@@ -60,6 +60,8 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
   table aliases, qualified column references (`u.id`), aggregates over joins
 - `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`
 - `RETURNING` on `INSERT`/`UPDATE`/`DELETE` (e.g. `INSERT ... RETURNING id`)
+- Uncorrelated subqueries: `x IN (SELECT ...)`, scalar `(SELECT ...)`,
+  `EXISTS (SELECT ...)` — in `SELECT`/`UPDATE`/`DELETE`
 - Expressions: arithmetic, comparison, `AND`/`OR`/`NOT`, `||`, `IS [NOT] NULL`,
   `[NOT] LIKE`/`ILIKE` (`%`/`_`), `[NOT] IN (...)`, `[NOT] BETWEEN`,
   `CASE` (simple and searched), `CAST(x AS t)` / `x::t`, parentheses,
@@ -129,7 +131,8 @@ cargo test
 - [x] `numeric`, `real`, `date`/`time`/`timestamp`/`timestamptz`, `uuid`,
       `json`/`jsonb` types; `OPERATOR(...)`/`COLLATE` syntax; loose numeric↔text compares
 - [ ] psql `\d <table>` (needs `pg_attribute`/`pg_type`, more `pg_class` cols)
-- [ ] Subqueries; arbitrary-precision numeric; richer date/time functions
+- [x] Uncorrelated subqueries (`IN`/scalar/`EXISTS`) in SELECT/UPDATE/DELETE
+- [ ] Correlated subqueries; arbitrary-precision numeric; date/time functions
 - [ ] MVCC isolation under concurrent writers (current model is last-commit-wins)
 - [ ] Composite (multi-column) indexes and a cost-based planner
 - [ ] More types (`numeric`, `date`/`timestamp`, `uuid`, `json`/`jsonb`, arrays)

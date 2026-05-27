@@ -25,7 +25,7 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
         Statement::Insert(i) => insert_sql(i),
         Statement::Update(u) => update_sql(u),
         Statement::Delete(d) => delete_sql(d),
-        Statement::Select(_) => String::new(),
+        Statement::Select(s) => select_to_sql(s),
         Statement::Begin => "BEGIN".into(),
         Statement::Commit => "COMMIT".into(),
         Statement::Rollback => "ROLLBACK".into(),
@@ -125,6 +125,88 @@ fn delete_sql(d: &Delete) -> String {
     s
 }
 
+/// Serialize a `SELECT` back to SQL. Used for subqueries embedded in logged
+/// DML and (harmlessly) for any standalone SELECT.
+pub fn select_to_sql(sel: &Select) -> String {
+    let mut s = String::from("SELECT ");
+    if sel.distinct {
+        s.push_str("DISTINCT ");
+    }
+    let items: Vec<String> = sel.projection.iter().map(select_item_to_sql).collect();
+    s.push_str(&items.join(", "));
+
+    if let Some(from) = &sel.from {
+        s.push_str(" FROM ");
+        s.push_str(&from_clause_to_sql(from));
+    }
+    if let Some(f) = &sel.filter {
+        s.push_str(&format!(" WHERE {}", expr_to_sql(f)));
+    }
+    if !sel.group_by.is_empty() {
+        let g: Vec<String> = sel.group_by.iter().map(expr_to_sql).collect();
+        s.push_str(&format!(" GROUP BY {}", g.join(", ")));
+    }
+    if let Some(h) = &sel.having {
+        s.push_str(&format!(" HAVING {}", expr_to_sql(h)));
+    }
+    if !sel.order_by.is_empty() {
+        let o: Vec<String> = sel
+            .order_by
+            .iter()
+            .map(|ob| format!("{}{}", expr_to_sql(&ob.expr), if ob.asc { "" } else { " DESC" }))
+            .collect();
+        s.push_str(&format!(" ORDER BY {}", o.join(", ")));
+    }
+    if let Some(l) = &sel.limit {
+        s.push_str(&format!(" LIMIT {}", expr_to_sql(l)));
+    }
+    if let Some(o) = &sel.offset {
+        s.push_str(&format!(" OFFSET {}", expr_to_sql(o)));
+    }
+    s
+}
+
+fn select_item_to_sql(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Wildcard => "*".to_string(),
+        SelectItem::Expr { expr, alias } => match alias {
+            Some(a) => format!("{} AS {}", expr_to_sql(expr), ident(a)),
+            None => expr_to_sql(expr),
+        },
+    }
+}
+
+fn from_clause_to_sql(from: &FromClause) -> String {
+    let mut s = table_ref_to_sql(&from.base);
+    for j in &from.joins {
+        let kw = match j.kind {
+            JoinKind::Inner => "JOIN",
+            JoinKind::Left => "LEFT JOIN",
+            JoinKind::Right => "RIGHT JOIN",
+            JoinKind::Full => "FULL JOIN",
+            JoinKind::Cross => "CROSS JOIN",
+        };
+        s.push_str(&format!(" {kw} {}", table_ref_to_sql(&j.table)));
+        if let Some(on) = &j.on {
+            s.push_str(&format!(" ON {}", expr_to_sql(on)));
+        }
+    }
+    s
+}
+
+fn table_ref_to_sql(t: &TableRef) -> String {
+    let mut s = String::new();
+    if let Some(schema) = &t.schema {
+        s.push_str(&ident(schema));
+        s.push('.');
+    }
+    s.push_str(&ident(&t.name));
+    if let Some(a) = &t.alias {
+        s.push_str(&format!(" AS {}", ident(a)));
+    }
+    s
+}
+
 /// Serialize an expression. Binary/unary ops are parenthesized for safety.
 pub fn expr_to_sql(e: &Expr) -> String {
     match e {
@@ -185,6 +267,12 @@ pub fn expr_to_sql(e: &Expr) -> String {
         }
         Expr::Cast { expr, target } => {
             format!("CAST({} AS {})", expr_to_sql(expr), target.sql_name())
+        }
+        Expr::ScalarSubquery(sel) => format!("({})", select_to_sql(sel)),
+        Expr::Exists(sel) => format!("EXISTS ({})", select_to_sql(sel)),
+        Expr::InSubquery { expr, subquery, negated } => {
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("({} {op} ({}))", expr_to_sql(expr), select_to_sql(subquery))
         }
         Expr::Function { name, args, star } => {
             if *star {

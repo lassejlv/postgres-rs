@@ -438,6 +438,42 @@ fn loose_number_text_comparison() {
 }
 
 #[test]
+fn subqueries() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE users (id serial PRIMARY KEY, name text)");
+    run(&mut db, "CREATE TABLE orders (id serial, user_id integer, amount integer)");
+    run(&mut db, "INSERT INTO users (name) VALUES ('Alice'),('Bob'),('Carol')");
+    run(&mut db, "INSERT INTO orders (user_id, amount) VALUES (1,100),(1,50),(2,200)");
+
+    // IN (subquery) — duplicate user_ids must not duplicate output rows.
+    let r = rows(run(&mut db, "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY name"));
+    assert_eq!(r, vec![vec![Value::Text("Alice".into())], vec![Value::Text("Bob".into())]]);
+
+    // NOT IN (subquery).
+    let r = rows(run(&mut db, "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)"));
+    assert_eq!(r, vec![vec![Value::Text("Carol".into())]]);
+
+    // Scalar subquery in the projection.
+    let r = rows(run(&mut db, "SELECT (SELECT count(*) FROM orders) AS n"));
+    assert_eq!(r[0][0], Value::Int(3));
+
+    // Scalar subquery in WHERE.
+    let r = rows(run(&mut db, "SELECT name FROM users WHERE (SELECT max(amount) FROM orders) > 150 AND id = 1"));
+    assert_eq!(r, vec![vec![Value::Text("Alice".into())]]);
+
+    // EXISTS / NOT EXISTS (uncorrelated).
+    let r = rows(run(&mut db, "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 1000)"));
+    assert_eq!(r.len(), 0);
+    let r = rows(run(&mut db, "SELECT count(*) FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 1000)"));
+    assert_eq!(r[0][0], Value::Int(3));
+
+    // DELETE driven by a scalar subquery.
+    run(&mut db, "DELETE FROM orders WHERE amount < (SELECT avg(amount) FROM orders)");
+    let r = rows(run(&mut db, "SELECT amount FROM orders ORDER BY amount"));
+    assert_eq!(r, vec![vec![Value::Int(200)]]);
+}
+
+#[test]
 fn qualified_column_on_single_table() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id integer, v integer)");

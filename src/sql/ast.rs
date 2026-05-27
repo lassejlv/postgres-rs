@@ -199,6 +199,12 @@ pub enum Expr {
     Case { operand: Option<Box<Expr>>, whens: Vec<(Expr, Expr)>, else_expr: Option<Box<Expr>> },
     /// `CAST(expr AS type)` or `expr::type`.
     Cast { expr: Box<Expr>, target: DataType },
+    /// A scalar subquery `(SELECT ...)` yielding one value.
+    ScalarSubquery(Box<Select>),
+    /// `EXISTS (SELECT ...)`.
+    Exists(Box<Select>),
+    /// `expr [NOT] IN (SELECT ...)`.
+    InSubquery { expr: Box<Expr>, subquery: Box<Select>, negated: bool },
     /// A function call, e.g. `count(*)` or `upper(name)`.
     Function { name: String, args: Vec<Expr>, star: bool },
 }

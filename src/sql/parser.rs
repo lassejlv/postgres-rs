@@ -776,9 +776,16 @@ impl Parser {
             Some(Token::Param(n)) => Ok(Expr::Param(n)),
             Some(Token::QuotedIdent(name)) => Ok(Expr::Column(name)),
             Some(Token::LParen) => {
-                let e = self.parse_expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(e)
+                // A parenthesized scalar subquery, or a grouped expression.
+                if self.is_keyword("select") {
+                    let sub = self.parse_select()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::ScalarSubquery(Box::new(sub)))
+                } else {
+                    let e = self.parse_expr()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(e)
+                }
             }
             Some(Token::Word(w)) => {
                 let lw = w.to_ascii_lowercase();
@@ -786,6 +793,12 @@ impl Parser {
                     "true" => Ok(Expr::Bool(true)),
                     "false" => Ok(Expr::Bool(false)),
                     "null" => Ok(Expr::Null),
+                    "exists" => {
+                        self.expect(&Token::LParen)?;
+                        let sub = self.parse_select()?;
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::Exists(Box::new(sub)))
+                    }
                     "case" => self.parse_case(),
                     "cast" => {
                         self.expect(&Token::LParen)?;
@@ -910,6 +923,12 @@ impl Parser {
             })
         } else if self.eat_keyword("in") {
             self.expect(&Token::LParen)?;
+            // `IN (SELECT ...)` is a subquery; otherwise a value list.
+            if self.is_keyword("select") {
+                let sub = self.parse_select()?;
+                self.expect(&Token::RParen)?;
+                return Ok(Expr::InSubquery { expr: Box::new(lhs), subquery: Box::new(sub), negated });
+            }
             let mut list = Vec::new();
             if self.peek() != Some(&Token::RParen) {
                 loop {

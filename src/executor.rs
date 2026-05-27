@@ -477,7 +477,10 @@ fn index_candidate_positions(table: &Table, filter: &Expr) -> Option<Vec<usize>>
         }
         IndexPlan::Range(lo, hi) => table.index_range(col, lo, hi)?,
     };
-    Some(positions)
+    // Distinct `IN` values (e.g. from a subquery) can map to the same row, so
+    // deduplicate positions to avoid emitting a row more than once.
+    let mut seen = std::collections::HashSet::new();
+    Some(positions.into_iter().filter(|p| seen.insert(*p)).collect())
 }
 
 /// Generate the rows of a supported `information_schema` view from the live
@@ -870,7 +873,151 @@ fn project_rows(
     Ok((fields, out))
 }
 
-fn exec_select(db: &mut Database, sel: Select) -> Result<ExecResult, String> {
+/// Resolve every uncorrelated subquery within a SELECT's clauses.
+fn resolve_subqueries_in_select(db: &mut Database, sel: &mut Select) -> Result<(), String> {
+    for item in &mut sel.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            resolve_subqueries(db, expr)?;
+        }
+    }
+    if let Some(f) = &mut sel.filter {
+        resolve_subqueries(db, f)?;
+    }
+    if let Some(h) = &mut sel.having {
+        resolve_subqueries(db, h)?;
+    }
+    for g in &mut sel.group_by {
+        resolve_subqueries(db, g)?;
+    }
+    for ob in &mut sel.order_by {
+        resolve_subqueries(db, &mut ob.expr)?;
+    }
+    if let Some(l) = &mut sel.limit {
+        resolve_subqueries(db, l)?;
+    }
+    if let Some(o) = &mut sel.offset {
+        resolve_subqueries(db, o)?;
+    }
+    Ok(())
+}
+
+/// Execute uncorrelated subqueries in `expr` once and replace them with the
+/// resulting literal (scalar), value-list (`IN`), or boolean (`EXISTS`). A
+/// correlated subquery (referencing an outer column) will surface as a
+/// "column does not exist" error when executed standalone — they are not yet
+/// supported.
+fn resolve_subqueries(db: &mut Database, expr: &mut Expr) -> Result<(), String> {
+    match expr {
+        Expr::ScalarSubquery(sel) => {
+            let v = exec_scalar_subquery(db, sel)?;
+            *expr = value_to_literal(v);
+        }
+        Expr::Exists(sel) => {
+            let has_rows = subquery_row_count(db, sel)? > 0;
+            *expr = Expr::Bool(has_rows);
+        }
+        Expr::InSubquery { expr: inner, subquery, negated } => {
+            resolve_subqueries(db, inner)?;
+            let values = subquery_single_column(db, subquery)?;
+            let list = values.into_iter().map(value_to_literal).collect();
+            *expr = Expr::InList { expr: inner.clone(), list, negated: *negated };
+        }
+        Expr::Unary { expr, .. } => resolve_subqueries(db, expr)?,
+        Expr::Binary { left, right, .. } => {
+            resolve_subqueries(db, left)?;
+            resolve_subqueries(db, right)?;
+        }
+        Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => resolve_subqueries(db, expr)?,
+        Expr::Like { expr, pattern, .. } => {
+            resolve_subqueries(db, expr)?;
+            resolve_subqueries(db, pattern)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            resolve_subqueries(db, expr)?;
+            for e in list {
+                resolve_subqueries(db, e)?;
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            resolve_subqueries(db, expr)?;
+            resolve_subqueries(db, low)?;
+            resolve_subqueries(db, high)?;
+        }
+        Expr::Case { operand, whens, else_expr } => {
+            if let Some(o) = operand {
+                resolve_subqueries(db, o)?;
+            }
+            for (c, r) in whens {
+                resolve_subqueries(db, c)?;
+                resolve_subqueries(db, r)?;
+            }
+            if let Some(e) = else_expr {
+                resolve_subqueries(db, e)?;
+            }
+        }
+        Expr::Function { args, .. } => {
+            for a in args {
+                resolve_subqueries(db, a)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Run a subquery expected to yield a single value (zero rows → NULL).
+fn exec_scalar_subquery(db: &mut Database, sel: &Select) -> Result<Value, String> {
+    match exec_select(db, sel.clone())? {
+        ExecResult::Rows { fields, mut rows, .. } => {
+            if fields.len() != 1 {
+                return Err("subquery must return only one column".into());
+            }
+            if rows.len() > 1 {
+                return Err("more than one row returned by a subquery used as an expression".into());
+            }
+            Ok(rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null))
+        }
+        _ => Err("subquery did not return a result set".into()),
+    }
+}
+
+/// Number of rows a subquery yields (for `EXISTS`).
+fn subquery_row_count(db: &mut Database, sel: &Select) -> Result<usize, String> {
+    match exec_select(db, sel.clone())? {
+        ExecResult::Rows { rows, .. } => Ok(rows.len()),
+        _ => Ok(0),
+    }
+}
+
+/// Collect a single-column subquery's values (for `IN (SELECT ...)`).
+fn subquery_single_column(db: &mut Database, sel: &Select) -> Result<Vec<Value>, String> {
+    match exec_select(db, sel.clone())? {
+        ExecResult::Rows { fields, rows, .. } => {
+            if fields.len() != 1 {
+                return Err("subquery must return only one column".into());
+            }
+            Ok(rows.into_iter().map(|mut r| r.remove(0)).collect())
+        }
+        _ => Err("subquery did not return a result set".into()),
+    }
+}
+
+fn value_to_literal(v: Value) -> Expr {
+    match v {
+        Value::Null => Expr::Null,
+        Value::Int(i) => Expr::Int(i),
+        Value::Float(f) => Expr::Float(f),
+        Value::Text(s) => Expr::Str(s),
+        Value::Bool(b) => Expr::Bool(b),
+    }
+}
+
+fn exec_select(db: &mut Database, mut sel: Select) -> Result<ExecResult, String> {
+    // Execute uncorrelated subqueries first, splicing their results in as
+    // literals/value-lists so the row-evaluation and index-planning paths
+    // never see a subquery.
+    resolve_subqueries_in_select(db, &mut sel)?;
+
     // Resolve the source: the (possibly joined) FROM rows with qualified
     // column names, or a single synthetic empty row for `SELECT <exprs>`.
     let (col_names, col_types, source_rows) = match &sel.from {
@@ -1140,7 +1287,14 @@ fn grouped_select(
     Ok(ExecResult::Rows { fields, rows: final_rows, tag })
 }
 
-fn exec_update(db: &mut Database, upd: Update) -> Result<ExecResult, String> {
+fn exec_update(db: &mut Database, mut upd: Update) -> Result<ExecResult, String> {
+    // Resolve any uncorrelated subqueries in SET expressions / WHERE first.
+    for (_, e) in &mut upd.assignments {
+        resolve_subqueries(db, e)?;
+    }
+    if let Some(f) = &mut upd.filter {
+        resolve_subqueries(db, f)?;
+    }
     let table = db
         .table(&upd.table)
         .ok_or_else(|| format!("relation \"{}\" does not exist", upd.table))?;
@@ -1192,7 +1346,10 @@ fn exec_update(db: &mut Database, upd: Update) -> Result<ExecResult, String> {
     Ok(result)
 }
 
-fn exec_delete(db: &mut Database, del: Delete) -> Result<ExecResult, String> {
+fn exec_delete(db: &mut Database, mut del: Delete) -> Result<ExecResult, String> {
+    if let Some(f) = &mut del.filter {
+        resolve_subqueries(db, f)?;
+    }
     let table = db
         .table(&del.table)
         .ok_or_else(|| format!("relation \"{}\" does not exist", del.table))?;
@@ -1327,6 +1484,11 @@ fn eval_expr(expr: &Expr, col_names: &[String], row: &[Value]) -> Result<Value, 
         Expr::Cast { expr, target } => {
             let v = eval_expr(expr, col_names, row)?;
             coerce(v, *target)
+        }
+        // Uncorrelated subqueries are resolved to literals before evaluation;
+        // reaching here means a correlated subquery, which is not yet supported.
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+            Err("correlated subqueries are not supported".into())
         }
         Expr::Function { name, args, star } => eval_scalar_function(name, args, *star, col_names, row),
     }
@@ -1834,6 +1996,9 @@ fn contains_aggregate(expr: &Expr) -> bool {
                 || whens.iter().any(|(c, r)| contains_aggregate(c) || contains_aggregate(r))
                 || else_expr.as_deref().is_some_and(contains_aggregate)
         }
+        // A subquery's own aggregates don't make the outer expression an
+        // aggregate; only the IN-test's left operand matters here.
+        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
         _ => false,
     }
 }
@@ -2070,6 +2235,10 @@ fn infer_expr_type(expr: &Expr, col_names: &[String], col_types: &[DataType]) ->
         Expr::IsNull { .. } => DataType::Bool,
         Expr::Cast { target, .. } => *target,
         Expr::Like { .. } | Expr::InList { .. } | Expr::Between { .. } => DataType::Bool,
+        Expr::Exists(_) | Expr::InSubquery { .. } => DataType::Bool,
+        // A scalar subquery's type is only known once executed; default to text
+        // for the pre-execution RowDescription (the value is resolved later).
+        Expr::ScalarSubquery(_) => DataType::Text,
         Expr::Case { whens, else_expr, .. } => {
             // Type of the first THEN result (fallback to ELSE, then text).
             if let Some((_, result)) = whens.first() {

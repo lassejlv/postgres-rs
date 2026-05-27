@@ -79,6 +79,10 @@ fn bind_expr(expr: &mut Expr, params: &[Value]) -> Result<(), String> {
         }
         Expr::IsNull { expr, .. } => bind_expr(expr, params),
         Expr::Cast { expr, .. } => bind_expr(expr, params),
+        // Parameters inside subqueries are not bound (uncommon); the IN-test's
+        // left operand still is.
+        Expr::InSubquery { expr, .. } => bind_expr(expr, params),
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => Ok(()),
         Expr::Like { expr, pattern, .. } => {
             bind_expr(expr, params)?;
             bind_expr(pattern, params)
