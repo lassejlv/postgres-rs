@@ -52,6 +52,7 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
 - `CREATE TABLE` / `DROP TABLE` (with `IF [NOT] EXISTS`), enforced `NOT NULL`,
   `PRIMARY KEY` and `UNIQUE` constraints (duplicate keys rejected atomically),
   `DEFAULT <expr>` values, `serial`/`bigserial`/`smallserial` auto-increment
+- `ALTER TABLE`: `ADD`/`DROP`/`RENAME COLUMN`, `RENAME TO` (WAL-durable)
 - `INSERT ... VALUES (...), (...)` with/without a column list
 - `SELECT` / `SELECT DISTINCT`: projection with aliases, `*`, `WHERE`,
   `GROUP BY`, `HAVING`, `ORDER BY` (by expression or output alias),

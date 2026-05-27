@@ -143,6 +143,30 @@ impl Table {
         self.row_pos.get(&id).copied()
     }
 
+    /// Append a column, giving every existing row the supplied value.
+    pub fn add_column(&mut self, column: Column, fill: &dyn Fn(usize) -> Value) {
+        self.columns.push(column);
+        for (pos, row) in self.rows.iter_mut().enumerate() {
+            row.push(fill(pos));
+        }
+    }
+
+    /// Remove the column at `idx` from the schema and every row, dropping any
+    /// index on it and shifting later indexes' column positions down. The
+    /// surviving index trees stay valid since the column *values* don't change.
+    pub fn drop_column(&mut self, idx: usize) {
+        self.columns.remove(idx);
+        for row in &mut self.rows {
+            row.remove(idx);
+        }
+        self.indexes.retain(|i| i.column != idx);
+        for i in &mut self.indexes {
+            if i.column > idx {
+                i.column -= 1;
+            }
+        }
+    }
+
     // --- index management ----------------------------------------------------
 
     /// Find an index over `column`, preferring a unique one when both exist.
@@ -276,6 +300,31 @@ impl Database {
     /// Drop a table, returning whether it existed.
     pub fn drop_table(&mut self, name: &str) -> bool {
         self.tables.remove(name).is_some()
+    }
+
+    /// Rename a table (and re-key its `serial` sequences).
+    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<(), String> {
+        if !self.tables.contains_key(from) {
+            return Err(format!("relation \"{from}\" does not exist"));
+        }
+        if self.tables.contains_key(to) {
+            return Err(format!("relation \"{to}\" already exists"));
+        }
+        let mut table = self.tables.remove(from).unwrap();
+        table.name = to.to_string();
+        self.tables.insert(to.to_string(), table);
+
+        // Re-key sequences "from.col" -> "to.col".
+        let moved: Vec<(String, i64)> = self
+            .sequences
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix(&format!("{from}.")).map(|c| (c.to_string(), *v)))
+            .collect();
+        for (col, v) in moved {
+            self.sequences.remove(&format!("{from}.{col}"));
+            self.sequences.insert(format!("{to}.{col}"), v);
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]

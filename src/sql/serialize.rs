@@ -17,6 +17,7 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
             let exists = if d.if_exists { "IF EXISTS " } else { "" };
             format!("DROP TABLE {exists}{}", ident(&d.name))
         }
+        Statement::AlterTable(a) => alter_table_sql(a),
         Statement::CreateIndex(c) => create_index_sql(c),
         Statement::DropIndex(d) => {
             let exists = if d.if_exists { "IF EXISTS " } else { "" };
@@ -37,36 +38,53 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
 
 fn create_table_sql(c: &CreateTable) -> String {
     let exists = if c.if_not_exists { "IF NOT EXISTS " } else { "" };
-    let cols: Vec<String> = c
-        .columns
-        .iter()
-        .map(|col| {
-            // `serial` columns re-emit as serial so replay rebuilds the
-            // sequence; their NOT NULL and default are implicit.
-            let type_name = if col.serial {
-                match col.data_type {
-                    DataType::Int2 => "smallserial",
-                    DataType::Int8 => "bigserial",
-                    _ => "serial",
-                }
-            } else {
-                col.data_type.sql_name()
-            };
-            let mut s = format!("{} {}", ident(&col.name), type_name);
-            if col.primary_key {
-                s.push_str(" PRIMARY KEY");
-            } else if col.not_null && !col.serial {
-                s.push_str(" NOT NULL");
-            }
-            if !col.serial {
-                if let Some(default) = &col.default {
-                    s.push_str(&format!(" DEFAULT {}", expr_to_sql(default)));
-                }
-            }
-            s
-        })
-        .collect();
+    let cols: Vec<String> = c.columns.iter().map(column_def_to_sql).collect();
     format!("CREATE TABLE {exists}{} ({})", ident(&c.name), cols.join(", "))
+}
+
+/// Serialize a single column definition (shared by CREATE TABLE / ALTER ADD).
+fn column_def_to_sql(col: &ColumnDef) -> String {
+    // `serial` columns re-emit as serial so replay rebuilds the sequence; their
+    // NOT NULL and default are implicit.
+    let type_name = if col.serial {
+        match col.data_type {
+            DataType::Int2 => "smallserial",
+            DataType::Int8 => "bigserial",
+            _ => "serial",
+        }
+    } else {
+        col.data_type.sql_name()
+    };
+    let mut s = format!("{} {}", ident(&col.name), type_name);
+    if col.primary_key {
+        s.push_str(" PRIMARY KEY");
+    } else if col.not_null && !col.serial {
+        s.push_str(" NOT NULL");
+    }
+    if !col.serial {
+        if let Some(default) = &col.default {
+            s.push_str(&format!(" DEFAULT {}", expr_to_sql(default)));
+        }
+    }
+    s
+}
+
+fn alter_table_sql(a: &AlterTable) -> String {
+    let t = ident(&a.table);
+    match &a.action {
+        AlterAction::AddColumn { column, if_not_exists } => {
+            let exists = if *if_not_exists { "IF NOT EXISTS " } else { "" };
+            format!("ALTER TABLE {t} ADD COLUMN {exists}{}", column_def_to_sql(column))
+        }
+        AlterAction::DropColumn { name, if_exists } => {
+            let exists = if *if_exists { "IF EXISTS " } else { "" };
+            format!("ALTER TABLE {t} DROP COLUMN {exists}{}", ident(name))
+        }
+        AlterAction::RenameColumn { from, to } => {
+            format!("ALTER TABLE {t} RENAME COLUMN {} TO {}", ident(from), ident(to))
+        }
+        AlterAction::RenameTable { to } => format!("ALTER TABLE {t} RENAME TO {}", ident(to)),
+    }
 }
 
 fn create_index_sql(c: &CreateIndex) -> String {

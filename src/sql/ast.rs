@@ -6,6 +6,7 @@ use crate::types::DataType;
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    AlterTable(AlterTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
     Insert(Insert),
@@ -48,6 +49,20 @@ pub struct CreateTable {
 pub struct DropTable {
     pub name: String,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub table: String,
+    pub action: AlterAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    AddColumn { column: ColumnDef, if_not_exists: bool },
+    DropColumn { name: String, if_exists: bool },
+    RenameColumn { from: String, to: String },
+    RenameTable { to: String },
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table (column)`.

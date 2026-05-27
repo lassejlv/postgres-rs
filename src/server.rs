@@ -572,6 +572,7 @@ fn is_mutation(stmt: &Statement) -> bool {
         stmt,
         Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::AlterTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::Insert(_)

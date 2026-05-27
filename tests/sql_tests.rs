@@ -504,6 +504,34 @@ fn unique_and_primary_key_enforcement() {
 }
 
 #[test]
+fn alter_table() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id integer, name text)");
+    run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+
+    // ADD COLUMN with a default backfills existing rows.
+    run(&mut db, "ALTER TABLE t ADD COLUMN active boolean DEFAULT true");
+    run(&mut db, "ALTER TABLE t ADD COLUMN score integer");
+    let r = rows(run(&mut db, "SELECT id, active, score FROM t ORDER BY id"));
+    assert_eq!(r[0], vec![Value::Int(1), Value::Bool(true), Value::Null]);
+
+    // RENAME COLUMN.
+    run(&mut db, "ALTER TABLE t RENAME COLUMN name TO label");
+    let r = rows(run(&mut db, "SELECT label FROM t WHERE id = 1"));
+    assert_eq!(r[0][0], Value::Text("a".into()));
+
+    // DROP COLUMN.
+    run(&mut db, "ALTER TABLE t DROP COLUMN score");
+    let r = rows(run(&mut db, "SELECT * FROM t WHERE id = 1"));
+    assert_eq!(r[0], vec![Value::Int(1), Value::Text("a".into()), Value::Bool(true)]);
+
+    // RENAME TABLE.
+    run(&mut db, "ALTER TABLE t RENAME TO items");
+    let r = rows(run(&mut db, "SELECT count(*) FROM items"));
+    assert_eq!(r[0][0], Value::Int(2));
+}
+
+#[test]
 fn qualified_column_on_single_table() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id integer, v integer)");

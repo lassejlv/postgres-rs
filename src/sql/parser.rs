@@ -123,6 +123,7 @@ impl Parser {
         let kw = w.to_ascii_lowercase();
         match kw.as_str() {
             "create" => self.parse_create(),
+            "alter" => self.parse_alter(),
             "drop" => self.parse_drop(),
             "insert" => self.parse_insert(),
             "select" => Ok(Statement::Select(self.parse_select()?)),
@@ -298,6 +299,42 @@ impl Parser {
         // Unknown types map to text (PostgreSQL has hundreds; this keeps casts
         // like `::regclass` and unusual column types working).
         Ok(DataType::from_sql_name(&name).unwrap_or(DataType::Text))
+    }
+
+    /// Parse `ALTER TABLE [IF EXISTS] name <action>`.
+    fn parse_alter(&mut self) -> Result<Statement, String> {
+        self.expect_keyword("alter")?;
+        self.expect_keyword("table")?;
+        self.parse_if_exists();
+        let table = self.parse_object_name()?;
+
+        let action = if self.eat_keyword("add") {
+            self.eat_keyword("column");
+            let if_not_exists = self.parse_if_not_exists();
+            let column = self.parse_column_def()?;
+            AlterAction::AddColumn { column, if_not_exists }
+        } else if self.eat_keyword("drop") {
+            self.eat_keyword("column");
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_ident()?;
+            self.eat_keyword("cascade");
+            self.eat_keyword("restrict");
+            AlterAction::DropColumn { name, if_exists }
+        } else if self.eat_keyword("rename") {
+            if self.eat_keyword("to") {
+                let to = self.parse_object_name()?;
+                AlterAction::RenameTable { to }
+            } else {
+                self.eat_keyword("column");
+                let from = self.parse_ident()?;
+                self.expect_keyword("to")?;
+                let to = self.parse_ident()?;
+                AlterAction::RenameColumn { from, to }
+            }
+        } else {
+            return Err(format!("unsupported ALTER TABLE action near {:?}", self.peek()));
+        };
+        Ok(Statement::AlterTable(AlterTable { table, action }))
     }
 
     fn parse_drop(&mut self) -> Result<Statement, String> {

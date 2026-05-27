@@ -31,6 +31,7 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
     match stmt {
         Statement::CreateTable(c) => exec_create_table(db, c),
         Statement::DropTable(d) => exec_drop_table(db, d),
+        Statement::AlterTable(a) => exec_alter_table(db, a),
         Statement::CreateIndex(c) => exec_create_index(db, c),
         Statement::DropIndex(d) => exec_drop_index(db, d),
         Statement::Insert(i) => exec_insert(db, i),
@@ -734,6 +735,87 @@ fn exec_drop_table(db: &mut Database, d: DropTable) -> Result<ExecResult, String
         return Err(format!("table \"{}\" does not exist", d.name));
     }
     Ok(ExecResult::Command("DROP TABLE".into()))
+}
+
+fn exec_alter_table(db: &mut Database, alter: AlterTable) -> Result<ExecResult, String> {
+    match alter.action {
+        AlterAction::RenameTable { to } => {
+            db.rename_table(&alter.table, &to)?;
+            return Ok(ExecResult::Command("ALTER TABLE".into()));
+        }
+        AlterAction::AddColumn { column, if_not_exists } => {
+            // Evaluate a constant default once; serial fills per row.
+            let default_val = match &column.default {
+                Some(e) => coerce(eval_expr(e, &[], &[])?, column.data_type)?,
+                None => Value::Null,
+            };
+            // Validate against the existing schema (immutable borrow first).
+            {
+                let table = db
+                    .table(&alter.table)
+                    .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+                if table.columns.iter().any(|c| c.name == column.name) {
+                    if if_not_exists {
+                        return Ok(ExecResult::Command("ALTER TABLE".into()));
+                    }
+                    return Err(format!(
+                        "column \"{}\" of relation \"{}\" already exists",
+                        column.name, alter.table
+                    ));
+                }
+                // A NOT NULL column with no default can't be added to a
+                // non-empty table (existing rows would violate it).
+                if column.not_null && column.default.is_none() && !column.serial && !table.rows.is_empty() {
+                    return Err(format!("column \"{}\" contains null values", column.name));
+                }
+            }
+            let col = Column {
+                name: column.name.clone(),
+                data_type: column.data_type,
+                not_null: column.not_null,
+                primary_key: column.primary_key,
+                default: column.default.clone(),
+                serial: column.serial,
+            };
+            if column.serial {
+                // Pre-compute one sequence value per existing row, then fill.
+                let key = format!("{}.{}", alter.table, column.name);
+                let n = db.table(&alter.table).map(|t| t.rows.len()).unwrap_or(0);
+                let fills: Vec<Value> = (0..n).map(|_| Value::Int(db.next_sequence(&key))).collect();
+                let table = db.table_mut(&alter.table).unwrap();
+                table.add_column(col, &|pos| fills[pos].clone());
+            } else {
+                let table = db.table_mut(&alter.table).unwrap();
+                table.add_column(col, &|_| default_val.clone());
+            }
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        AlterAction::DropColumn { name, if_exists } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            match table.column_index(&name) {
+                Some(idx) => {
+                    table.drop_column(idx);
+                    Ok(ExecResult::Command("ALTER TABLE".into()))
+                }
+                None if if_exists => Ok(ExecResult::Command("ALTER TABLE".into())),
+                None => Err(format!("column \"{name}\" of relation \"{}\" does not exist", alter.table)),
+            }
+        }
+        AlterAction::RenameColumn { from, to } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            match table.column_index(&from) {
+                Some(idx) => {
+                    table.columns[idx].name = to;
+                    Ok(ExecResult::Command("ALTER TABLE".into()))
+                }
+                None => Err(format!("column \"{from}\" of relation \"{}\" does not exist", alter.table)),
+            }
+        }
+    }
 }
 
 fn exec_insert(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
