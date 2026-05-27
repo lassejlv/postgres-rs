@@ -159,6 +159,10 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement, String> {
         self.expect_keyword("create")?;
+        // `CREATE [UNIQUE] INDEX ...` branches off here.
+        if self.is_keyword("unique") || self.is_keyword("index") {
+            return self.parse_create_index();
+        }
         self.expect_keyword("table")?;
         let if_not_exists = self.parse_if_not_exists();
         let name = self.parse_object_name()?;
@@ -187,6 +191,33 @@ impl Parser {
             return Err("table must have at least one column".to_string());
         }
         Ok(Statement::CreateTable(CreateTable { name, columns, if_not_exists }))
+    }
+
+    /// Parse `[UNIQUE] INDEX [IF NOT EXISTS] [name] ON table (column)`.
+    /// The leading `CREATE` has already been consumed.
+    fn parse_create_index(&mut self) -> Result<Statement, String> {
+        let unique = self.eat_keyword("unique");
+        self.expect_keyword("index")?;
+        let if_not_exists = self.parse_if_not_exists();
+        // The index name is optional; `ON` immediately means an unnamed index.
+        let name = if self.is_keyword("on") {
+            None
+        } else {
+            Some(self.parse_ident()?)
+        };
+        self.expect_keyword("on")?;
+        let table = self.parse_object_name()?;
+        // An optional `USING <method>` (e.g. btree) is accepted and ignored:
+        // every index here is a B-tree.
+        if self.eat_keyword("using") {
+            let _ = self.parse_ident()?;
+        }
+        self.expect(&Token::LParen)?;
+        let column = self.parse_ident()?;
+        // Accept and ignore a trailing `ASC`/`DESC` ordering on the column.
+        let _ = self.eat_keyword("asc") || self.eat_keyword("desc");
+        self.expect(&Token::RParen)?;
+        Ok(Statement::CreateIndex(CreateIndex { name, table, column, unique, if_not_exists }))
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, String> {
@@ -271,6 +302,13 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement, String> {
         self.expect_keyword("drop")?;
+        if self.eat_keyword("index") {
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            self.eat_keyword("cascade");
+            self.eat_keyword("restrict");
+            return Ok(Statement::DropIndex(DropIndex { name, if_exists }));
+        }
         self.expect_keyword("table")?;
         let if_exists = self.parse_if_exists();
         let name = self.parse_object_name()?;

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::index::{Bound, Index, RowId};
 use crate::sql::ast::Expr;
 use crate::types::{DataType, Value};
 
@@ -25,23 +26,184 @@ pub struct Column {
     pub serial: bool,
 }
 
-/// A stored table: schema plus its rows.
+/// A stored table: schema, its rows, and any secondary indexes.
+///
+/// Rows live in `rows`. Each row also has a *stable* [`RowId`] in the parallel
+/// `row_ids` vector (`row_ids[i]` is the id of `rows[i]`), and `row_pos` maps a
+/// `RowId` back to its current position. Stable ids let B-tree indexes
+/// reference rows that survive deletions of other rows, and the position map
+/// turns an index hit (a set of `RowId`s) into row lookups in `O(1)` each.
 #[derive(Debug, Clone)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<Value>>,
+    /// Stable id for each row, parallel to `rows`.
+    row_ids: Vec<RowId>,
+    /// Reverse map: `RowId` -> current index into `rows`/`row_ids`.
+    row_pos: HashMap<RowId, usize>,
+    /// Next id to hand out; monotonically increasing, never reused.
+    next_row_id: RowId,
+    /// Secondary indexes maintained incrementally on every mutation.
+    indexes: Vec<Index>,
 }
 
 impl Table {
+    /// Create an empty table with the given schema and no indexes.
+    pub fn new(name: String, columns: Vec<Column>) -> Self {
+        Table {
+            name,
+            columns,
+            rows: Vec::new(),
+            row_ids: Vec::new(),
+            row_pos: HashMap::new(),
+            next_row_id: 0,
+            indexes: Vec::new(),
+        }
+    }
+
     /// Index of a column by name (case-sensitive, matching how it was created).
-    #[allow(dead_code)]
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == name)
     }
 
     pub fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    // --- row + index maintenance ---------------------------------------------
+
+    /// Append a row, assigning it a fresh stable id and updating all indexes.
+    pub fn push_row(&mut self, row: Vec<Value>) {
+        let id = self.next_row_id;
+        self.next_row_id += 1;
+        let pos = self.rows.len();
+        for idx in &mut self.indexes {
+            idx.insert(&row[idx.column], id);
+        }
+        self.rows.push(row);
+        self.row_ids.push(id);
+        self.row_pos.insert(id, pos);
+    }
+
+    /// Replace the row at position `pos` with `new_row`, keeping its id and
+    /// repairing every index whose column changed.
+    pub fn update_row(&mut self, pos: usize, new_row: Vec<Value>) {
+        let id = self.row_ids[pos];
+        for idx in &mut self.indexes {
+            let old = &self.rows[pos][idx.column];
+            let new = &new_row[idx.column];
+            if old != new {
+                idx.remove(old, id);
+                idx.insert(new, id);
+            }
+        }
+        self.rows[pos] = new_row;
+    }
+
+    /// Delete the rows at the given positions (in any order), patching indexes
+    /// and the position map. Implemented by rebuilding the kept rows, which is
+    /// `O(n)` — acceptable since a DELETE already scans/filters the table.
+    pub fn delete_rows(&mut self, positions: &[usize]) {
+        if positions.is_empty() {
+            return;
+        }
+        let mut drop_mask = vec![false; self.rows.len()];
+        for &p in positions {
+            drop_mask[p] = true;
+        }
+        // Remove deleted entries from each index first (we still have the old
+        // values and ids in place).
+        for idx in &mut self.indexes {
+            for (p, dropped) in drop_mask.iter().enumerate() {
+                if *dropped {
+                    idx.remove(&self.rows[p][idx.column], self.row_ids[p]);
+                }
+            }
+        }
+        // Compact the surviving rows/ids and rebuild the position map.
+        let mut new_rows = Vec::with_capacity(self.rows.len() - positions.len());
+        let mut new_ids = Vec::with_capacity(new_rows.capacity());
+        let mut new_pos = HashMap::with_capacity(new_rows.capacity());
+        for (p, row) in std::mem::take(&mut self.rows).into_iter().enumerate() {
+            if drop_mask[p] {
+                continue;
+            }
+            new_pos.insert(self.row_ids[p], new_rows.len());
+            new_rows.push(row);
+            new_ids.push(self.row_ids[p]);
+        }
+        self.rows = new_rows;
+        self.row_ids = new_ids;
+        self.row_pos = new_pos;
+    }
+
+    /// Current position of a row id, if it still exists.
+    pub fn position_of(&self, id: RowId) -> Option<usize> {
+        self.row_pos.get(&id).copied()
+    }
+
+    // --- index management ----------------------------------------------------
+
+    /// Find an index over `column`, preferring a unique one when both exist.
+    pub fn index_on(&self, column: usize) -> Option<&Index> {
+        let mut chosen: Option<&Index> = None;
+        for idx in &self.indexes {
+            if idx.column == column {
+                match chosen {
+                    Some(c) if c.unique => {}
+                    _ => chosen = Some(idx),
+                }
+            }
+        }
+        chosen
+    }
+
+    /// Whether an index with this name already exists.
+    pub fn has_index_named(&self, name: &str) -> bool {
+        self.indexes.iter().any(|i| i.name == name)
+    }
+
+    /// Build and populate a new index over `column` from the current rows.
+    pub fn create_index(&mut self, name: String, column: usize, unique: bool) {
+        let mut idx = Index::new(name, column, unique);
+        for (row, &id) in self.rows.iter().zip(&self.row_ids) {
+            idx.insert(&row[column], id);
+        }
+        self.indexes.push(idx);
+    }
+
+    /// Drop an index by name, returning whether it existed.
+    pub fn drop_index(&mut self, name: &str) -> bool {
+        let before = self.indexes.len();
+        self.indexes.retain(|i| i.name != name);
+        self.indexes.len() != before
+    }
+
+    // --- index-accelerated scans ---------------------------------------------
+
+    /// Row positions whose `column` equals `value`, via an index if one exists.
+    /// Positions are returned for the caller to read from `rows`.
+    pub fn index_eq(&self, column: usize, value: &Value) -> Option<Vec<usize>> {
+        let idx = self.index_on(column)?;
+        Some(self.ids_to_positions(idx.lookup_eq(value)))
+    }
+
+    /// Row positions whose `column` falls in the given range, via an index.
+    pub fn index_range(
+        &self,
+        column: usize,
+        lo: Option<Bound>,
+        hi: Option<Bound>,
+    ) -> Option<Vec<usize>> {
+        let idx = self.index_on(column)?;
+        Some(self.ids_to_positions(&idx.lookup_range(lo, hi)))
+    }
+
+    /// Translate a set of row ids into current row positions, dropping any that
+    /// no longer exist (defensive; ids in an index should always be present).
+    fn ids_to_positions(&self, ids: &[RowId]) -> Vec<usize> {
+        ids.iter().filter_map(|&id| self.position_of(id)).collect()
     }
 }
 
