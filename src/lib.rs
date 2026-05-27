@@ -4,6 +4,7 @@
 //! - [`protocol`]: the PostgreSQL v3 frontend/backend wire format.
 //! - [`sql`]: lexer, AST, and parser for the supported SQL subset.
 //! - [`storage`]: the (currently in-memory) storage engine.
+//! - [`index`]: B-tree secondary indexes for fast lookups and range scans.
 //! - [`executor`]: turns parsed statements into results.
 //! - [`bind`]: extended-protocol parameter decoding/substitution.
 //! - [`server`]: TCP server and per-connection session handling.
@@ -12,6 +13,7 @@ pub mod auth;
 pub mod bind;
 pub mod crypto;
 pub mod executor;
+pub mod index;
 pub mod protocol;
 pub mod server;
 pub mod sql;

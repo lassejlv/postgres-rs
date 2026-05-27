@@ -17,6 +17,11 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
             let exists = if d.if_exists { "IF EXISTS " } else { "" };
             format!("DROP TABLE {exists}{}", ident(&d.name))
         }
+        Statement::CreateIndex(c) => create_index_sql(c),
+        Statement::DropIndex(d) => {
+            let exists = if d.if_exists { "IF EXISTS " } else { "" };
+            format!("DROP INDEX {exists}{}", ident(&d.name))
+        }
         Statement::Insert(i) => insert_sql(i),
         Statement::Update(u) => update_sql(u),
         Statement::Delete(d) => delete_sql(d),
@@ -62,6 +67,22 @@ fn create_table_sql(c: &CreateTable) -> String {
         })
         .collect();
     format!("CREATE TABLE {exists}{} ({})", ident(&c.name), cols.join(", "))
+}
+
+fn create_index_sql(c: &CreateIndex) -> String {
+    let unique = if c.unique { "UNIQUE " } else { "" };
+    let exists = if c.if_not_exists { "IF NOT EXISTS " } else { "" };
+    let name = match &c.name {
+        // A name is required by our parser unless `ON` follows immediately, so
+        // re-emit the (possibly auto-generated) name to keep replay stable.
+        Some(n) => format!("{} ", ident(n)),
+        None => String::new(),
+    };
+    format!(
+        "CREATE {unique}INDEX {exists}{name}ON {} ({})",
+        ident(&c.table),
+        ident(&c.column)
+    )
 }
 
 fn insert_sql(i: &Insert) -> String {

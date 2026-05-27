@@ -1,0 +1,227 @@
+//! Tests that B-tree indexes return results identical to the full-scan path,
+//! stay consistent across UPDATE/DELETE, and survive a WAL-style replay.
+//!
+//! The strategy throughout is differential: build two databases with identical
+//! data, add an index to only one, run the same query against both, and assert
+//! the rows match exactly. Because the executor always re-checks the predicate
+//! after using an index, any divergence would be a real bug.
+
+use postgres_rs::executor::{self, ExecResult};
+use postgres_rs::sql::Parser;
+use postgres_rs::sql::serialize::statement_to_sql;
+use postgres_rs::storage::Database;
+use postgres_rs::types::Value;
+
+fn run(db: &mut Database, sql: &str) -> ExecResult {
+    let stmts = Parser::parse_sql(sql).expect("parse");
+    let mut last = ExecResult::Empty;
+    for s in stmts {
+        last = executor::execute(db, s).expect("execute");
+    }
+    last
+}
+
+fn rows(res: ExecResult) -> Vec<Vec<Value>> {
+    match res {
+        ExecResult::Rows { rows, .. } => rows,
+        _ => panic!("expected rows"),
+    }
+}
+
+/// Populate a fresh products table with `n` rows: id (1..=n), category cycling
+/// through a few values, and price = id * 3 % 1000.
+fn seed_products(db: &mut Database, n: i64) {
+    run(db, "CREATE TABLE products (id integer PRIMARY KEY, category text, price integer)");
+    let cats = ["a", "b", "c", "d"];
+    let mut sql = String::from("INSERT INTO products VALUES ");
+    for i in 1..=n {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, '{}', {})", i, cats[(i as usize) % cats.len()], (i * 3) % 1000));
+    }
+    run(db, &sql);
+}
+
+/// Build two identical databases, indexing `index_col` on only the second.
+fn paired(n: i64, index_sql: Option<&str>) -> (Database, Database) {
+    let mut unindexed = Database::new();
+    let mut indexed = Database::new();
+    seed_products(&mut unindexed, n);
+    seed_products(&mut indexed, n);
+    if let Some(sql) = index_sql {
+        run(&mut indexed, sql);
+    }
+    (unindexed, indexed)
+}
+
+/// Assert the same query yields identical rows with and without an index.
+fn assert_same(unindexed: &mut Database, indexed: &mut Database, query: &str) {
+    let a = rows(run(unindexed, query));
+    let b = rows(run(indexed, query));
+    assert_eq!(a, b, "index path diverged for query: {query}");
+}
+
+#[test]
+fn point_lookup_matches_scan() {
+    let (mut u, mut i) = paired(500, Some("CREATE INDEX idx_price ON products (price)"));
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 300 ORDER BY id");
+    // Reversed operand order must use the index too.
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE 300 = price ORDER BY id");
+    // A value with no match returns nothing on both paths.
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 999999");
+}
+
+#[test]
+fn primary_key_autoindex_matches_scan() {
+    // No explicit index: the PRIMARY KEY index is auto-created on `id`.
+    let (mut u, mut i) = paired(500, None);
+    assert_same(&mut u, &mut i, "SELECT id, category FROM products WHERE id = 250");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id IN (1, 100, 250, 9999) ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id BETWEEN 10 AND 20 ORDER BY id");
+}
+
+#[test]
+fn range_and_between_match_scan() {
+    let (mut u, mut i) = paired(500, Some("CREATE INDEX idx_price ON products (price)"));
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price < 50 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price <= 50 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price > 950 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price >= 950 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price BETWEEN 100 AND 200 ORDER BY id");
+    // Combined with an extra predicate the index can't cover: still correct.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price BETWEEN 100 AND 400 AND category = 'a' ORDER BY id",
+    );
+}
+
+#[test]
+fn in_list_matches_scan() {
+    let (mut u, mut i) = paired(300, Some("CREATE INDEX idx_cat ON products (category)"));
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE category IN ('a', 'c') ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT count(*) FROM products WHERE category = 'b'");
+}
+
+#[test]
+fn update_keeps_index_consistent() {
+    let (mut u, mut i) = paired(200, Some("CREATE INDEX idx_price ON products (price)"));
+    // Change indexed values; the index must follow.
+    run(&mut u, "UPDATE products SET price = price + 1000 WHERE id <= 50");
+    run(&mut i, "UPDATE products SET price = price + 1000 WHERE id <= 50");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price >= 1000 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 1003 ORDER BY id");
+    // The old key must no longer resolve to the moved rows.
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 3 ORDER BY id");
+}
+
+#[test]
+fn delete_keeps_index_consistent() {
+    let (mut u, mut i) = paired(200, Some("CREATE INDEX idx_price ON products (price)"));
+    run(&mut u, "DELETE FROM products WHERE price < 100");
+    run(&mut i, "DELETE FROM products WHERE price < 100");
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price < 200 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT count(*) FROM products");
+    // Deleted rows are gone from point lookups too.
+    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id = 1");
+}
+
+#[test]
+fn indexed_join_matches_scan() {
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(db, "CREATE TABLE users (id integer PRIMARY KEY, name text)");
+        run(db, "CREATE TABLE orders (id integer, user_id integer, amount integer)");
+        run(db, "INSERT INTO users VALUES (1,'Alice'),(2,'Bob'),(3,'Carol')");
+        run(db, "INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,200),(13,3,75)");
+    }
+    // users.id is the PK index; the join probes it per order row.
+    let q = "SELECT u.name, o.amount FROM orders o INNER JOIN users u ON u.id = o.user_id ORDER BY o.amount";
+    assert_same(&mut u, &mut i, q);
+    // LEFT join with the indexed side as the inner table.
+    let q2 = "SELECT o.amount, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id ORDER BY o.id";
+    assert_same(&mut u, &mut i, q2);
+}
+
+#[test]
+fn drop_index_falls_back_to_scan() {
+    let mut db = Database::new();
+    seed_products(&mut db, 100);
+    run(&mut db, "CREATE INDEX idx_price ON products (price)");
+    let before = rows(run(&mut db, "SELECT id FROM products WHERE price = 30 ORDER BY id"));
+    run(&mut db, "DROP INDEX idx_price");
+    let after = rows(run(&mut db, "SELECT id FROM products WHERE price = 30 ORDER BY id"));
+    assert_eq!(before, after, "dropping the index must not change results");
+}
+
+#[test]
+fn index_survives_wal_replay() {
+    // Mimic the WAL: serialize each mutating statement (including CREATE INDEX),
+    // then rebuild a fresh database from the serialized log and confirm the
+    // index is present and correct.
+    let mut original = Database::new();
+    let mut log = String::new();
+    let mut apply = |db: &mut Database, sql: &str| {
+        for stmt in Parser::parse_sql(sql).expect("parse") {
+            let serialized = statement_to_sql(&stmt);
+            let res = executor::execute(db, stmt).expect("execute");
+            if !serialized.is_empty() && !matches!(res, ExecResult::Rows { .. }) {
+                log.push_str(&serialized);
+                log.push_str(";\n");
+            }
+        }
+    };
+    apply(&mut original, "CREATE TABLE t (id integer PRIMARY KEY, v integer)");
+    apply(&mut original, "CREATE INDEX idx_v ON t (v)");
+    apply(&mut original, "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,20)");
+    apply(&mut original, "UPDATE t SET v = 99 WHERE id = 1");
+    apply(&mut original, "DELETE FROM t WHERE id = 3");
+
+    let mut recovered = Database::new();
+    for stmt in Parser::parse_sql(&log).expect("reparse WAL") {
+        executor::execute(&mut recovered, stmt).expect("replay");
+    }
+
+    // The index must be present after replay and produce identical results.
+    let q1 = "SELECT id FROM t WHERE v = 20 ORDER BY id";
+    let q2 = "SELECT id FROM t WHERE v = 99";
+    let q3 = "SELECT id FROM t WHERE v BETWEEN 0 AND 100 ORDER BY id";
+    assert_eq!(rows(run(&mut original, q1)), rows(run(&mut recovered, q1)));
+    assert_eq!(rows(run(&mut original, q2)), rows(run(&mut recovered, q2)));
+    assert_eq!(rows(run(&mut original, q3)), rows(run(&mut recovered, q3)));
+}
+
+#[test]
+fn create_index_round_trips_through_serialize() {
+    let stmt = Parser::parse_sql("CREATE UNIQUE INDEX my_idx ON t (col)")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let sql = statement_to_sql(&stmt);
+    let reparsed = Parser::parse_sql(&sql).unwrap().into_iter().next().unwrap();
+    assert_eq!(stmt, reparsed, "CREATE INDEX did not round-trip: {sql}");
+
+    let stmt = Parser::parse_sql("DROP INDEX IF EXISTS my_idx").unwrap().into_iter().next().unwrap();
+    let sql = statement_to_sql(&stmt);
+    let reparsed = Parser::parse_sql(&sql).unwrap().into_iter().next().unwrap();
+    assert_eq!(stmt, reparsed, "DROP INDEX did not round-trip: {sql}");
+}
+
+#[test]
+fn null_values_excluded_from_index_scans() {
+    // A nullable indexed column: NULLs must never be returned by range scans
+    // (comparisons with NULL are never true), matching the scan path.
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(db, "CREATE TABLE t (id integer, v integer)");
+        run(db, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)");
+    }
+    run(&mut i, "CREATE INDEX idx_v ON t (v)");
+    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v > 0 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v = 10");
+    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v IS NULL ORDER BY id");
+}

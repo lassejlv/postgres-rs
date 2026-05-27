@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 
+use crate::index::Bound;
 use crate::sql::ast::*;
 use crate::storage::{Column, Database, Table};
 use crate::types::{DataType, Value};
@@ -30,6 +31,8 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
     match stmt {
         Statement::CreateTable(c) => exec_create_table(db, c),
         Statement::DropTable(d) => exec_drop_table(db, d),
+        Statement::CreateIndex(c) => exec_create_index(db, c),
+        Statement::DropIndex(d) => exec_drop_index(db, d),
         Statement::Insert(i) => exec_insert(db, i),
         Statement::Select(s) => exec_select(db, s),
         Statement::Update(u) => exec_update(db, u),
@@ -99,14 +102,25 @@ fn from_schema(db: &Database, from: &FromClause) -> Result<(Vec<String>, Vec<Dat
 
 /// Materialize a FROM clause (base table + nested-loop joins) into a flat
 /// rowset with qualified column names and types.
+///
+/// `filter` is the SELECT's WHERE predicate, used purely as an optimization
+/// hint: when the base table has a usable index it prunes the base scan to the
+/// matching rows. The predicate is still applied in full by the caller, so a
+/// missed or over-broad prune never changes the result.
 fn build_source(
     db: &Database,
     from: &FromClause,
+    filter: Option<&Expr>,
 ) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
-    let (mut names, mut types, mut rows) = resolve_source_table(db, &from.base)?;
+    // Base pruning is only safe to drive from the WHERE clause when there is
+    // no join (a join's WHERE could reference other tables' columns, and the
+    // filter runs after the join). With joins, the base is fully scanned and
+    // any indexed join is handled per-inner-side below.
+    let base_filter = if from.joins.is_empty() { filter } else { None };
+    let (mut names, mut types, mut rows) = resolve_base_source(db, &from.base, base_filter)?;
 
     for j in &from.joins {
-        let (right_names, right_types, right_rows) = resolve_source_table(db, &j.table)?;
+        let (right_names, right_types, _) = resolve_source_table(db, &j.table)?;
         let right_width = right_names.len();
         let left_width = names.len();
 
@@ -114,11 +128,27 @@ fn build_source(
         let mut combined_names = names.clone();
         combined_names.extend(right_names.iter().cloned());
 
+        // Try an indexed nested-loop join: if the inner (right) side is a real
+        // table whose join column is indexed and the ON clause is a simple
+        // equality between a left column and that right column, we can probe
+        // the index per left row instead of scanning every right row.
+        let inner = indexed_join_inner(db, j, &names);
+
         let mut joined = Vec::new();
+        // Resolve the right rows once (used by the scan path and to map index
+        // hits back to row data for the indexed path).
+        let (_, _, right_rows) = resolve_source_table(db, &j.table)?;
         let mut right_matched = vec![false; right_rows.len()];
+
         for left_row in &rows {
             let mut matched = false;
-            for (ri, right_row) in right_rows.iter().enumerate() {
+            // Choose the candidate right-row indices for this left row.
+            let candidates: Vec<usize> = match &inner {
+                Some(probe) => probe.candidates_for(db, left_row, &names)?,
+                None => (0..right_rows.len()).collect(),
+            };
+            for ri in candidates {
+                let right_row = &right_rows[ri];
                 let mut combo = left_row.clone();
                 combo.extend(right_row.iter().cloned());
                 let on_true = match &j.on {
@@ -157,6 +187,114 @@ fn build_source(
     Ok((names, types, rows))
 }
 
+/// Resolve the base table of a FROM clause, pruning to index candidates when
+/// the WHERE predicate permits and there is no join that could reference other
+/// tables (we still re-check the predicate later, so this only narrows rows).
+fn resolve_base_source(
+    db: &Database,
+    tref: &TableRef,
+    filter: Option<&Expr>,
+) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
+    // Only real tables (not the virtual catalog views) carry indexes.
+    let is_real = tref.schema.as_deref() != Some("information_schema")
+        && tref.schema.as_deref() != Some("pg_catalog")
+        && !is_pg_catalog_table(&tref.name);
+    if let (true, Some(pred)) = (is_real, filter) {
+        if let Some(table) = db.table(&tref.name) {
+            if let Some(positions) = index_candidate_positions(table, pred) {
+                let mut names = Vec::with_capacity(table.columns.len());
+                let mut types = Vec::with_capacity(table.columns.len());
+                for c in &table.columns {
+                    names.push(format!("{}.{}", tref.qualifier(), c.name));
+                    types.push(c.data_type);
+                }
+                let rows = positions.into_iter().map(|p| table.rows[p].clone()).collect();
+                return Ok((names, types, rows));
+            }
+        }
+    }
+    resolve_source_table(db, tref)
+}
+
+/// An indexed inner side of a join: which right-table column is indexed and
+/// which left column feeds the probe.
+struct IndexedJoinProbe {
+    /// The inner (right) table's name.
+    table: String,
+    /// Indexed column position within the right table.
+    right_col: usize,
+    /// The left column index (into the current left schema) used as the key.
+    left_col: usize,
+}
+
+impl IndexedJoinProbe {
+    /// Candidate right-row positions for a given left row, via the index.
+    fn candidates_for(
+        &self,
+        db: &Database,
+        left_row: &[Value],
+        _left_names: &[String],
+    ) -> Result<Vec<usize>, String> {
+        let key = &left_row[self.left_col];
+        // A NULL key never equality-matches, so probe yields nothing.
+        if key.is_null() {
+            return Ok(Vec::new());
+        }
+        let table = db.table(&self.table).expect("inner table existed at planning");
+        Ok(table.index_eq(self.right_col, key).unwrap_or_default())
+    }
+}
+
+/// Detect an indexed nested-loop opportunity for join `j` whose left schema is
+/// `left_names`. Requires an INNER/LEFT join with an `ON left.x = right.y`
+/// equality where `right.y` is indexed. Returns `None` to fall back to the
+/// nested-loop scan.
+fn indexed_join_inner(db: &Database, j: &Join, left_names: &[String]) -> Option<IndexedJoinProbe> {
+    // RIGHT/FULL joins need the unmatched-right bookkeeping that a per-left
+    // probe complicates; keep them on the scan path. CROSS has no ON clause.
+    if !matches!(j.kind, JoinKind::Inner | JoinKind::Left) {
+        return None;
+    }
+    let on = j.on.as_ref()?;
+    let Expr::Binary { op: BinaryOp::Eq, left, right } = on else {
+        return None;
+    };
+    let table = db.table(&j.table.name)?;
+    let right_qual = j.table.qualifier();
+
+    // Identify which operand is the right (inner) column and which is the left.
+    let try_dir = |a: &Expr, b: &Expr| -> Option<IndexedJoinProbe> {
+        // `a` must be the inner (right) table's column, `b` a left column.
+        let right_col = column_ref_of_table(a, right_qual, table)?;
+        table.index_on(right_col)?;
+        let left_col = resolve_left_column(b, left_names)?;
+        Some(IndexedJoinProbe { table: j.table.name.clone(), right_col, left_col })
+    };
+    try_dir(left, right).or_else(|| try_dir(right, left))
+}
+
+/// If `expr` names a column of `table` (qualified by `qual` or bare), return
+/// its column index within that table.
+fn column_ref_of_table(expr: &Expr, qual: &str, table: &Table) -> Option<usize> {
+    match expr {
+        Expr::QualifiedColumn { qualifier, name } if qualifier == qual => table.column_index(name),
+        // A bare column resolves only if it is unambiguously in this table.
+        Expr::Column(name) => table.column_index(name),
+        _ => None,
+    }
+}
+
+/// Resolve a join-key expression to an index into the current left schema.
+fn resolve_left_column(expr: &Expr, left_names: &[String]) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => resolve_column(left_names, None, name).ok(),
+        Expr::QualifiedColumn { qualifier, name } => {
+            resolve_column(left_names, Some(qualifier), name).ok()
+        }
+        _ => None,
+    }
+}
+
 /// Resolve one table reference (real or a virtual catalog table) into its
 /// qualified column names, types, and rows.
 fn resolve_source_table(
@@ -179,6 +317,167 @@ fn resolve_source_table(
         types.push(c.data_type);
     }
     Ok((names, types, table.rows.clone()))
+}
+
+// --- index planning ----------------------------------------------------------
+
+/// An access path an index can satisfy for a single column.
+enum IndexPlan {
+    /// `col = value`.
+    Eq(Value),
+    /// `col IN (v1, v2, ...)`.
+    In(Vec<Value>),
+    /// A (possibly half-open) range; bounds carry inclusivity.
+    Range(Option<Bound>, Option<Bound>),
+}
+
+/// Inspect a WHERE predicate for an index-eligible access path on a single
+/// column of `target`. Returns the column index plus the plan, or `None` to
+/// fall back to a full scan.
+///
+/// Only the *outermost* shape is considered, plus AND-conjuncts (we may use one
+/// conjunct's index and re-check the whole predicate afterward). The executor
+/// always re-evaluates the original filter on the candidate rows, so an
+/// over-broad plan can never return wrong rows — only a slower-than-ideal one.
+fn plan_index_access(filter: &Expr, target: &Table) -> Option<(usize, IndexPlan)> {
+    match filter {
+        // `col = const` (either operand order). Only a constant RHS qualifies.
+        Expr::Binary { op: BinaryOp::Eq, left, right } => {
+            if let (Some(col), Some(v)) = (column_index_of(left, target), const_value(right)) {
+                return Some((col, IndexPlan::Eq(v)));
+            }
+            if let (Some(col), Some(v)) = (column_index_of(right, target), const_value(left)) {
+                return Some((col, IndexPlan::Eq(v)));
+            }
+            None
+        }
+        // Range comparisons: `col < c`, `c > col`, etc.
+        Expr::Binary { op: op @ (BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq), left, right } => {
+            if let (Some(col), Some(v)) = (column_index_of(left, target), const_value(right)) {
+                return Some((col, range_from_op(*op, v)));
+            }
+            if let (Some(col), Some(v)) = (column_index_of(right, target), const_value(left)) {
+                // Flip the operator since the column is on the right.
+                return Some((col, range_from_op(flip_op(*op), v)));
+            }
+            None
+        }
+        // `col IN (consts...)` — all list elements must be constant.
+        Expr::InList { expr, list, negated: false } => {
+            let col = column_index_of(expr, target)?;
+            let mut vals = Vec::with_capacity(list.len());
+            for item in list {
+                vals.push(const_value(item)?);
+            }
+            Some((col, IndexPlan::In(vals)))
+        }
+        // `col BETWEEN lo AND hi` — inclusive range on both ends.
+        Expr::Between { expr, low, high, negated: false } => {
+            let col = column_index_of(expr, target)?;
+            let lo = const_value(low)?;
+            let hi = const_value(high)?;
+            Some((
+                col,
+                IndexPlan::Range(
+                    Some(Bound { value: lo, inclusive: true }),
+                    Some(Bound { value: hi, inclusive: true }),
+                ),
+            ))
+        }
+        // AND: try each side; the first index-eligible conjunct wins.
+        Expr::Binary { op: BinaryOp::And, left, right } => {
+            plan_index_access(left, target).or_else(|| plan_index_access(right, target))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve an expression that is a (possibly qualified) column reference to its
+/// column index within `target`, or `None` if it isn't a plain column of it.
+fn column_index_of(expr: &Expr, target: &Table) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => target.column_index(name),
+        // A qualifier is accepted regardless of value: a single-table scan has
+        // exactly one source, so any qualifier must refer to it.
+        Expr::QualifiedColumn { name, .. } => target.column_index(name),
+        _ => None,
+    }
+}
+
+/// Evaluate an expression that must be a constant (no column references), used
+/// for the right-hand side of an indexable predicate.
+fn const_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {
+            eval_expr(expr, &[], &[]).ok()
+        }
+        // Casts/negation of constants are still constants (e.g. `-5`, `'5'::int`).
+        Expr::Unary { .. } | Expr::Cast { .. } => eval_expr(expr, &[], &[]).ok(),
+        _ => None,
+    }
+}
+
+/// Build a `Range` plan from a comparison operator and bound value.
+fn range_from_op(op: BinaryOp, v: Value) -> IndexPlan {
+    match op {
+        BinaryOp::Lt => IndexPlan::Range(None, Some(Bound { value: v, inclusive: false })),
+        BinaryOp::LtEq => IndexPlan::Range(None, Some(Bound { value: v, inclusive: true })),
+        BinaryOp::Gt => IndexPlan::Range(Some(Bound { value: v, inclusive: false }), None),
+        BinaryOp::GtEq => IndexPlan::Range(Some(Bound { value: v, inclusive: true }), None),
+        _ => unreachable!("range_from_op called with non-range operator"),
+    }
+}
+
+/// Mirror a comparison operator when its operands are swapped (`c < col`
+/// becomes `col > c`).
+fn flip_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Candidate row positions for a filter, using an index when one applies.
+///
+/// Used by UPDATE/DELETE (which then re-check the full predicate). Returns a
+/// position list; positions index into `table.rows`. When no index applies (or
+/// there is no filter), returns all positions — i.e. the full scan.
+fn candidate_positions(
+    table: &Table,
+    filter: &Option<Expr>,
+    _col_names: &[String],
+) -> Result<Vec<usize>, String> {
+    if let Some(pred) = filter {
+        if let Some(positions) = index_candidate_positions(table, pred) {
+            return Ok(positions);
+        }
+    }
+    Ok((0..table.rows.len()).collect())
+}
+
+/// If `filter` yields an index plan over `table`, execute it and return the
+/// matching row positions. `None` means no usable index → caller full-scans.
+fn index_candidate_positions(table: &Table, filter: &Expr) -> Option<Vec<usize>> {
+    let (col, plan) = plan_index_access(filter, table)?;
+    // Only proceed if an index actually exists on that column.
+    table.index_on(col)?;
+    let positions = match plan {
+        IndexPlan::Eq(v) => table.index_eq(col, &v)?,
+        IndexPlan::In(vals) => {
+            let mut all = Vec::new();
+            for v in &vals {
+                if let Some(p) = table.index_eq(col, v) {
+                    all.extend(p);
+                }
+            }
+            all
+        }
+        IndexPlan::Range(lo, hi) => table.index_range(col, lo, hi)?,
+    };
+    Some(positions)
 }
 
 /// Generate the rows of a supported `information_schema` view from the live
@@ -360,7 +659,7 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
         }
         return Err(format!("relation \"{}\" already exists", c.name));
     }
-    let columns = c
+    let columns: Vec<Column> = c
         .columns
         .into_iter()
         .map(|cd| Column {
@@ -372,8 +671,58 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
             serial: cd.serial,
         })
         .collect();
-    db.create_table(Table { name: c.name, columns, rows: Vec::new() })?;
+    // Auto-create a unique index for each PRIMARY KEY column so point lookups
+    // on it are fast out of the box (mirrors PostgreSQL's implicit pkey index).
+    let pk_indexes: Vec<(usize, String)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| col.primary_key)
+        .map(|(i, col)| (i, format!("{}_{}_pkey", c.name, col.name)))
+        .collect();
+    let mut table = Table::new(c.name.clone(), columns);
+    for (col_idx, name) in pk_indexes {
+        table.create_index(name, col_idx, true);
+    }
+    db.create_table(table)?;
     Ok(ExecResult::Command("CREATE TABLE".into()))
+}
+
+fn exec_create_index(db: &mut Database, c: CreateIndex) -> Result<ExecResult, String> {
+    let table = db
+        .table_mut(&c.table)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", c.table))?;
+    let column = table
+        .column_index(&c.column)
+        .ok_or_else(|| format!("column \"{}\" does not exist", c.column))?;
+    // Generate a deterministic name when none is given, matching PostgreSQL's
+    // `<table>_<column>_idx` convention so replay is stable.
+    let name = c.name.unwrap_or_else(|| format!("{}_{}_idx", c.table, c.column));
+    if table.has_index_named(&name) {
+        if c.if_not_exists {
+            return Ok(ExecResult::Command("CREATE INDEX".into()));
+        }
+        return Err(format!("relation \"{name}\" already exists"));
+    }
+    table.create_index(name, column, c.unique);
+    Ok(ExecResult::Command("CREATE INDEX".into()))
+}
+
+fn exec_drop_index(db: &mut Database, d: DropIndex) -> Result<ExecResult, String> {
+    // Index names are not globally unique in our flat model, so search every
+    // table for one bearing this name.
+    let mut dropped = false;
+    for name in db.table_names() {
+        if let Some(table) = db.table_mut(&name) {
+            if table.drop_index(&d.name) {
+                dropped = true;
+                break;
+            }
+        }
+    }
+    if !dropped && !d.if_exists {
+        return Err(format!("index \"{}\" does not exist", d.name));
+    }
+    Ok(ExecResult::Command("DROP INDEX".into()))
 }
 
 fn exec_drop_table(db: &mut Database, d: DropTable) -> Result<ExecResult, String> {
@@ -461,7 +810,10 @@ fn exec_insert(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
     let tag = format!("INSERT 0 {n}");
     let result = returning_result(&ins.returning, &columns, &new_rows, tag)?;
     let table = db.table_mut(&ins.table).expect("table existed above");
-    table.rows.extend(new_rows);
+    // `push_row` assigns each row a stable id and maintains every index.
+    for row in new_rows {
+        table.push_row(row);
+    }
     Ok(result)
 }
 
@@ -522,7 +874,7 @@ fn exec_select(db: &mut Database, sel: Select) -> Result<ExecResult, String> {
     // Resolve the source: the (possibly joined) FROM rows with qualified
     // column names, or a single synthetic empty row for `SELECT <exprs>`.
     let (col_names, col_types, source_rows) = match &sel.from {
-        Some(fc) => build_source(db, fc)?,
+        Some(fc) => build_source(db, fc, sel.filter.as_ref())?,
         None => (Vec::new(), Vec::new(), vec![Vec::new()]),
     };
 
@@ -805,28 +1157,38 @@ fn exec_update(db: &mut Database, upd: Update) -> Result<ExecResult, String> {
         targets.push((idx, expr.clone()));
     }
 
-    let rows = table.rows.clone();
-    let mut updated = Vec::with_capacity(rows.len());
+    // Pick the candidate row positions: an index when the filter allows it,
+    // otherwise every row. The predicate is re-checked below regardless, so
+    // the index can only narrow the set, never change the result.
+    let candidates = candidate_positions(table, &upd.filter, &col_names)?;
+
+    let mut new_versions: Vec<(usize, Vec<Value>)> = Vec::new();
     let mut affected = Vec::new();
-    for mut row in rows {
+    for pos in candidates {
+        let row = &table.rows[pos];
         let matches = match &upd.filter {
-            Some(pred) => eval_expr(pred, &col_names, &row)?.is_true(),
+            Some(pred) => eval_expr(pred, &col_names, row)?.is_true(),
             None => true,
         };
-        if matches {
-            for (idx, expr) in &targets {
-                let val = eval_expr(expr, &col_names, &row)?;
-                row[*idx] = coerce(val, columns[*idx].data_type)?;
-            }
-            affected.push(row.clone());
+        if !matches {
+            continue;
         }
-        updated.push(row);
+        let mut new_row = row.clone();
+        for (idx, expr) in &targets {
+            let val = eval_expr(expr, &col_names, &new_row)?;
+            new_row[*idx] = coerce(val, columns[*idx].data_type)?;
+        }
+        affected.push(new_row.clone());
+        new_versions.push((pos, new_row));
     }
 
     let tag = format!("UPDATE {}", affected.len());
     let result = returning_result(&upd.returning, &columns, &affected, tag)?;
     let table = db.table_mut(&upd.table).expect("table existed above");
-    table.rows = updated;
+    // Apply through `update_row` so each touched index is repaired in place.
+    for (pos, new_row) in new_versions {
+        table.update_row(pos, new_row);
+    }
     Ok(result)
 }
 
@@ -836,26 +1198,27 @@ fn exec_delete(db: &mut Database, del: Delete) -> Result<ExecResult, String> {
         .ok_or_else(|| format!("relation \"{}\" does not exist", del.table))?;
     let col_names = table.column_names();
     let columns = table.columns.clone();
-    let rows = table.rows.clone();
 
-    let mut kept = Vec::with_capacity(rows.len());
-    let mut affected = Vec::new();
-    for row in rows {
+    let candidates = candidate_positions(table, &del.filter, &col_names)?;
+    // Build the matching positions in ascending row order so RETURNING and the
+    // command tag match the full-scan path exactly.
+    let mut matching = std::collections::BTreeSet::new();
+    for pos in candidates {
         let matches = match &del.filter {
-            Some(pred) => eval_expr(pred, &col_names, &row)?.is_true(),
+            Some(pred) => eval_expr(pred, &col_names, &table.rows[pos])?.is_true(),
             None => true,
         };
         if matches {
-            affected.push(row);
-        } else {
-            kept.push(row);
+            matching.insert(pos);
         }
     }
+    let positions: Vec<usize> = matching.into_iter().collect();
+    let affected: Vec<Vec<Value>> = positions.iter().map(|&p| table.rows[p].clone()).collect();
 
     let tag = format!("DELETE {}", affected.len());
     let result = returning_result(&del.returning, &columns, &affected, tag)?;
     let table = db.table_mut(&del.table).expect("table existed above");
-    table.rows = kept;
+    table.delete_rows(&positions);
     Ok(result)
 }
 
