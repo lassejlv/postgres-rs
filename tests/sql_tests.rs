@@ -532,6 +532,25 @@ fn alter_table() {
 }
 
 #[test]
+fn distinct_aggregates_and_string_agg() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (region text, amount integer)");
+    run(&mut db, "INSERT INTO t VALUES ('w',10),('w',10),('w',20),('e',30)");
+
+    let r = rows(run(&mut db, "SELECT count(*), count(DISTINCT amount), sum(DISTINCT amount) FROM t"));
+    assert_eq!(r[0], vec![Value::Int(4), Value::Int(3), Value::Int(60)]);
+
+    let r = rows(run(&mut db, "SELECT region, string_agg(amount::text, ',') FROM t GROUP BY region ORDER BY region"));
+    assert_eq!(r, vec![
+        vec![Value::Text("e".into()), Value::Text("30".into())],
+        vec![Value::Text("w".into()), Value::Text("10,10,20".into())],
+    ]);
+
+    let r = rows(run(&mut db, "SELECT string_agg(DISTINCT region, '|') FROM t"));
+    assert_eq!(r[0][0], Value::Text("w|e".into()));
+}
+
+#[test]
 fn qualified_column_on_single_table() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id integer, v integer)");

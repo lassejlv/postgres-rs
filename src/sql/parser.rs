@@ -850,7 +850,7 @@ impl Parser {
                     | "current_catalog" | "current_date" | "current_timestamp"
                         if self.peek() != Some(&Token::LParen) =>
                     {
-                        Ok(Expr::Function { name: lw, args: Vec::new(), star: false })
+                        Ok(Expr::Function { name: lw, args: Vec::new(), star: false, distinct: false })
                     }
                     _ => {
                         // Function call?
@@ -892,12 +892,13 @@ impl Parser {
         if self.peek() == Some(&Token::Star) {
             self.advance();
             self.expect(&Token::RParen)?;
-            return Ok(Expr::Function { name, args: Vec::new(), star: true });
+            return Ok(Expr::Function { name, args: Vec::new(), star: true, distinct: false });
         }
         let mut args = Vec::new();
+        let mut distinct = false;
         if self.peek() != Some(&Token::RParen) {
-            // Accept and ignore `DISTINCT` inside aggregates.
-            self.eat_keyword("distinct");
+            // `DISTINCT` inside an aggregate, e.g. `count(DISTINCT x)`.
+            distinct = self.eat_keyword("distinct");
             loop {
                 args.push(self.parse_expr()?);
                 if self.eat(&Token::Comma) {
@@ -907,7 +908,7 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        Ok(Expr::Function { name, args, star: false })
+        Ok(Expr::Function { name, args, star: false, distinct })
     }
 
     /// If a `[NOT] LIKE/ILIKE/IN/BETWEEN` predicate begins here, return its

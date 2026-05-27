@@ -220,8 +220,8 @@ pub enum Expr {
     Exists(Box<Select>),
     /// `expr [NOT] IN (SELECT ...)`.
     InSubquery { expr: Box<Expr>, subquery: Box<Select>, negated: bool },
-    /// A function call, e.g. `count(*)` or `upper(name)`.
-    Function { name: String, args: Vec<Expr>, star: bool },
+    /// A function call, e.g. `count(*)`, `upper(name)`, or `count(DISTINCT x)`.
+    Function { name: String, args: Vec<Expr>, star: bool, distinct: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

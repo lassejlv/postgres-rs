@@ -67,7 +67,8 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
   `[NOT] LIKE`/`ILIKE` (`%`/`_`), `[NOT] IN (...)`, `[NOT] BETWEEN`,
   `CASE` (simple and searched), `CAST(x AS t)` / `x::t`, parentheses,
   three-valued NULL logic
-- Aggregates: `count`, `sum`, `avg`, `min`, `max` (with `GROUP BY`/`HAVING`)
+- Aggregates: `count`, `sum`, `avg`, `min`, `max`, `string_agg` (with
+  `GROUP BY`/`HAVING` and `DISTINCT`, e.g. `count(DISTINCT x)`)
 - Scalar functions: `upper`, `lower`, `length`, `abs`, `round`, `trim`/`ltrim`/
   `rtrim`, `substr`/`substring`, `replace`, `coalesce`, `nullif`, `greatest`,
   `least`, `concat`, `current_user`/`current_database()`/`current_schema`,

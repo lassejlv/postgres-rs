@@ -292,12 +292,13 @@ pub fn expr_to_sql(e: &Expr) -> String {
             let op = if *negated { "NOT IN" } else { "IN" };
             format!("({} {op} ({}))", expr_to_sql(expr), select_to_sql(subquery))
         }
-        Expr::Function { name, args, star } => {
+        Expr::Function { name, args, star, distinct } => {
             if *star {
                 format!("{name}(*)")
             } else {
                 let a: Vec<String> = args.iter().map(expr_to_sql).collect();
-                format!("{name}({})", a.join(", "))
+                let d = if *distinct { "DISTINCT " } else { "" };
+                format!("{name}({d}{})", a.join(", "))
             }
         }
     }

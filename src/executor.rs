@@ -1612,7 +1612,9 @@ fn eval_expr(expr: &Expr, col_names: &[String], row: &[Value]) -> Result<Value, 
         Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
             Err("correlated subqueries are not supported".into())
         }
-        Expr::Function { name, args, star } => eval_scalar_function(name, args, *star, col_names, row),
+        Expr::Function { name, args, star, .. } => {
+            eval_scalar_function(name, args, *star, col_names, row)
+        }
     }
 }
 
@@ -2128,7 +2130,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
 fn is_aggregate_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max"
+        "count" | "sum" | "avg" | "min" | "max" | "string_agg"
     )
 }
 
@@ -2141,8 +2143,8 @@ fn eval_aggregate_expr(
     rows: &[Vec<Value>],
 ) -> Result<Value, String> {
     match expr {
-        Expr::Function { name, args, star } if is_aggregate_name(name) => {
-            eval_aggregate(name, args, *star, col_names, rows)
+        Expr::Function { name, args, star, distinct } if is_aggregate_name(name) => {
+            eval_aggregate(name, args, *star, *distinct, col_names, rows)
         }
         Expr::Binary { op, left, right } => {
             let l = eval_aggregate_expr(left, col_names, rows)?;
@@ -2166,92 +2168,95 @@ fn eval_aggregate(
     name: &str,
     args: &[Expr],
     star: bool,
+    distinct: bool,
     col_names: &[String],
     rows: &[Vec<Value>],
 ) -> Result<Value, String> {
     let lname = name.to_ascii_lowercase();
-    match lname.as_str() {
-        "count" => {
-            if star {
-                return Ok(Value::Int(rows.len() as i64));
-            }
-            let arg = args.first().ok_or("count() requires an argument")?;
-            let mut n = 0i64;
-            for row in rows {
-                if !eval_expr(arg, col_names, row)?.is_null() {
-                    n += 1;
-                }
-            }
-            Ok(Value::Int(n))
+
+    // count(*) ignores the argument and counts rows.
+    if lname == "count" && star {
+        return Ok(Value::Int(rows.len() as i64));
+    }
+
+    // Collect the (non-null) argument values once, deduplicating for DISTINCT.
+    let arg = args.first().ok_or_else(|| format!("{lname}() requires an argument"))?;
+    let mut vals: Vec<Value> = Vec::new();
+    for row in rows {
+        let v = eval_expr(arg, col_names, row)?;
+        if !v.is_null() {
+            vals.push(v);
         }
+    }
+    if distinct {
+        let mut seen = std::collections::HashSet::new();
+        vals.retain(|v| seen.insert(v.to_text().unwrap_or_default()));
+    }
+
+    match lname.as_str() {
+        "count" => Ok(Value::Int(vals.len() as i64)),
         "sum" => {
-            let arg = args.first().ok_or("sum() requires an argument")?;
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
-            let mut any = false;
             let mut is_float = false;
-            for row in rows {
-                match eval_expr(arg, col_names, row)? {
-                    Value::Null => {}
+            for v in &vals {
+                match v {
                     Value::Int(i) => {
-                        any = true;
                         int_sum += i;
-                        float_sum += i as f64;
+                        float_sum += *i as f64;
                     }
                     Value::Float(f) => {
-                        any = true;
                         is_float = true;
                         float_sum += f;
                     }
                     _ => return Err("sum() requires numeric input".into()),
                 }
             }
-            if !any {
-                Ok(Value::Null)
-            } else if is_float {
-                Ok(Value::Float(float_sum))
-            } else {
-                Ok(Value::Int(int_sum))
-            }
+            Ok(if is_float { Value::Float(float_sum) } else { Value::Int(int_sum) })
         }
         "avg" => {
-            let arg = args.first().ok_or("avg() requires an argument")?;
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
             let mut sum = 0.0;
-            let mut n = 0i64;
-            for row in rows {
-                match eval_expr(arg, col_names, row)? {
-                    Value::Null => {}
-                    other => {
-                        sum += to_f64(&other)?;
-                        n += 1;
-                    }
-                }
+            for v in &vals {
+                sum += to_f64(v)?;
             }
-            if n == 0 {
-                Ok(Value::Null)
-            } else {
-                Ok(Value::Float(sum / n as f64))
-            }
+            Ok(Value::Float(sum / vals.len() as f64))
         }
         "min" | "max" => {
             let want_min = lname == "min";
-            let arg = args.first().ok_or("min/max requires an argument")?;
             let mut best: Option<Value> = None;
-            for row in rows {
-                let v = eval_expr(arg, col_names, row)?;
-                if v.is_null() {
-                    continue;
-                }
+            for v in &vals {
                 best = Some(match best {
-                    None => v,
+                    None => v.clone(),
                     Some(cur) => {
-                        let ord = compare_values(&v, &cur).unwrap_or(Ordering::Equal);
+                        let ord = compare_values(v, &cur).unwrap_or(Ordering::Equal);
                         let take = if want_min { ord == Ordering::Less } else { ord == Ordering::Greater };
-                        if take { v } else { cur }
+                        if take { v.clone() } else { cur }
                     }
                 });
             }
             Ok(best.unwrap_or(Value::Null))
+        }
+        "string_agg" => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            // The separator is a constant second argument.
+            let sep = match args.get(1) {
+                Some(e) => {
+                    let empty = Vec::new();
+                    let row = rows.first().unwrap_or(&empty);
+                    eval_expr(e, col_names, row)?.to_text().unwrap_or_default()
+                }
+                None => String::new(),
+            };
+            let parts: Vec<String> = vals.iter().map(|v| v.to_text().unwrap_or_default()).collect();
+            Ok(Value::Text(parts.join(&sep)))
         }
         _ => Err(format!("unknown aggregate {lname}")),
     }
