@@ -72,7 +72,7 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
 - Scalar functions: `upper`, `lower`, `length`, `abs`, `round`, `trim`/`ltrim`/
   `rtrim`, `substr`/`substring`, `replace`, `coalesce`, `nullif`, `greatest`,
   `least`, `concat`, `current_user`/`current_database()`/`current_schema`,
-  `version`, `now`
+  `version`, `now`; date/time: `EXTRACT`/`date_part`, `date_trunc`
 - **Transactions**: `BEGIN` / `COMMIT` / `ROLLBACK` with real rollback —
   statements run against a private snapshot, an error aborts the block (further
   commands rejected until it ends), and only committed mutations reach the WAL.

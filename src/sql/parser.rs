@@ -830,6 +830,20 @@ impl Parser {
                     "true" => Ok(Expr::Bool(true)),
                     "false" => Ok(Expr::Bool(false)),
                     "null" => Ok(Expr::Null),
+                    "extract" => {
+                        // EXTRACT(field FROM source) → date_part('field', source)
+                        self.expect(&Token::LParen)?;
+                        let field = self.parse_ident()?.to_ascii_lowercase();
+                        self.expect_keyword("from")?;
+                        let source = self.parse_expr()?;
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::Function {
+                            name: "date_part".to_string(),
+                            args: vec![Expr::Str(field), source],
+                            star: false,
+                            distinct: false,
+                        })
+                    }
                     "exists" => {
                         self.expect(&Token::LParen)?;
                         let sub = self.parse_select()?;

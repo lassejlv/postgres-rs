@@ -2068,6 +2068,49 @@ fn eval_scalar_function(
             Ok(Value::Text("postgres".to_string()))
         }
         "current_schema" => Ok(Value::Text("public".to_string())),
+        "date_part" | "extract" => {
+            let field = arg(&vals, 0)?.to_text().unwrap_or_default().to_ascii_lowercase();
+            let src = arg(&vals, 1)?;
+            if src.is_null() {
+                return Ok(Value::Null);
+            }
+            let p = parse_iso_datetime(&src.to_text().unwrap_or_default())
+                .ok_or_else(|| format!("invalid timestamp for date_part: {src}"))?;
+            let v = match field.as_str() {
+                "year" => p.year,
+                "month" => p.month,
+                "day" => p.day,
+                "hour" => p.hour,
+                "minute" => p.minute,
+                "second" => p.second,
+                other => return Err(format!("unsupported date_part field: {other}")),
+            };
+            Ok(Value::Float(v as f64))
+        }
+        "date_trunc" => {
+            let field = arg(&vals, 0)?.to_text().unwrap_or_default().to_ascii_lowercase();
+            let src = arg(&vals, 1)?;
+            if src.is_null() {
+                return Ok(Value::Null);
+            }
+            let p = parse_iso_datetime(&src.to_text().unwrap_or_default())
+                .ok_or_else(|| format!("invalid timestamp for date_trunc: {src}"))?;
+            let truncated = match field.as_str() {
+                "year" => format!("{:04}-01-01 00:00:00", p.year),
+                "month" => format!("{:04}-{:02}-01 00:00:00", p.year, p.month),
+                "day" => format!("{:04}-{:02}-{:02} 00:00:00", p.year, p.month, p.day),
+                "hour" => format!("{:04}-{:02}-{:02} {:02}:00:00", p.year, p.month, p.day, p.hour),
+                "minute" => {
+                    format!("{:04}-{:02}-{:02} {:02}:{:02}:00", p.year, p.month, p.day, p.hour, p.minute)
+                }
+                "second" => format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                    p.year, p.month, p.day, p.hour, p.minute, p.second
+                ),
+                other => return Err(format!("unsupported date_trunc field: {other}")),
+            };
+            Ok(Value::Text(truncated))
+        }
         // Catalog helpers used by psql meta-commands.
         "pg_get_userbyid" => Ok(Value::Text("postgres".to_string())),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
@@ -2096,6 +2139,46 @@ fn str_fn(vals: &[Value], f: impl Fn(&str) -> String) -> Result<Value, String> {
 
 fn arg<'a>(vals: &'a [Value], i: usize) -> Result<&'a Value, String> {
     vals.get(i).ok_or_else(|| "missing function argument".to_string())
+}
+
+/// Components of an ISO date or timestamp (date/time types are text-stored).
+struct DateTimeParts {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+}
+
+/// Parse an ISO date/timestamp like `2024-03-15` or `2024-03-15 10:30:00`
+/// (a `T` separator and trailing fraction/timezone are tolerated).
+fn parse_iso_datetime(s: &str) -> Option<DateTimeParts> {
+    let s = s.trim();
+    let (date, time) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut d = date.split('-');
+    let year = d.next()?.parse().ok()?;
+    let month = d.next().and_then(|x| x.parse().ok()).unwrap_or(1);
+    let day = d.next().and_then(|x| x.parse().ok()).unwrap_or(1);
+
+    let (mut hour, mut minute, mut second) = (0, 0, 0);
+    if let Some(t) = time {
+        // Drop any timezone offset or 'Z' suffix.
+        let t = t.split(['+', 'Z']).next().unwrap_or(t);
+        let mut parts = t.split(':');
+        hour = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        minute = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        // Seconds may carry a fraction (e.g. 12.5).
+        second = parts
+            .next()
+            .and_then(|x| x.split('.').next())
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+    }
+    Some(DateTimeParts { year, month, day, hour, minute, second })
 }
 
 // --- aggregates --------------------------------------------------------------
@@ -2403,7 +2486,7 @@ fn infer_expr_type(expr: &Expr, col_names: &[String], col_types: &[DataType]) ->
         Expr::Function { name, .. } => match name.to_ascii_lowercase().as_str() {
             "count" => DataType::Int8,
             "sum" | "abs" => DataType::Int8,
-            "avg" | "round" => DataType::Float8,
+            "avg" | "round" | "date_part" | "extract" => DataType::Float8,
             "length" | "char_length" | "character_length" => DataType::Int8,
             _ => DataType::Text,
         },

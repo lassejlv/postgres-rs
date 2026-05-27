@@ -551,6 +551,19 @@ fn distinct_aggregates_and_string_agg() {
 }
 
 #[test]
+fn date_time_functions() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE e (ts timestamp)");
+    run(&mut db, "INSERT INTO e VALUES ('2024-03-15 10:30:45')");
+
+    let r = rows(run(&mut db, "SELECT EXTRACT(year FROM ts), EXTRACT(month FROM ts), date_part('day', ts) FROM e"));
+    assert_eq!(r[0], vec![Value::Float(2024.0), Value::Float(3.0), Value::Float(15.0)]);
+
+    let r = rows(run(&mut db, "SELECT date_trunc('month', ts) FROM e"));
+    assert_eq!(r[0][0], Value::Text("2024-03-01 00:00:00".into()));
+}
+
+#[test]
 fn qualified_column_on_single_table() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id integer, v integer)");
