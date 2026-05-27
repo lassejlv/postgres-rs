@@ -49,9 +49,9 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
   database runs in memory.
 
 **SQL**
-- `CREATE TABLE` / `DROP TABLE` (with `IF [NOT] EXISTS`), column constraints
-  (`NOT NULL`, `PRIMARY KEY` parsed), `DEFAULT <expr>` values,
-  `serial`/`bigserial`/`smallserial` auto-increment columns
+- `CREATE TABLE` / `DROP TABLE` (with `IF [NOT] EXISTS`), enforced `NOT NULL`,
+  `PRIMARY KEY` and `UNIQUE` constraints (duplicate keys rejected atomically),
+  `DEFAULT <expr>` values, `serial`/`bigserial`/`smallserial` auto-increment
 - `INSERT ... VALUES (...), (...)` with/without a column list
 - `SELECT` / `SELECT DISTINCT`: projection with aliases, `*`, `WHERE`,
   `GROUP BY`, `HAVING`, `ORDER BY` (by expression or output alias),

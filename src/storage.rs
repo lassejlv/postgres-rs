@@ -17,7 +17,7 @@ pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub not_null: bool,
-    /// Reserved for primary-key/uniqueness enforcement (not yet enforced).
+    /// Whether this column is a PRIMARY KEY (enforced via a unique index).
     #[allow(dead_code)]
     pub primary_key: bool,
     /// `DEFAULT` expression applied when the column is omitted from an INSERT.
@@ -164,6 +164,28 @@ impl Table {
         self.indexes.iter().any(|i| i.name == name)
     }
 
+    /// If inserting/updating `row` would collide with an existing row on a
+    /// unique index, return that index's name. `exclude` skips a position (the
+    /// row being updated, so it doesn't conflict with itself). NULLs never
+    /// conflict (SQL permits multiple NULLs in a unique index).
+    pub fn unique_violation(&self, row: &[Value], exclude: Option<usize>) -> Option<String> {
+        for idx in &self.indexes {
+            if !idx.unique {
+                continue;
+            }
+            let value = &row[idx.column];
+            if value.is_null() {
+                continue;
+            }
+            if let Some(positions) = self.index_eq(idx.column, value) {
+                if positions.iter().any(|&p| Some(p) != exclude) {
+                    return Some(idx.name.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Build and populate a new index over `column` from the current rows.
     pub fn create_index(&mut self, name: String, column: usize, unique: bool) {
         let mut idx = Index::new(name, column, unique);
@@ -171,6 +193,11 @@ impl Table {
             idx.insert(&row[column], id);
         }
         self.indexes.push(idx);
+    }
+
+    /// Columns covered by a unique index (for batch duplicate checks).
+    pub fn unique_index_columns(&self) -> Vec<usize> {
+        self.indexes.iter().filter(|i| i.unique).map(|i| i.column).collect()
     }
 
     /// Drop an index by name, returning whether it existed.

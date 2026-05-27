@@ -808,6 +808,27 @@ fn exec_insert(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
         new_rows.push(row);
     }
 
+    // Enforce unique constraints atomically: check all new rows against
+    // existing data and against each other before inserting any.
+    {
+        let table = db.table(&ins.table).expect("table existed above");
+        for row in &new_rows {
+            if let Some(name) = table.unique_violation(row, None) {
+                return Err(format!("duplicate key value violates unique constraint \"{name}\""));
+            }
+        }
+        for col in table.unique_index_columns() {
+            let mut seen = std::collections::HashSet::new();
+            for row in &new_rows {
+                if let Some(key) = row[col].to_text() {
+                    if !seen.insert(key) {
+                        return Err("duplicate key value violates unique constraint".into());
+                    }
+                }
+            }
+        }
+    }
+
     let n = new_rows.len();
     // PostgreSQL tag form is "INSERT <oid> <count>"; oid is always 0 now.
     let tag = format!("INSERT 0 {n}");
@@ -1334,6 +1355,25 @@ fn exec_update(db: &mut Database, mut upd: Update) -> Result<ExecResult, String>
         }
         affected.push(new_row.clone());
         new_versions.push((pos, new_row));
+    }
+
+    // Enforce unique constraints before applying any change (atomic): each new
+    // row must not collide with another row (excluding its own position) or
+    // with another row updated in the same statement.
+    for (pos, new_row) in &new_versions {
+        if let Some(name) = table.unique_violation(new_row, Some(*pos)) {
+            return Err(format!("duplicate key value violates unique constraint \"{name}\""));
+        }
+    }
+    for col in table.unique_index_columns() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, new_row) in &new_versions {
+            if let Some(key) = new_row[col].to_text() {
+                if !seen.insert(key) {
+                    return Err("duplicate key value violates unique constraint".into());
+                }
+            }
+        }
     }
 
     let tag = format!("UPDATE {}", affected.len());

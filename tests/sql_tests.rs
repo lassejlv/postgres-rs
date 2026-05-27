@@ -474,6 +474,36 @@ fn subqueries() {
 }
 
 #[test]
+fn unique_and_primary_key_enforcement() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id integer PRIMARY KEY, name text)");
+    run(&mut db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+
+    // Duplicate primary key (against existing row) is rejected.
+    let dup = Parser::parse_sql("INSERT INTO t VALUES (1, 'dup')").unwrap().into_iter().next().unwrap();
+    assert!(executor::execute(&mut db, dup).is_err());
+
+    // Duplicate within the same batch is rejected.
+    let batch = Parser::parse_sql("INSERT INTO t VALUES (3, 'c'), (3, 'd')").unwrap().into_iter().next().unwrap();
+    assert!(executor::execute(&mut db, batch).is_err());
+
+    // UPDATE that collides with another row's key is rejected.
+    let upd = Parser::parse_sql("UPDATE t SET id = 2 WHERE id = 1").unwrap().into_iter().next().unwrap();
+    assert!(executor::execute(&mut db, upd).is_err());
+
+    // The table is unchanged by the rejected operations.
+    let r = rows(run(&mut db, "SELECT id FROM t ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+    // A standalone UNIQUE index is enforced too.
+    run(&mut db, "CREATE TABLE u (email text)");
+    run(&mut db, "CREATE UNIQUE INDEX u_email ON u (email)");
+    run(&mut db, "INSERT INTO u VALUES ('x@y.com')");
+    let dup = Parser::parse_sql("INSERT INTO u VALUES ('x@y.com')").unwrap().into_iter().next().unwrap();
+    assert!(executor::execute(&mut db, dup).is_err());
+}
+
+#[test]
 fn qualified_column_on_single_table() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id integer, v integer)");
