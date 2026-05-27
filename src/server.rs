@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::auth::ScramServer;
 use crate::bind;
 use crate::executor::{self, ExecResult, FieldDescription};
 use crate::protocol::{FrontendMessage, MessageBuilder, Startup, read_message, read_startup};
@@ -147,7 +148,16 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         }
     };
 
-    // --- authentication (trust) ---
+    // --- authentication ---
+    // With PGRS_PASSWORD set we require SCRAM-SHA-256; otherwise trust auth.
+    if let Some(password) = std::env::var("PGRS_PASSWORD").ok().filter(|p| !p.is_empty()) {
+        if !scram_authenticate(&mut reader, &mut writer, &password)? {
+            send_error(&mut writer, "28P01", "password authentication failed")?;
+            writer.flush()?;
+            return Ok(());
+        }
+    }
+
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed);
     let secret = weak_secret();
     send_authentication_ok(&mut writer)?;
@@ -690,6 +700,75 @@ fn send_authentication_ok<W: Write>(w: &mut W) -> io::Result<()> {
     let mut b = MessageBuilder::new(b'R');
     b.put_i32(0); // AuthenticationOk
     w.write_all(&b.finish())
+}
+
+/// Run a SCRAM-SHA-256 exchange. Returns `Ok(true)` if the client proved the
+/// password, `Ok(false)` if authentication failed (caller reports the error).
+fn scram_authenticate<R: io::Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    password: &str,
+) -> io::Result<bool> {
+    // AuthenticationSASL (code 10): advertise the mechanism list.
+    let mut b = MessageBuilder::new(b'R');
+    b.put_i32(10);
+    b.put_cstr("SCRAM-SHA-256");
+    b.put_u8(0); // end of mechanism list
+    writer.write_all(&b.finish())?;
+    writer.flush()?;
+
+    // SASLInitialResponse arrives as a password ('p') message.
+    let Some(FrontendMessage::Password(body)) = read_message(reader)? else {
+        return Ok(false);
+    };
+    let Some(client_first) = parse_sasl_initial(&body) else {
+        return Ok(false);
+    };
+
+    let mut scram = ScramServer::new(password);
+    let server_first = match scram.server_first(&client_first) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    // AuthenticationSASLContinue (code 11).
+    let mut b = MessageBuilder::new(b'R');
+    b.put_i32(11);
+    b.put_bytes(&server_first);
+    writer.write_all(&b.finish())?;
+    writer.flush()?;
+
+    // SASLResponse: the client-final message (whole payload).
+    let Some(FrontendMessage::Password(client_final)) = read_message(reader)? else {
+        return Ok(false);
+    };
+    match scram.server_final(&client_final) {
+        Ok(server_final) => {
+            // AuthenticationSASLFinal (code 12) with the server signature.
+            let mut b = MessageBuilder::new(b'R');
+            b.put_i32(12);
+            b.put_bytes(&server_final);
+            writer.write_all(&b.finish())?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Extract the client-first payload from a SASLInitialResponse body:
+/// `mechanism-name \0 Int32(len) client-first-bytes`.
+fn parse_sasl_initial(body: &[u8]) -> Option<Vec<u8>> {
+    let nul = body.iter().position(|&b| b == 0)?;
+    let rest = &body[nul + 1..];
+    if rest.len() < 4 {
+        return None;
+    }
+    let len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let data = &rest[4..];
+    if len < 0 {
+        return Some(Vec::new());
+    }
+    let len = (len as usize).min(data.len());
+    Some(data[..len].to_vec())
 }
 
 fn send_initial_parameters<W: Write>(w: &mut W) -> io::Result<()> {

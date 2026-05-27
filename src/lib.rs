@@ -8,7 +8,9 @@
 //! - [`bind`]: extended-protocol parameter decoding/substitution.
 //! - [`server`]: TCP server and per-connection session handling.
 
+pub mod auth;
 pub mod bind;
+pub mod crypto;
 pub mod executor;
 pub mod protocol;
 pub mod server;

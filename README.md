@@ -23,7 +23,8 @@ postgres=> SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC;
 ## What works today
 
 **Wire protocol (PostgreSQL v3)**
-- Startup, SSL/GSS negotiation (declined), trust authentication
+- Startup, SSL/GSS negotiation (declined), **trust or SCRAM-SHA-256 auth**
+  (set `PGRS_PASSWORD` to require a password — crypto is hand-rolled, no deps)
 - `ParameterStatus`, `BackendKeyData`, `ReadyForQuery`
 - **Simple query** protocol (`Q`)
 - **Extended query** protocol: `Parse` / `Bind` / `Describe` / `Execute` /
@@ -85,6 +86,8 @@ f64-backed for now. Unknown/`schema.type` cast targets degrade to text.
 | `storage`     | in-memory tables (the engine interface)               |
 | `executor`    | evaluate statements, expressions, grouped aggregates  |
 | `bind`        | decode/substitute extended-protocol parameters        |
+| `crypto`      | SHA-256, HMAC, PBKDF2, Base64 (no deps)               |
+| `auth`        | SCRAM-SHA-256 server exchange                          |
 | `wal`         | logical write-ahead log + recovery                    |
 | `server`      | TCP accept loop, per-connection session, auth flow    |
 
@@ -119,7 +122,8 @@ cargo test
 - [ ] Indexes (B-tree) and a cost-based planner
 - [ ] More types (`numeric`, `date`/`timestamp`, `uuid`, `json`/`jsonb`, arrays)
 - [ ] `pg_catalog` system views so `\d`, `\dt`, and ORMs introspect correctly
-- [ ] SCRAM-SHA-256 authentication and TLS
+- [x] SCRAM-SHA-256 authentication (`PGRS_PASSWORD`)
+- [ ] TLS, query cancellation
 - [ ] Prepared statement caching, `COPY`, and more
 
 ## Status
