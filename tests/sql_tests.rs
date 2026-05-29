@@ -2928,9 +2928,18 @@ fn extended_types() {
     ));
     assert_eq!(r, vec![vec![Value::Text("2024-03-15".into())]]);
 
-    // numeric arithmetic.
+    // numeric arithmetic is now exact: amount is `numeric`, so `amount * 2`
+    // stays numeric. The inserted literals reach the column as float literals
+    // (bare `5.50` is a float and loses its trailing zero before coercion), so
+    // 5.50 stores as 5.5 and 5.5*2 = 11.0; 19.99 stores exactly and 19.99*2 =
+    // 39.98 with no float rounding error.
     let r = rows(run(&mut db, "SELECT amount * 2 FROM e ORDER BY amount"));
-    assert_eq!(r, vec![vec![Value::Float(11.0)], vec![Value::Float(39.98)]]);
+    assert_eq!(
+        r.iter()
+            .map(|row| row[0].to_text().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["11.0".to_string(), "39.98".to_string()]
+    );
 
     // Casts to the new types round-trip the text.
     let r = rows(run(
@@ -2960,7 +2969,7 @@ fn json_extraction_operators() {
         r,
         vec![vec![
             Value::Text("Ada".into()),
-            Value::Text("{\"score\":9}".into()),
+            Value::Text("{\"score\": 9}".into()),
             Value::Text("sql".into()),
         ]]
     );
@@ -5367,6 +5376,169 @@ fn plain_table_unaffected_by_partitioning_changes() {
     assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
 }
 
+// --- TOAST: oversized values stored out-of-line, transparent on read --------
+
+#[test]
+fn toast_oversized_value_round_trips_and_is_observable() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE big (id integer, payload text)");
+    // A >2 KB value must be moved to the TOAST side store.
+    let big = "x".repeat(5000);
+    run(
+        &mut db,
+        &format!("INSERT INTO big VALUES (1, '{big}'), (2, 'small')"),
+    );
+
+    // Observable: exactly one value (the 5000-char one) is out-of-line.
+    let table = db.table("big").expect("table exists");
+    assert_eq!(table.toast_chunk_count(), 1);
+    assert!(table.toast_bytes() >= 5000);
+
+    // Transparent on read: SELECT returns the full value, byte-for-byte.
+    let r = rows(run(&mut db, "SELECT payload FROM big WHERE id = 1"));
+    assert_eq!(r, vec![vec![Value::Text(big.clone())]]);
+    assert_eq!(r[0][0].to_text().unwrap().len(), 5000);
+
+    // The small value is not toasted.
+    let r = rows(run(&mut db, "SELECT payload FROM big WHERE id = 2"));
+    assert_eq!(r, vec![vec![Value::Text("small".into())]]);
+
+    // Updating an unrelated column preserves the toasted value.
+    run(&mut db, "UPDATE big SET id = 11 WHERE id = 1");
+    let r = rows(run(&mut db, "SELECT payload FROM big WHERE id = 11"));
+    assert_eq!(r, vec![vec![Value::Text(big)]]);
+
+    // Deleting frees the out-of-line chunk.
+    run(&mut db, "DELETE FROM big WHERE id = 11");
+    assert_eq!(db.table("big").unwrap().toast_chunk_count(), 0);
+}
+
+// --- large objects: lo_create / lo_put / lo_get / lo_unlink -----------------
+
+#[test]
+fn large_object_lifecycle() {
+    let mut db = Database::new();
+    // Create with an explicit OID.
+    let r = rows(run(&mut db, "SELECT lo_create(42)"));
+    assert_eq!(r, vec![vec![Value::Int(42)]]);
+
+    // Put bytes (hex bytea) and read them back.
+    run(&mut db, "SELECT lo_put(42, 0, '\\x48656c6c6f')"); // "Hello"
+    let r = rows(run(&mut db, "SELECT lo_get(42)"));
+    assert_eq!(r, vec![vec![Value::Text("\\x48656c6c6f".into())]]);
+
+    // Overwrite at an offset, zero-extending as needed.
+    run(&mut db, "SELECT lo_put(42, 5, '\\x21')"); // append "!"
+    let r = rows(run(&mut db, "SELECT lo_get(42)"));
+    assert_eq!(r, vec![vec![Value::Text("\\x48656c6c6f21".into())]]);
+
+    // lo_creat allocates a fresh OID distinct from 42.
+    let r = rows(run(&mut db, "SELECT lo_creat(-1)"));
+    let Value::Int(oid) = r[0][0] else {
+        panic!("expected oid")
+    };
+    assert_ne!(oid, 42);
+
+    // Unlink removes it; a subsequent get errors.
+    run(&mut db, "SELECT lo_unlink(42)");
+    let stmts = Parser::parse_sql("SELECT lo_get(42)").unwrap();
+    let err = executor::execute(&mut db, stmts.into_iter().next().unwrap());
+    assert!(err.is_err());
+}
+
+// --- autovacuum: pure decision logic + autovacuum_once ----------------------
+
+#[test]
+fn autovacuum_once_compacts_tables_with_dead_tuples() {
+    use postgres_rs::storage::should_autovacuum;
+
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE av (id integer)");
+    // Insert enough rows that deleting them all clears the threshold (50 + 20%).
+    for i in 0..200 {
+        run(&mut db, &format!("INSERT INTO av VALUES ({i})"));
+    }
+    // No dead tuples yet => not due.
+    assert!(!should_autovacuum(db.table("av").unwrap()));
+
+    // Delete most rows to accumulate dead tuples.
+    run(&mut db, "DELETE FROM av WHERE id < 180");
+    let table = db.table("av").unwrap();
+    assert!(table.storage_stats().dead_rows >= 100);
+    assert!(should_autovacuum(table));
+
+    // autovacuum_once vacuums the qualifying table and reports it.
+    let vacuumed = db.autovacuum_once();
+    assert_eq!(vacuumed, vec!["av".to_string()]);
+
+    // After vacuuming, dead tuples are gone and the table is no longer due.
+    let table = db.table("av").unwrap();
+    assert_eq!(table.storage_stats().dead_rows, 0);
+    assert!(!should_autovacuum(table));
+
+    // Idempotent: a second pass finds nothing to do.
+    assert!(db.autovacuum_once().is_empty());
+}
+
+// --- jsonb binary semantics: normalization + containment --------------------
+
+#[test]
+fn jsonb_normalizes_on_input() {
+    let mut db = Database::new();
+    // Duplicate keys: last value wins; keys ordered (length, then bytewise);
+    // canonical whitespace.
+    let r = rows(run(
+        &mut db,
+        "SELECT '{\"b\":1,\"a\":2,\"a\":3}'::jsonb",
+    ));
+    assert_eq!(r, vec![vec![Value::Text("{\"a\": 3, \"b\": 1}".into())]]);
+
+    // Nested objects + arrays normalize recursively.
+    let r = rows(run(
+        &mut db,
+        "SELECT '{\"z\":[3,2,1],\"aa\":{\"y\":1,\"x\":2}}'::jsonb",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![Value::Text(
+            "{\"z\": [3, 2, 1], \"aa\": {\"x\": 2, \"y\": 1}}".into()
+        )]]
+    );
+}
+
+#[test]
+fn jsonb_containment_correct_and_gin_indexed() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE j (id integer, doc jsonb)");
+    run(
+        &mut db,
+        "INSERT INTO j VALUES (1, '{\"a\":1,\"b\":2}'), (2, '{\"a\":1}'), (3, '{\"c\":3}')",
+    );
+
+    // `@>` object containment: rows whose doc contains {"a":1}.
+    let r = rows(run(
+        &mut db,
+        "SELECT id FROM j WHERE doc @> '{\"a\":1}' ORDER BY id",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+    // `<@` contained-by.
+    let r = rows(run(
+        &mut db,
+        "SELECT id FROM j WHERE '{\"a\":1}' <@ doc ORDER BY id",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+    // A GIN index on the jsonb column is accepted and the containment query
+    // still returns correct results.
+    run(&mut db, "CREATE INDEX j_gin ON j USING gin (doc)");
+    let r = rows(run(
+        &mut db,
+        "SELECT id FROM j WHERE doc @> '{\"a\":1}' ORDER BY id",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
 // --- extended DDL: accept + catalog/store (parse → tag → round-trip) ---------
 
 use postgres_rs::sql::serialize::statement_to_sql;
@@ -6474,4 +6646,295 @@ fn row_level_security_flag_and_pg_policy() {
         "SELECT relrowsecurity FROM pg_class WHERE relname = 'secured'",
     ));
     assert_eq!(rls, Value::Bool(false));
+}
+
+#[test]
+fn plpgsql_if_return() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION classify(n integer) RETURNS text AS $$
+         BEGIN
+            IF n > 0 THEN RETURN 'pos';
+            ELSIF n < 0 THEN RETURN 'neg';
+            ELSE RETURN 'zero';
+            END IF;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT classify(5)")), Value::Text("pos".into()));
+    assert_eq!(one(run(&mut db, "SELECT classify(-2)")), Value::Text("neg".into()));
+    assert_eq!(one(run(&mut db, "SELECT classify(0)")), Value::Text("zero".into()));
+}
+
+#[test]
+fn plpgsql_for_loop_factorial() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION fact(n integer) RETURNS bigint AS $$
+         DECLARE r bigint := 1;
+         BEGIN
+            FOR i IN 1..n LOOP
+                r := r * i;
+            END LOOP;
+            RETURN r;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT fact(0)")), Value::Int(1));
+    assert_eq!(one(run(&mut db, "SELECT fact(5)")), Value::Int(120));
+    assert_eq!(one(run(&mut db, "SELECT fact(10)")), Value::Int(3628800));
+}
+
+#[test]
+fn plpgsql_while_loop_sum() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION sumn(n integer) RETURNS integer AS $$
+         DECLARE s integer := 0; i integer := 1;
+         BEGIN
+            WHILE i <= n LOOP
+                s := s + i;
+                i := i + 1;
+            END LOOP;
+            RETURN s;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT sumn(10)")), Value::Int(55));
+    assert_eq!(one(run(&mut db, "SELECT sumn(100)")), Value::Int(5050));
+}
+
+#[test]
+fn plpgsql_select_into_no_table() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION dbl(n integer) RETURNS integer AS $$
+         DECLARE x integer;
+         BEGIN
+            SELECT n * 2 INTO x;
+            RETURN x;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT dbl(21)")), Value::Int(42));
+}
+
+#[test]
+fn plpgsql_raise_exception_aborts() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION checked(n integer) RETURNS integer AS $$
+         BEGIN
+            IF n < 0 THEN RAISE EXCEPTION 'negative not allowed'; END IF;
+            RETURN n;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT checked(7)")), Value::Int(7));
+    let err = try_run(&mut db, "SELECT checked(-1)").expect_err("RAISE EXCEPTION should abort");
+    assert!(err.contains("negative not allowed"), "got: {err}");
+}
+
+#[test]
+fn plpgsql_called_over_table() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION fact(n integer) RETURNS bigint AS $$
+         DECLARE r bigint := 1;
+         BEGIN
+            FOR i IN 1..n LOOP r := r * i; END LOOP;
+            RETURN r;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    run(&mut db, "CREATE TABLE nums (x integer)");
+    run(&mut db, "INSERT INTO nums VALUES (1), (3), (5)");
+    let r = rows(run(&mut db, "SELECT x, fact(x) FROM nums ORDER BY x"));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::Int(1)],
+            vec![Value::Int(3), Value::Int(6)],
+            vec![Value::Int(5), Value::Int(120)],
+        ]
+    );
+}
+
+#[test]
+fn plpgsql_select_into_from_table_errors_cleanly() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (x integer)");
+    run(&mut db, "INSERT INTO t VALUES (9)");
+    run(
+        &mut db,
+        "CREATE FUNCTION grab() RETURNS integer AS $$
+         DECLARE v integer;
+         BEGIN
+            SELECT x INTO v FROM t;
+            RETURN v;
+         END;
+         $$ LANGUAGE plpgsql",
+    );
+    // Table access from inside a plpgsql body is unsupported on this path; it
+    // must error cleanly rather than panic.
+    let err = try_run(&mut db, "SELECT grab()").expect_err("SELECT INTO from table unsupported");
+    assert!(err.to_lowercase().contains("table"), "got: {err}");
+}
+
+#[test]
+fn plpgsql_does_not_break_sql_udf() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION inc(n integer) RETURNS integer AS $$ SELECT n + 1 $$ LANGUAGE sql",
+    );
+    assert_eq!(one(run(&mut db, "SELECT inc(41)")), Value::Int(42));
+}
+
+#[test]
+fn extension_install_script_creates_function() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE EXTENSION pgrs_demo");
+    // The bundled install script created working SQL functions.
+    assert_eq!(one(run(&mut db, "SELECT pgrs_demo_add(2, 3)")), Value::Int(5));
+    assert_eq!(one(run(&mut db, "SELECT pgrs_demo_answer()")), Value::Int(42));
+
+    // Dropping the extension removes the installed objects.
+    run(&mut db, "DROP EXTENSION pgrs_demo");
+    let err = try_run(&mut db, "SELECT pgrs_demo_answer()")
+        .expect_err("function should be gone after DROP EXTENSION");
+    assert!(err.contains("does not exist"), "got: {err}");
+}
+
+#[test]
+fn extension_unknown_still_catalogued() {
+    let mut db = Database::new();
+    // Unknown extensions keep the prior behavior: accepted and catalogued.
+    run(&mut db, "CREATE EXTENSION pgcrypto");
+    let r = rows(run(
+        &mut db,
+        "SELECT extname FROM pg_extension WHERE extname = 'pgcrypto'",
+    ));
+    assert_eq!(r, vec![vec![Value::Text("pgcrypto".into())]]);
+}
+
+/// The canonical text of the single result cell of the last statement.
+fn one_text(db: &mut Database, sql: &str) -> String {
+    let r = rows(run(db, sql));
+    r[0][0].to_text().expect("not null")
+}
+
+#[test]
+fn numeric_exact_decimal_arithmetic() {
+    let mut db = Database::new();
+    // The textbook float trap: exact with numeric.
+    assert_eq!(
+        one_text(&mut db, "SELECT '0.1'::numeric + '0.2'::numeric"),
+        "0.3"
+    );
+    // Subtraction and multiplication keep scale.
+    assert_eq!(
+        one_text(&mut db, "SELECT '1.50'::numeric * 2"),
+        "3.00"
+    );
+    assert_eq!(
+        one_text(&mut db, "SELECT '10.00'::numeric - '0.01'::numeric"),
+        "9.99"
+    );
+    // CAST(... AS numeric) reaches the exact path too.
+    assert_eq!(
+        one_text(&mut db, "SELECT CAST('0.1' AS numeric) + CAST('0.2' AS decimal)"),
+        "0.3"
+    );
+}
+
+#[test]
+fn numeric_big_integer_exact() {
+    let mut db = Database::new();
+    // Far beyond i64/f64 exact range.
+    assert_eq!(
+        one_text(
+            &mut db,
+            "SELECT '123456789012345678901234567890'::numeric * 2"
+        ),
+        "246913578024691357802469135780"
+    );
+    assert_eq!(
+        one_text(
+            &mut db,
+            "SELECT '99999999999999999999'::numeric + '1'::numeric"
+        ),
+        "100000000000000000000"
+    );
+}
+
+#[test]
+fn numeric_division_scale() {
+    let mut db = Database::new();
+    assert_eq!(
+        one_text(&mut db, "SELECT '1'::numeric / '3'::numeric"),
+        "0.3333333333333333"
+    );
+    assert_eq!(
+        one_text(&mut db, "SELECT '2'::numeric / '3'::numeric"),
+        "0.6666666666666667"
+    );
+}
+
+#[test]
+fn numeric_ordering_and_aggregates() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE n (v numeric)");
+    run(
+        &mut db,
+        "INSERT INTO n (v) VALUES ('0.1'), ('0.2'), ('100000000000000000000'), ('-5.5'), ('0.3')",
+    );
+
+    // Ordering is exact (not float-approximate).
+    let r = rows(run(&mut db, "SELECT v FROM n ORDER BY v"));
+    let ordered: Vec<String> = r.iter().map(|row| row[0].to_text().unwrap()).collect();
+    assert_eq!(
+        ordered,
+        vec![
+            "-5.5".to_string(),
+            "0.1".to_string(),
+            "0.2".to_string(),
+            "0.3".to_string(),
+            "100000000000000000000".to_string(),
+        ]
+    );
+
+    // sum stays exact numeric.
+    assert_eq!(
+        one_text(&mut db, "SELECT sum(v) FROM n WHERE v < 1"),
+        "-4.9"
+    );
+    // min / max are exact.
+    assert_eq!(one_text(&mut db, "SELECT min(v) FROM n"), "-5.5");
+    assert_eq!(
+        one_text(&mut db, "SELECT max(v) FROM n"),
+        "100000000000000000000"
+    );
+}
+
+#[test]
+fn numeric_avg_exact() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE m (v numeric)");
+    run(&mut db, "INSERT INTO m (v) VALUES ('1'), ('2'), ('3')");
+    // avg(1,2,3) = 2 exactly.
+    let avg = one_text(&mut db, "SELECT avg(v) FROM m");
+    assert!(avg.starts_with('2'), "avg was {avg}");
+    // avg of values whose mean is exact fractional.
+    run(&mut db, "DELETE FROM m");
+    run(&mut db, "INSERT INTO m (v) VALUES ('0.1'), ('0.2')");
+    let avg = one_text(&mut db, "SELECT avg(v) FROM m");
+    // (0.1+0.2)/2 = 0.15 exactly (no float error).
+    assert!(avg.starts_with("0.15"), "avg was {avg}");
 }

@@ -252,7 +252,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `json` stored as text
 - [x] `jsonb` stored as text
 - [x] Unknown or schema-qualified cast targets degrade to text
-- [ ] Arbitrary precision `numeric`
+- [x] Arbitrary precision `numeric`
 - [x] `char(n)`
 - [x] `bytea`
 - [x] Arrays
@@ -262,7 +262,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `inet`, `cidr`, `macaddr`, `macaddr8`
 - [x] Geometric types (accept + store, in pg_type)
 - [x] Range and multirange types (ranges real; multirange accept + store)
-- [ ] Full JSONB binary semantics and indexing
+- [x] Full JSONB binary semantics and indexing
 - [x] XML
 - [x] `tsvector` and `tsquery`
 - [x] Composite types (catalog-registered, text-backed)
@@ -314,7 +314,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Ordered-set aggregate functions
 - [x] Statistical aggregates
 - [x] User-defined SQL functions
-- [ ] Procedural language functions
+- [x] Procedural language functions (plpgsql)
 
 ## Indexes and Planning
 
@@ -367,9 +367,9 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Savepoints
 - [x] Two-phase commit
 - [x] Advisory locks
-- [ ] Row-level locks
-- [ ] Table locks
-- [ ] Deadlock detection
+- [x] Row-level locks
+- [x] Table locks
+- [x] Deadlock detection
 - [x] Concurrent writers without last-commit-wins behavior
 
 ## Storage and Durability
@@ -385,18 +385,18 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] WAL replay on startup with `PGRS_DATA`
 - [x] In-memory mode without `PGRS_DATA`
 - [x] Serializable SQL emitted for supported mutating statements
-- [ ] Disk-backed heap/table storage
-- [ ] Disk page format
-- [ ] Buffer manager
-- [ ] Physical WAL
-- [ ] Checkpoints
-- [ ] WAL segment management
+- [x] Disk-backed heap/table storage (opt-in PGRS_DISK)
+- [x] Disk page format (8KB slotted pages)
+- [x] Buffer manager (LRU page cache)
+- [x] Physical WAL (page-level records; checkpoint-based recovery)
+- [x] Checkpoints (flush to disk pages via PGRS_DISK)
+- [x] WAL segment management
 - [x] Crash recovery with partial record handling
-- [ ] WAL compaction / log truncation
+- [x] WAL compaction / log truncation
 - [x] Vacuum
-- [ ] Autovacuum
-- [ ] TOAST storage
-- [ ] Large objects
+- [x] Autovacuum (opt-in via PGRS_AUTOVACUUM)
+- [x] TOAST storage (out-of-line, no compression)
+- [x] Large objects
 
 ## Catalogs and Introspection
 
@@ -445,7 +445,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Logical replication slots (accept + store)
 - [x] Publication/subscription (accept + store)
 - [ ] WAL sender / receiver behavior
-- [ ] Base backups
+- [x] Base backups (copy disk store via PGRS_DISK)
 - [ ] Point-in-time recovery
 - [ ] Hot standby reads
 - [ ] Synchronous replication
@@ -456,9 +456,9 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `CREATE EXTENSION`
 - [x] `DROP EXTENSION`
 - [x] Extension catalog metadata
-- [ ] Extension SQL install scripts
+- [x] Extension SQL install scripts
 - [ ] C extension ABI
-- [ ] `plpgsql`
+- [x] `plpgsql` (usable subset)
 - [ ] Other procedural languages
 - [x] Triggers (FOR EACH ROW; no NEW/OLD binding)
 - [x] Event triggers (accept + store)

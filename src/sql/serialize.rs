@@ -1474,6 +1474,7 @@ fn table_ref_to_sql(t: &TableRef) -> String {
         if let Some(a) = &t.alias {
             s.push_str(&format!(" AS {}", ident(a)));
         }
+        push_column_aliases(&mut s, &t.column_aliases);
         return s;
     }
     if let Some(schema) = &t.schema {
@@ -1485,10 +1486,21 @@ fn table_ref_to_sql(t: &TableRef) -> String {
         let args: Vec<String> = t.args.iter().map(expr_to_sql).collect();
         s.push_str(&format!("({})", args.join(", ")));
     }
+    if t.with_ordinality {
+        s.push_str(" WITH ORDINALITY");
+    }
     if let Some(a) = &t.alias {
         s.push_str(&format!(" AS {}", ident(a)));
     }
+    push_column_aliases(&mut s, &t.column_aliases);
     s
+}
+
+fn push_column_aliases(s: &mut String, aliases: &[String]) {
+    if !aliases.is_empty() {
+        let cols: Vec<String> = aliases.iter().map(|a| ident(a)).collect();
+        s.push_str(&format!("({})", cols.join(", ")));
+    }
 }
 
 /// Serialize an expression. Binary/unary ops are parenthesized for safety.

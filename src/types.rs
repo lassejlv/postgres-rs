@@ -3,6 +3,7 @@
 //! Type OIDs are fixed constants in PostgreSQL (defined in `pg_type.dat`).
 //! Clients and drivers key off these exact numbers, so we must reproduce them.
 
+use crate::numeric::BigDecimal;
 use std::fmt;
 
 /// A column's declared SQL type.
@@ -285,6 +286,8 @@ pub enum Value {
     Null,
     Int(i64),
     Float(f64),
+    /// Exact arbitrary-precision decimal (`numeric`/`decimal`).
+    Numeric(BigDecimal),
     Text(String),
     Bool(bool),
 }
@@ -302,6 +305,7 @@ impl Value {
             Value::Null => None,
             Value::Int(i) => Some(i.to_string()),
             Value::Float(f) => Some(format_float(*f)),
+            Value::Numeric(n) => Some(n.to_canonical_string()),
             Value::Text(s) => Some(s.clone()),
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
         }
@@ -314,6 +318,7 @@ impl Value {
             Value::Null => DataType::Text,
             Value::Int(_) => DataType::Int8,
             Value::Float(_) => DataType::Float8,
+            Value::Numeric(_) => DataType::Numeric,
             Value::Text(_) => DataType::Text,
             Value::Bool(_) => DataType::Bool,
         }
@@ -327,6 +332,7 @@ impl Value {
             Value::Null => false,
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
+            Value::Numeric(n) => !n.is_zero(),
             Value::Text(s) => !s.is_empty(),
         }
     }

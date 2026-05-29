@@ -12,9 +12,13 @@
 pub mod auth;
 pub mod bind;
 pub mod crypto;
+pub mod disk;
 pub mod executor;
 pub mod hba;
 pub mod index;
+pub mod lock;
+pub mod numeric;
+pub mod plpgsql;
 pub mod protocol;
 pub mod server;
 pub mod sql;

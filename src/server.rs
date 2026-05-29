@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,11 +18,12 @@ use crate::auth::ScramServer;
 use crate::bind;
 use crate::hba::{HbaConfig, HbaMethod};
 use crate::executor::{self, ExecResult, FieldDescription};
+use crate::lock::{LockManager, LockMode, LockObject, TryAcquire};
 use crate::protocol::{FrontendMessage, MessageBuilder, Startup, read_message, read_startup};
 use crate::sql::Parser;
 use crate::sql::ast::{
     Copy as CopyStmt, CopyDirection, CopyFormat, CopyTarget, Expr, Insert, IsolationLevel,
-    Statement,
+    RowLockingMode, RowLockingWaitPolicy, Select, Statement,
 };
 use crate::sql::serialize;
 use crate::storage::Database;
@@ -34,11 +35,21 @@ struct Shared {
     db: Mutex<Database>,
     /// `None` when running purely in memory (no `PGRS_DATA` configured).
     wal: Mutex<Option<Wal>>,
+    /// Page-based on-disk store, present only when `PGRS_DISK` is set. When
+    /// present, `CHECKPOINT` flushes the database to it; otherwise CHECKPOINT
+    /// is a no-op (the default in-memory behaviour).
+    disk: Mutex<Option<crate::disk::DiskStore>>,
     /// Live backends keyed by their advertised pid, used to route
     /// cancellation requests and asynchronous notifications.
     backends: Mutex<HashMap<i32, BackendHandle>>,
     /// `LISTEN` registrations: channel name → set of listening backend pids.
     listeners: Mutex<HashMap<String, Vec<i32>>>,
+    /// Central lock manager coordinating table/row locks across connections.
+    /// Paired with `lock_cv`, which blocked waiters park on; the manager mutex
+    /// is never held across a wait.
+    locks: Mutex<LockManager>,
+    /// Condvar notified whenever locks are released, waking parked waiters.
+    lock_cv: Condvar,
 }
 
 /// Shared handles for one live backend, reachable from other connections.
@@ -107,12 +118,38 @@ pub fn serve_on(listener: TcpListener, data_dir: Option<String>) -> io::Result<(
         None => None,
     };
 
+    // Opt-in page-based disk persistence (separate from the logical WAL above).
+    // When `PGRS_DISK` names a directory, open the store and recover any
+    // previously checkpointed tables into the database before serving.
+    let disk = match std::env::var("PGRS_DISK").ok().filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let store = crate::disk::DiskStore::open(&dir)?;
+            match store.recover() {
+                Ok(recovered) => {
+                    let n = recovered.table_names().len();
+                    if n > 0 {
+                        db = recovered;
+                        println!("recovered {n} table(s) from disk store in {dir}");
+                    }
+                }
+                Err(e) => eprintln!("warning: disk recovery failed: {e}"),
+            }
+            Some(store)
+        }
+        None => None,
+    };
+
     let shared = Arc::new(Shared {
         db: Mutex::new(db),
         wal: Mutex::new(wal),
+        disk: Mutex::new(disk),
         backends: Mutex::new(HashMap::new()),
         listeners: Mutex::new(HashMap::new()),
+        locks: Mutex::new(LockManager::new()),
+        lock_cv: Condvar::new(),
     });
+
+    spawn_autovacuum_worker(&shared);
 
     for stream in listener.incoming() {
         match stream {
@@ -134,6 +171,37 @@ pub fn serve_on(listener: TcpListener, data_dir: Option<String>) -> io::Result<(
         }
     }
     Ok(())
+}
+
+/// Spawn the autovacuum background worker, gated on `PGRS_AUTOVACUUM=on` (off by
+/// default so behaviour/tests are unchanged). Every `PGRS_AUTOVACUUM_INTERVAL`
+/// seconds (default 60) it locks the shared database and runs
+/// [`Database::autovacuum_once`], which vacuums tables whose dead-tuple count
+/// exceeds the threshold (see `should_autovacuum`). The deterministic decision
+/// logic lives in storage.rs and is unit-tested directly; this thread is just
+/// the periodic driver.
+fn spawn_autovacuum_worker(shared: &Arc<Shared>) {
+    let on = std::env::var("PGRS_AUTOVACUUM")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !on {
+        return;
+    }
+    let interval_secs = std::env::var("PGRS_AUTOVACUUM_INTERVAL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(60);
+    let shared = Arc::clone(shared);
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(interval_secs));
+        if let Ok(mut db) = shared.db.lock() {
+            let vacuumed = db.autovacuum_once();
+            if !vacuumed.is_empty() {
+                eprintln!("autovacuum: vacuumed {} table(s): {}", vacuumed.len(), vacuumed.join(", "));
+            }
+        }
+    });
 }
 
 /// A prepared statement created by Parse.
@@ -357,6 +425,7 @@ fn handle_connection(
             let idle_ms = current_guc_ms(&shared, &session, "idle_in_transaction_session_timeout");
             if idle_ms > 0 && session.last_activity.elapsed() >= Duration::from_millis(idle_ms) {
                 session.abort_idle_transaction();
+                release_locks(&shared, session.pid);
                 send_error(
                     &mut writer,
                     "25P03",
@@ -461,6 +530,9 @@ struct ConnGuard<'a> {
 
 impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
+        // Release any locks this backend still holds so peers waiting on them
+        // can proceed even if the connection died mid-transaction.
+        release_locks(self.shared, self.pid);
         self.shared
             .backends
             .lock()
@@ -914,6 +986,10 @@ fn value_to_expr(v: Value) -> Expr {
         Value::Null => Expr::Null,
         Value::Int(i) => Expr::Int(i),
         Value::Float(f) => Expr::Float(f),
+        Value::Numeric(n) => Expr::Cast {
+            expr: Box::new(Expr::Str(n.to_canonical_string())),
+            target: DataType::Numeric,
+        },
         Value::Text(s) => Expr::Str(s),
         Value::Bool(b) => Expr::Bool(b),
     }
@@ -1459,6 +1535,97 @@ fn run_statement_timed(
     result
 }
 
+// --- lock manager integration -------------------------------------------------
+
+/// Acquire `mode` on `obj` for this backend, blocking on the lock condvar until
+/// the lock is free.
+///
+/// Returns `Ok(())` once granted. On a NOWAIT request that conflicts, returns
+/// `55P03`. If granting the wait would deadlock, the requesting transaction is
+/// aborted with `40P01` (its locks are released by the caller's COMMIT/ROLLBACK
+/// path; here we just release this backend's locks so it cannot keep blocking
+/// others). The cancel flag is honored so a canceled statement does not block
+/// forever.
+///
+/// The lock-manager mutex is dropped while parked on the condvar, and the DB
+/// mutex must NOT be held by the caller across this call.
+fn acquire_lock(
+    shared: &Shared,
+    session: &Session,
+    obj: &LockObject,
+    mode: LockMode,
+    nowait: bool,
+) -> Result<(), String> {
+    let mut guard = shared.locks.lock().expect("locks mutex poisoned");
+    loop {
+        match guard.try_acquire(session.pid, obj, mode) {
+            TryAcquire::Granted => return Ok(()),
+            TryAcquire::Deadlock => {
+                // Release everything this backend holds/waits on so it stops
+                // blocking peers, then surface the deadlock error.
+                if guard.release_all(session.pid) {
+                    shared.lock_cv.notify_all();
+                }
+                return Err("deadlock detected".to_string());
+            }
+            TryAcquire::Conflict(_) => {
+                if nowait {
+                    // Drop our tentative waiter entry before erroring.
+                    guard.release_all(session.pid);
+                    return Err("could not obtain lock on relation".to_string());
+                }
+                // Honor cancellation rather than blocking forever.
+                if session.cancel.load(Ordering::SeqCst) {
+                    guard.release_all(session.pid);
+                    return Err("canceling statement due to user request".to_string());
+                }
+                // Park until woken by a release; re-check periodically so a
+                // cancellation set while we sleep is still observed.
+                let (g, _timeout) = shared
+                    .lock_cv
+                    .wait_timeout(guard, Duration::from_millis(50))
+                    .expect("lock condvar poisoned");
+                guard = g;
+            }
+        }
+    }
+}
+
+/// Release every lock held or waited on by this backend and wake parked
+/// waiters. Called at COMMIT/ROLLBACK and on disconnect.
+fn release_locks(shared: &Shared, pid: i32) {
+    let mut guard = shared.locks.lock().expect("locks mutex poisoned");
+    if guard.release_all(pid) {
+        drop(guard);
+        shared.lock_cv.notify_all();
+    }
+}
+
+/// Map a `LOCK TABLE` mode spelling to a [`LockMode`], defaulting to
+/// ACCESS EXCLUSIVE (PostgreSQL's default).
+fn table_lock_mode(spec: &Option<String>) -> Result<LockMode, String> {
+    match spec {
+        None => Ok(LockMode::AccessExclusive),
+        Some(s) => LockMode::parse(s).ok_or_else(|| format!("unrecognized lock mode: {s}")),
+    }
+}
+
+/// A stable opaque key for a row, derived from its full projected value tuple.
+/// Coarser than PostgreSQL's physical-tuple locks (see `lock.rs` docs).
+fn row_key(row: &[Value]) -> String {
+    let mut key = String::new();
+    for (i, v) in row.iter().enumerate() {
+        if i > 0 {
+            key.push('\u{1}');
+        }
+        match v.to_text() {
+            Some(t) => key.push_str(&t),
+            None => key.push_str("\u{0}NULL"),
+        }
+    }
+    key
+}
+
 // --- execution + transactions + durability -----------------------------------
 
 /// Execute one statement, honoring transaction state.
@@ -1606,6 +1773,7 @@ fn run_statement(
         Statement::Commit => match session.tx.take() {
             Some(tx) if tx.failed => {
                 // Committing an aborted transaction rolls it back.
+                release_locks(shared, session.pid);
                 session.tx_status = b'I';
                 Ok(ExecResult::Command("ROLLBACK".into()))
             }
@@ -1623,6 +1791,7 @@ fn run_statement(
                     && shared_db.has_conflicting_commit(&tx.write_set, tx.snapshot_version)
                 {
                     drop(shared_db);
+                    release_locks(shared, session.pid);
                     session.tx_status = b'I';
                     return Err("could not serialize access due to concurrent update".to_string());
                 }
@@ -1641,6 +1810,7 @@ fn run_statement(
                         }
                     }
                 }
+                release_locks(shared, session.pid);
                 session.tx_status = b'I';
                 Ok(ExecResult::Command("COMMIT".into()))
             }
@@ -1661,11 +1831,13 @@ fn run_statement(
                     message: "there is no transaction in progress".into(),
                 });
             }
+            release_locks(shared, session.pid);
             session.tx_status = b'I';
             Ok(ExecResult::Command("ROLLBACK".into()))
         }
         Statement::PrepareTransaction { gid } => match session.tx.take() {
             Some(tx) if tx.failed => {
+                release_locks(shared, session.pid);
                 session.tx_status = b'I';
                 Err("current transaction is aborted, commands ignored until end of transaction block".into())
             }
@@ -1681,6 +1853,7 @@ fn run_statement(
                     && shared_db.has_conflicting_commit(&tx.write_set, tx.snapshot_version)
                 {
                     drop(shared_db);
+                    release_locks(shared, session.pid);
                     session.tx_status = b'I';
                     return Err("could not serialize access due to concurrent update".to_string());
                 }
@@ -1697,6 +1870,7 @@ fn run_statement(
                     }
                 }
                 session.prepared_gids.insert(gid.clone());
+                release_locks(shared, session.pid);
                 session.tx_status = b'I';
                 Ok(ExecResult::Command("PREPARE TRANSACTION".into()))
             }
@@ -1764,6 +1938,45 @@ fn run_statement(
             session.tx_status = b'T';
             Ok(ExecResult::Command("ROLLBACK".into()))
         }
+        // Real table locking. LOCK TABLE requires a transaction block (the lock
+        // is held until COMMIT/ROLLBACK), matching PostgreSQL.
+        Statement::LockTable(lock) => {
+            if session.tx.is_none() {
+                return Err("LOCK TABLE can only be used in transaction blocks".into());
+            }
+            if session.tx.as_ref().is_some_and(|t| t.failed) {
+                return Err(
+                    "current transaction is aborted, commands ignored until end of transaction block".into(),
+                );
+            }
+            // Validate the relations exist against the working copy.
+            {
+                let tx = session.tx.as_ref().unwrap();
+                for table in &lock.tables {
+                    if !tx.db.contains_table(table) {
+                        return Err(format!("relation \"{table}\" does not exist"));
+                    }
+                }
+            }
+            let mode = table_lock_mode(&lock.mode)?;
+            for table in &lock.tables {
+                let obj = LockObject::Table(table.clone());
+                if let Err(e) = acquire_lock(shared, session, &obj, mode, lock.nowait) {
+                    // A lock failure aborts the transaction.
+                    if let Some(tx) = session.tx.as_mut() {
+                        tx.failed = true;
+                    }
+                    session.tx_status = b'E';
+                    return Err(e);
+                }
+            }
+            Ok(ExecResult::Command("LOCK TABLE".into()))
+        }
+        // `SELECT ... FOR UPDATE/SHARE` acquires row locks on the selected rows
+        // (held until end of transaction). Plain SELECTs fall through.
+        Statement::Select(select) if !select.locking.is_empty() => {
+            run_select_for_locking(shared, session, stmt, select)
+        }
         // Server-side file COPY (`FROM/TO '<path>'`). STDIN/STDOUT forms are
         // handled by the COPY sub-protocol before reaching here.
         Statement::Copy(copy) => run_copy_file(shared, session, copy),
@@ -1806,12 +2019,167 @@ fn run_statement(
     }
 }
 
+/// Execute a `SELECT ... FOR UPDATE/SHARE`, acquiring row locks on the selected
+/// rows.
+///
+/// The SELECT runs first (against the transaction working copy if any, else the
+/// shared db) to determine which rows are selected. Each result row gets a lock
+/// object keyed by `(target table, row fingerprint)` — a coarser, logical-tuple
+/// granularity than PostgreSQL's heap-TID locks (see `lock.rs`). `FOR UPDATE`
+/// requests an exclusive row lock, `FOR SHARE` a share lock.
+///
+/// - default wait policy: conflicting rows block until free;
+/// - `NOWAIT`: error `55P03` if any selected row is already locked;
+/// - `SKIP LOCKED`: silently drop already-locked rows from the result.
+fn run_select_for_locking(
+    shared: &Shared,
+    session: &mut Session,
+    stmt: &Statement,
+    select: &Select,
+) -> Result<ExecResult, String> {
+    // Resolve mode + wait policy from the (first) locking clause. Multiple
+    // clauses collapse to the strongest mode.
+    let strongest = select
+        .locking
+        .iter()
+        .map(|c| c.mode)
+        .max_by_key(|m| matches!(m, RowLockingMode::Update | RowLockingMode::NoKeyUpdate))
+        .unwrap();
+    let mode = match strongest {
+        RowLockingMode::Update | RowLockingMode::NoKeyUpdate => LockMode::Exclusive,
+        RowLockingMode::Share | RowLockingMode::KeyShare => LockMode::Share,
+    };
+    let wait_policy = select.locking.iter().find_map(|c| c.wait_policy);
+
+    // The lock target table: the explicit `OF <table>` list (first entry) or the
+    // base table of the FROM clause.
+    let target = select
+        .locking
+        .iter()
+        .flat_map(|c| c.tables.iter())
+        .next()
+        .cloned()
+        .or_else(|| select.from.as_ref().map(|f| f.base.name.clone()));
+    let Some(target) = target else {
+        // No base relation (e.g. `SELECT 1 FOR UPDATE`): nothing to lock; run as
+        // an ordinary statement.
+        return run_plain(shared, session, stmt);
+    };
+
+    // Run the SELECT to obtain the selected rows.
+    let res = run_plain(shared, session, stmt)?;
+    let ExecResult::Rows { fields, rows, tag } = res else {
+        return Ok(res);
+    };
+
+    // Acquire a row lock per selected row, applying the wait policy.
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let obj = LockObject::Row {
+            table: target.clone(),
+            key: row_key(&row),
+        };
+        match wait_policy {
+            Some(RowLockingWaitPolicy::SkipLocked) => {
+                let locked = {
+                    let mut guard = shared.locks.lock().expect("locks mutex poisoned");
+                    if guard.is_locked_by_other(session.pid, &obj, mode) {
+                        true
+                    } else {
+                        // Free for us: take it (no block) and keep the row.
+                        guard.try_acquire(session.pid, &obj, mode);
+                        false
+                    }
+                };
+                if !locked {
+                    kept.push(row);
+                }
+            }
+            Some(RowLockingWaitPolicy::NoWait) => {
+                if let Err(e) = acquire_lock(shared, session, &obj, mode, true) {
+                    if let Some(tx) = session.tx.as_mut() {
+                        tx.failed = true;
+                    }
+                    if session.tx.is_some() {
+                        session.tx_status = b'E';
+                    }
+                    return Err(e);
+                }
+                kept.push(row);
+            }
+            None => {
+                if let Err(e) = acquire_lock(shared, session, &obj, mode, false) {
+                    if let Some(tx) = session.tx.as_mut() {
+                        tx.failed = true;
+                    }
+                    if session.tx.is_some() {
+                        session.tx_status = b'E';
+                    }
+                    return Err(e);
+                }
+                kept.push(row);
+            }
+        }
+    }
+
+    let n = kept.len();
+    Ok(ExecResult::Rows {
+        fields,
+        rows: kept,
+        // The command tag reports the (possibly reduced, under SKIP LOCKED) count.
+        tag: if tag.starts_with("SELECT") {
+            format!("SELECT {n}")
+        } else {
+            tag
+        },
+    })
+}
+
+/// Run a statement through the ordinary (non-locking) path: against the
+/// transaction working copy when in a transaction, else the shared database.
+/// This mirrors the fall-through arms of [`run_statement`] without re-entering
+/// the LOCK TABLE / FOR UPDATE interception.
+fn run_plain(
+    shared: &Shared,
+    session: &mut Session,
+    stmt: &Statement,
+) -> Result<ExecResult, String> {
+    if session.tx.is_some() {
+        let res = {
+            let tx = session.tx.as_mut().unwrap();
+            if tx.failed {
+                return Err(
+                    "current transaction is aborted, commands ignored until end of transaction block".into(),
+                );
+            }
+            executor::execute(&mut tx.db, stmt.clone())
+        };
+        if res.is_err() {
+            session.tx.as_mut().unwrap().failed = true;
+            session.tx_status = b'E';
+        }
+        res
+    } else {
+        execute_autocommit(shared, stmt)
+    }
+}
+
 /// Execute one statement against the shared database and, if it mutates state
 /// and succeeds, durably append it to the WAL before releasing the lock.
 /// Holding the db lock across the append keeps WAL order == execution order.
 fn execute_autocommit(shared: &Shared, stmt: &Statement) -> Result<ExecResult, String> {
     let mut db = shared.db.lock().expect("db mutex poisoned");
     let result = executor::execute(&mut db, stmt.clone());
+
+    // CHECKPOINT: when a page-based disk store is configured (PGRS_DISK), flush
+    // the current database to it. A no-op otherwise (default behaviour).
+    if result.is_ok() && matches!(stmt, Statement::Checkpoint) {
+        if let Some(store) = shared.disk.lock().expect("disk mutex poisoned").as_mut() {
+            if let Err(e) = store.checkpoint(&db) {
+                eprintln!("warning: CHECKPOINT to disk store failed: {e}");
+            }
+        }
+    }
 
     if result.is_ok() && is_mutation(stmt) {
         if let Some(wal) = shared.wal.lock().expect("wal mutex poisoned").as_mut() {
@@ -2056,6 +2424,7 @@ fn as_i64(v: &Value) -> i64 {
     match v {
         Value::Int(i) => *i,
         Value::Float(f) => *f as i64,
+        Value::Numeric(n) => n.to_f64() as i64,
         Value::Bool(b) => *b as i64,
         Value::Text(s) => s.parse().unwrap_or(0),
         Value::Null => 0,
@@ -2066,6 +2435,7 @@ fn as_f64(v: &Value) -> f64 {
     match v {
         Value::Int(i) => *i as f64,
         Value::Float(f) => *f,
+        Value::Numeric(n) => n.to_f64(),
         Value::Bool(b) => *b as i64 as f64,
         Value::Text(s) => s.parse().unwrap_or(0.0),
         Value::Null => 0.0,
@@ -2388,6 +2758,10 @@ fn sqlstate_for(msg: &str) -> &'static str {
         "57014" // query_canceled
     } else if msg.contains("could not serialize access") {
         "40001" // serialization_failure
+    } else if msg.contains("deadlock detected") {
+        "40P01" // deadlock_detected
+    } else if msg.contains("could not obtain lock") {
+        "55P03" // lock_not_available
     } else if msg.contains("read-only transaction") {
         "25006" // read_only_sql_transaction
     } else {
@@ -2413,9 +2787,45 @@ mod tests {
         Shared {
             db: Mutex::new(Database::new()),
             wal: Mutex::new(None),
+            disk: Mutex::new(None),
             backends: Mutex::new(HashMap::new()),
             listeners: Mutex::new(HashMap::new()),
+            locks: Mutex::new(LockManager::new()),
+            lock_cv: Condvar::new(),
         }
+    }
+
+    /// CHECKPOINT is a no-op without a disk store, and flushes to the disk store
+    /// (so a fresh recovery sees the rows) when one is configured.
+    #[test]
+    fn checkpoint_flushes_to_disk_store_when_configured() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pgrs_disk_srv_{}_{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        let s = shared();
+        *s.disk.lock().unwrap() = Some(crate::disk::DiskStore::open(&dir).unwrap());
+
+        let run = |sql: &str| {
+            for stmt in Parser::parse_sql(sql).unwrap() {
+                execute_autocommit(&s, &stmt).unwrap();
+            }
+        };
+        run("CREATE TABLE kv (k bigint, v text)");
+        run("INSERT INTO kv VALUES (1, 'one'), (2, 'two')");
+        run("CHECKPOINT");
+
+        // A fresh recovery from the same directory sees the checkpointed rows.
+        let recovered = crate::disk::DiskStore::open(&dir).unwrap().recover().unwrap();
+        let kv = recovered.table("kv").expect("kv recovered");
+        assert_eq!(kv.rows.len(), 2);
+        assert_eq!(kv.rows[0], vec![Value::Int(1), Value::Text("one".into())]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A bare session with dummy cancellation/notification handles.
@@ -3240,5 +3650,257 @@ mod tests {
 
     fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // --- locking integration tests ---------------------------------------
+
+    /// Run a SELECT through the full `run_statement` path (so locking clauses
+    /// take effect) and return the first column as ints.
+    fn run_select_ints(s: &Shared, sess: &mut Session, sql: &str) -> Vec<i64> {
+        let stmt = Parser::parse_sql(sql).unwrap().remove(0);
+        match run_statement(s, sess, &stmt).unwrap() {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Int(i) => i,
+                    _ => panic!("expected int"),
+                })
+                .collect(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// `run_statement` returning its `Err` (ExecResult isn't `Debug`, so
+    /// `unwrap_err` is unavailable).
+    fn run_stmt_err(s: &Shared, sess: &mut Session, sql: &str) -> String {
+        let stmt = Parser::parse_sql(sql).unwrap().remove(0);
+        match run_statement(s, sess, &stmt) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for {sql}"),
+        }
+    }
+
+    /// A session with an explicit pid (so two share-the-Shared sessions are
+    /// distinct to the lock manager).
+    fn session_with_pid(pid: i32) -> Session {
+        Session::new(
+            pid,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn lock_table_requires_transaction_block() {
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+        let err = run_stmt_err(&s, &mut setup, "LOCK TABLE t");
+        assert!(err.contains("can only be used in transaction blocks"), "{err}");
+    }
+
+    #[test]
+    fn table_lock_nowait_conflicts_then_succeeds_after_commit() {
+        // Session A locks t EXCLUSIVE in a tx; B's NOWAIT attempt errors 55P03;
+        // after A commits, B succeeds. Sequential calls, no real threads.
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+
+        let mut a = session_with_pid(10);
+        let mut b = session_with_pid(20);
+        run(&s, &mut a, "BEGIN").unwrap();
+        run(&s, &mut a, "LOCK TABLE t IN EXCLUSIVE MODE").unwrap();
+
+        run(&s, &mut b, "BEGIN").unwrap();
+        let err = run_stmt_err(&s, &mut b, "LOCK TABLE t IN EXCLUSIVE MODE NOWAIT");
+        assert_eq!(sqlstate_for(&err), "55P03", "{err}");
+        // B's tx is now aborted; roll it back to clear.
+        run(&s, &mut b, "ROLLBACK").unwrap();
+
+        // A commits, releasing the lock; B can now lock t.
+        run(&s, &mut a, "COMMIT").unwrap();
+        let mut b2 = session_with_pid(20);
+        run(&s, &mut b2, "BEGIN").unwrap();
+        run(&s, &mut b2, "LOCK TABLE t IN EXCLUSIVE MODE NOWAIT").unwrap();
+        run(&s, &mut b2, "COMMIT").unwrap();
+    }
+
+    #[test]
+    fn access_share_does_not_conflict_with_access_share() {
+        // Two readers can both hold ACCESS SHARE concurrently.
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+
+        let mut a = session_with_pid(10);
+        let mut b = session_with_pid(20);
+        run(&s, &mut a, "BEGIN").unwrap();
+        run(&s, &mut a, "LOCK TABLE t IN ACCESS SHARE MODE").unwrap();
+        run(&s, &mut b, "BEGIN").unwrap();
+        run(&s, &mut b, "LOCK TABLE t IN ACCESS SHARE MODE NOWAIT").unwrap();
+    }
+
+    #[test]
+    fn select_for_update_skip_locked_omits_locked_rows() {
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE jobs (id integer)").unwrap();
+        run(&s, &mut setup, "INSERT INTO jobs VALUES (1), (2), (3)").unwrap();
+
+        // A locks all rows FOR UPDATE.
+        let mut a = session_with_pid(10);
+        run(&s, &mut a, "BEGIN").unwrap();
+        let _ = run_select_ints(&s, &mut a, "SELECT id FROM jobs ORDER BY id FOR UPDATE");
+
+        // B with SKIP LOCKED sees none of them (all locked by A).
+        let mut b = session_with_pid(20);
+        run(&s, &mut b, "BEGIN").unwrap();
+        let got = run_select_ints(
+            &s,
+            &mut b,
+            "SELECT id FROM jobs ORDER BY id FOR UPDATE SKIP LOCKED",
+        );
+        assert!(got.is_empty(), "expected all rows skipped, got {got:?}");
+
+        run(&s, &mut a, "COMMIT").unwrap();
+        // After A releases, B sees them all.
+        let got = run_select_ints(
+            &s,
+            &mut b,
+            "SELECT id FROM jobs ORDER BY id FOR UPDATE SKIP LOCKED",
+        );
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn select_for_update_nowait_errors_on_locked_row() {
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE jobs (id integer)").unwrap();
+        run(&s, &mut setup, "INSERT INTO jobs VALUES (1)").unwrap();
+
+        let mut a = session_with_pid(10);
+        run(&s, &mut a, "BEGIN").unwrap();
+        let _ = run_select_ints(&s, &mut a, "SELECT id FROM jobs FOR UPDATE");
+
+        let mut b = session_with_pid(20);
+        run(&s, &mut b, "BEGIN").unwrap();
+        let err = run_stmt_err(&s, &mut b, "SELECT id FROM jobs FOR UPDATE NOWAIT");
+        assert_eq!(sqlstate_for(&err), "55P03", "{err}");
+    }
+
+    #[test]
+    fn blocking_lock_unblocks_after_commit_real_threads() {
+        // A real blocking test: B blocks on a table lock A holds, and proceeds
+        // only once A commits. Synchronized with channels (no sleeps for
+        // correctness; one short sleep only to bias scheduling, not relied on).
+        use std::sync::mpsc;
+        let s = Arc::new(shared());
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+
+        let mut a = session_with_pid(10);
+        run(&s, &mut a, "BEGIN").unwrap();
+        run(&s, &mut a, "LOCK TABLE t IN EXCLUSIVE MODE").unwrap();
+
+        let (tx_started, rx_started) = mpsc::channel();
+        let (tx_done, rx_done) = mpsc::channel();
+        let s_b = Arc::clone(&s);
+        let handle = thread::spawn(move || {
+            let mut b = session_with_pid(20);
+            run(&s_b, &mut b, "BEGIN").unwrap();
+            tx_started.send(()).unwrap();
+            // This blocks until A commits and releases the lock.
+            run(&s_b, &mut b, "LOCK TABLE t IN EXCLUSIVE MODE").unwrap();
+            tx_done.send(()).unwrap();
+            run(&s_b, &mut b, "COMMIT").unwrap();
+        });
+
+        // Wait until B has started and is (about to be) blocked.
+        rx_started.recv().unwrap();
+        // B must NOT have acquired the lock yet (A still holds it).
+        assert!(
+            rx_done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "B acquired the lock while A still held it"
+        );
+
+        // Release by committing A; B should now proceed.
+        run(&s, &mut a, "COMMIT").unwrap();
+        rx_done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("B did not unblock after A committed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn deadlock_is_detected_and_aborts_a_transaction() {
+        // A holds table x and waits for y; B holds y and requests x, closing a
+        // cycle. The lock manager must abort one with 40P01 rather than hang.
+        use std::sync::mpsc;
+        let s = Arc::new(shared());
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE x (id integer)").unwrap();
+        run(&s, &mut setup, "CREATE TABLE y (id integer)").unwrap();
+
+        let mut a = session_with_pid(10);
+        run(&s, &mut a, "BEGIN").unwrap();
+        run(&s, &mut a, "LOCK TABLE x IN EXCLUSIVE MODE").unwrap();
+
+        // B locks y, then signals it is ready, then asks for x (will block on A).
+        let (tx_b_ready, rx_b_ready) = mpsc::channel();
+        let (tx_b_result, rx_b_result) = mpsc::channel();
+        let s_b = Arc::clone(&s);
+        let handle = thread::spawn(move || {
+            let mut b = session_with_pid(20);
+            run(&s_b, &mut b, "BEGIN").unwrap();
+            run(&s_b, &mut b, "LOCK TABLE y IN EXCLUSIVE MODE").unwrap();
+            tx_b_ready.send(()).unwrap();
+            let stmt = Parser::parse_sql("LOCK TABLE x IN EXCLUSIVE MODE")
+                .unwrap()
+                .remove(0);
+            let r = run_statement(&s_b, &mut b, &stmt);
+            tx_b_result.send(r.is_err()).unwrap();
+            run(&s_b, &mut b, "ROLLBACK").unwrap();
+        });
+
+        rx_b_ready.recv().unwrap();
+        // Give B a moment to actually park on x. We retry A's request which
+        // closes the cycle; whichever side detects the cycle aborts with 40P01.
+        // A now requests y (held by B): this would deadlock.
+        let mut detected_on_a = false;
+        // Spin until B is waiting on x (its wait-for edge is recorded), then
+        // make A request y to form the cycle.
+        loop {
+            let waiting = {
+                let lm = s.locks.lock().unwrap();
+                !lm.wait_for_graph().is_empty()
+            };
+            if waiting {
+                break;
+            }
+            thread::yield_now();
+        }
+        let stmt = Parser::parse_sql("LOCK TABLE y IN EXCLUSIVE MODE")
+            .unwrap()
+            .remove(0);
+        match run_statement(&s, &mut a, &stmt) {
+            Err(e) => {
+                assert_eq!(sqlstate_for(&e), "40P01", "{e}");
+                detected_on_a = true;
+                run(&s, &mut a, "ROLLBACK").unwrap();
+            }
+            Ok(_) => {
+                // A got y because B was the one aborted; release so B unblocks.
+                run(&s, &mut a, "COMMIT").unwrap();
+            }
+        }
+
+        let b_aborted = rx_b_result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("B never completed: implementation deadlocked");
+        // Exactly one side must have hit the deadlock abort.
+        assert!(detected_on_a || b_aborted, "no side detected the deadlock");
+        handle.join().unwrap();
     }
 }

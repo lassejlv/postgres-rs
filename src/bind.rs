@@ -185,6 +185,11 @@ fn value_to_expr(v: &Value) -> Expr {
         Value::Null => Expr::Null,
         Value::Int(i) => Expr::Int(*i),
         Value::Float(f) => Expr::Float(*f),
+        // Re-cast the canonical text so the exact numeric value round-trips.
+        Value::Numeric(n) => Expr::Cast {
+            expr: Box::new(Expr::Str(n.to_canonical_string())),
+            target: crate::types::DataType::Numeric,
+        },
         Value::Text(s) => Expr::Str(s.clone()),
         Value::Bool(b) => Expr::Bool(*b),
     }
@@ -211,7 +216,10 @@ fn decode_text(s: String, oid: i32) -> Value {
     match oid {
         16 => Value::Bool(matches!(s.as_str(), "t" | "true" | "1" | "yes" | "on")),
         20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s)),
-        700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s)),
+        700 | 701 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s)),
+        1700 => crate::numeric::BigDecimal::parse(&s)
+            .map(Value::Numeric)
+            .unwrap_or(Value::Text(s)),
         25 | 1042 | 1043 | 0 => {
             // Unspecified: infer from the lexical form so comparisons work.
             if oid == 0 {

@@ -59,6 +59,29 @@ pub struct Domain {
 
 pub const DEFAULT_PAGE_SIZE: usize = 8192;
 
+/// Autovacuum fires on a table once its dead-tuple count reaches
+/// `AUTOVACUUM_VACUUM_THRESHOLD + AUTOVACUUM_VACUUM_SCALE_FACTOR * live_rows`,
+/// mirroring PostgreSQL's `autovacuum_vacuum_threshold` (default 50) and
+/// `autovacuum_vacuum_scale_factor` (default 0.2).
+pub const AUTOVACUUM_VACUUM_THRESHOLD: usize = 50;
+pub const AUTOVACUUM_VACUUM_SCALE_FACTOR: f64 = 0.2;
+
+/// Pure decision function: should this table be autovacuumed now? True when its
+/// accumulated dead tuples reach the threshold-plus-scale formula above. Exposed
+/// (and unit-tested) directly because the background worker that calls it is not
+/// deterministically testable.
+pub fn should_autovacuum(table: &Table) -> bool {
+    let stats = table.storage_stats();
+    let trigger = AUTOVACUUM_VACUUM_THRESHOLD
+        + (AUTOVACUUM_VACUUM_SCALE_FACTOR * stats.live_rows as f64) as usize;
+    stats.dead_rows >= trigger
+}
+
+/// Field values larger than this (in bytes of their text representation) are
+/// moved out-of-line into the per-table TOAST side store on insert/update.
+/// PostgreSQL's real threshold (`TOAST_TUPLE_THRESHOLD`) is ~2 KB; we mirror it.
+pub const TOAST_THRESHOLD_BYTES: usize = 2048;
+
 /// A table column: a name and its declared type, plus simple constraints.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -82,6 +105,26 @@ pub struct Column {
     pub identity_always: bool,
     /// Stored generated expression.
     pub generated: Option<Expr>,
+}
+
+impl Column {
+    /// A plain column with just a name, type, and nullability — all other
+    /// attributes defaulted. Used when reconstructing a table from persisted
+    /// catalog metadata (the disk subsystem), where only these survive.
+    pub fn basic(name: String, data_type: DataType, not_null: bool) -> Column {
+        Column {
+            name,
+            data_type,
+            type_name: None,
+            not_null,
+            primary_key: false,
+            default: None,
+            serial: false,
+            identity: false,
+            identity_always: false,
+            generated: None,
+        }
+    }
 }
 
 /// Per-column statistics collected by `ANALYZE`, used by the cost-based planner
@@ -113,6 +156,7 @@ fn value_stat_key(v: &Value) -> String {
         Value::Null => "n".to_string(),
         Value::Int(i) => format!("i{i}"),
         Value::Float(f) => format!("f{}", f.to_bits()),
+        Value::Numeric(n) => format!("d{}", n.to_canonical_string()),
         Value::Text(s) => format!("t{s}"),
         Value::Bool(b) => format!("b{b}"),
     }
@@ -153,6 +197,12 @@ pub struct Table {
     row_storage_bytes: HashMap<RowId, usize>,
     vacuum_count: usize,
     compaction_count: usize,
+    /// Out-of-line TOAST side store: oversized text/bytea field values are moved
+    /// here keyed by a fresh chunk id, with a compact pointer left in the row.
+    /// De-toasted transparently on read so SQL semantics are unchanged.
+    toast: HashMap<u64, String>,
+    /// Next TOAST chunk id to hand out; monotonically increasing.
+    next_toast_id: u64,
     /// Planner statistics, populated by `ANALYZE`. `None` until first analyzed.
     stats: Option<TableStats>,
     /// Direct parent tables this table inherits from (`INHERITS (...)`), or the
@@ -373,6 +423,8 @@ impl Table {
             row_storage_bytes: HashMap::new(),
             vacuum_count: 0,
             compaction_count: 0,
+            toast: HashMap::new(),
+            next_toast_id: 0,
             stats: None,
             inherits: Vec::new(),
             partition_scheme: None,
@@ -619,14 +671,89 @@ impl Table {
         }
     }
 
+    // --- TOAST out-of-line storage -------------------------------------------
+
+    /// Prefix/suffix sentinels delimiting a TOAST pointer left in a row cell.
+    /// Chosen from control characters so they never collide with real data.
+    const TOAST_PREFIX: &'static str = "\u{1}pg_toast:";
+    const TOAST_SUFFIX: &'static str = "\u{1}";
+
+    /// Move oversized text/bytea cells of `row` out-of-line into the TOAST store,
+    /// replacing each with a compact pointer. Numbers/bools are never toasted.
+    fn toast_row(&mut self, row: &mut [Value]) {
+        for cell in row.iter_mut() {
+            let Value::Text(s) = cell else { continue };
+            // Don't re-toast an existing pointer (e.g. on internal rewrites).
+            if s.starts_with(Self::TOAST_PREFIX) {
+                continue;
+            }
+            if s.len() <= TOAST_THRESHOLD_BYTES {
+                continue;
+            }
+            let id = self.next_toast_id;
+            self.next_toast_id += 1;
+            let full = std::mem::take(s);
+            self.toast.insert(id, full);
+            *cell = Value::Text(format!(
+                "{}{id}{}",
+                Self::TOAST_PREFIX,
+                Self::TOAST_SUFFIX
+            ));
+        }
+    }
+
+    /// Free any TOAST chunks referenced by `row`'s pointers (called when a row
+    /// is removed so the side store doesn't leak).
+    fn untoast_row(&mut self, row: &[Value]) {
+        for cell in row {
+            if let Some(id) = Self::toast_id_of(cell) {
+                self.toast.remove(&id);
+            }
+        }
+    }
+
+    /// Parse the TOAST chunk id out of a pointer value, if `cell` is one.
+    fn toast_id_of(cell: &Value) -> Option<u64> {
+        let Value::Text(s) = cell else { return None };
+        let inner = s.strip_prefix(Self::TOAST_PREFIX)?;
+        let inner = inner.strip_suffix(Self::TOAST_SUFFIX)?;
+        inner.parse::<u64>().ok()
+    }
+
+    /// Resolve a single cell, replacing a TOAST pointer with its full value.
+    /// Non-pointer values are returned unchanged. This is what makes TOAST
+    /// transparent to readers.
+    pub fn detoast_value(&self, cell: &Value) -> Value {
+        match Self::toast_id_of(cell) {
+            Some(id) => Value::Text(self.toast.get(&id).cloned().unwrap_or_default()),
+            None => cell.clone(),
+        }
+    }
+
+    /// Detoast a whole row into fully materialized values.
+    pub fn detoast_row(&self, row: &[Value]) -> Vec<Value> {
+        row.iter().map(|c| self.detoast_value(c)).collect()
+    }
+
+    /// Number of values currently stored out-of-line (observability for tests).
+    pub fn toast_chunk_count(&self) -> usize {
+        self.toast.len()
+    }
+
+    /// Total bytes held in the TOAST side store (observability for tests).
+    pub fn toast_bytes(&self) -> usize {
+        self.toast.values().map(|s| s.len()).sum()
+    }
+
     /// Append a row, assigning it a fresh stable id and updating all indexes.
-    pub fn push_row(&mut self, row: Vec<Value>) {
+    pub fn push_row(&mut self, mut row: Vec<Value>) {
         let id = self.next_row_id;
         self.next_row_id += 1;
         let pos = self.rows.len();
         let storage_bytes = row_storage_bytes(&row);
         self.index_row(&row, id);
         self.assign_live_storage(id, storage_bytes);
+        self.toast_row(&mut row);
         self.rows.push(row);
         self.row_ids.push(id);
         self.row_pos.insert(id, pos);
@@ -634,17 +761,22 @@ impl Table {
 
     /// Replace the row at position `pos` with `new_row`, keeping its id and
     /// repairing every index whose column changed.
-    pub fn update_row(&mut self, pos: usize, new_row: Vec<Value>) {
+    pub fn update_row(&mut self, pos: usize, mut new_row: Vec<Value>) {
         let id = self.row_ids[pos];
         // Re-derive index membership wholesale: a row can enter or leave a
         // partial index, or change an expression key, so removing the old key
         // and inserting the new one is both simplest and always correct.
-        let old_row = self.rows[pos].clone();
+        // Indexes/storage accounting work on fully de-toasted values.
+        let stored_old = self.rows[pos].clone();
+        let old_row = self.detoast_row(&stored_old);
         self.unindex_row(&old_row, id);
         self.index_row(&new_row, id);
         let storage_bytes = row_storage_bytes(&new_row);
         self.mark_dead_storage(id);
         self.assign_live_storage(id, storage_bytes);
+        // Free the prior row's out-of-line chunks, then toast the new row.
+        self.untoast_row(&stored_old);
+        self.toast_row(&mut new_row);
         self.rows[pos] = new_row;
     }
 
@@ -663,9 +795,11 @@ impl Table {
         // values and ids in place).
         for (p, dropped) in drop_mask.iter().enumerate() {
             if *dropped {
-                let row = self.rows[p].clone();
+                let stored = self.rows[p].clone();
+                let row = self.detoast_row(&stored);
                 let id = self.row_ids[p];
                 self.unindex_row(&row, id);
+                self.untoast_row(&stored);
             }
         }
         for (p, dropped) in drop_mask.iter().enumerate() {
@@ -697,6 +831,7 @@ impl Table {
         self.storage_pages.clear();
         self.row_storage_pages.clear();
         self.row_storage_bytes.clear();
+        self.toast.clear();
         for idx in &mut self.indexes {
             idx.clear();
         }
@@ -1221,6 +1356,7 @@ fn value_storage_bytes(value: &Value) -> usize {
         Value::Null => 0,
         Value::Bool(_) => 1,
         Value::Int(_) | Value::Float(_) => 8,
+        Value::Numeric(n) => 4 + n.to_canonical_string().len(),
         Value::Text(s) => 4 + s.len(),
     }
 }
@@ -1350,6 +1486,11 @@ pub struct Database {
     /// transaction, keyed by table name. Absent => never modified post-startup
     /// (treated as version 0).
     table_versions: HashMap<String, u64>,
+    /// `pg_largeobject`-style store: large-object OID -> its full byte content
+    /// (held as the engine's text/bytea representation). Backs the `lo_*` API.
+    large_objects: HashMap<u32, Vec<u8>>,
+    /// Next OID handed out by `lo_creat`/`lo_create(0)`.
+    next_lo_oid: u32,
 }
 
 impl Default for Database {
@@ -1406,6 +1547,8 @@ impl Default for Database {
             catalog_objects: HashMap::new(),
             commit_version: 0,
             table_versions: HashMap::new(),
+            large_objects: HashMap::new(),
+            next_lo_oid: 16384,
         }
     }
 }
@@ -2868,6 +3011,96 @@ impl Database {
             stats.absorb(table.vacuum_storage());
         }
         stats
+    }
+
+    // --- large objects (pg_largeobject) -------------------------------------
+
+    /// `lo_create(oid)`: register a new, empty large object with the given OID
+    /// (or allocate one when `oid` is 0). Errors if the OID is already in use.
+    pub fn lo_create(&mut self, oid: u32) -> Result<u32, String> {
+        let oid = if oid == 0 { self.alloc_lo_oid() } else { oid };
+        if self.large_objects.contains_key(&oid) {
+            return Err(format!("large object {oid} already exists"));
+        }
+        self.large_objects.insert(oid, Vec::new());
+        Ok(oid)
+    }
+
+    /// `lo_creat(mode)`: allocate a fresh OID and create an empty large object.
+    /// `mode` (read/write permission bits) is accepted and ignored.
+    pub fn lo_creat(&mut self, _mode: i64) -> u32 {
+        let oid = self.alloc_lo_oid();
+        self.large_objects.insert(oid, Vec::new());
+        oid
+    }
+
+    fn alloc_lo_oid(&mut self) -> u32 {
+        while self.large_objects.contains_key(&self.next_lo_oid) {
+            self.next_lo_oid = self.next_lo_oid.wrapping_add(1).max(16384);
+        }
+        let oid = self.next_lo_oid;
+        self.next_lo_oid = self.next_lo_oid.wrapping_add(1).max(16384);
+        oid
+    }
+
+    /// `lo_unlink(oid)`: delete a large object. Errors if it does not exist.
+    pub fn lo_unlink(&mut self, oid: u32) -> Result<(), String> {
+        if self.large_objects.remove(&oid).is_none() {
+            return Err(format!("large object {oid} does not exist"));
+        }
+        Ok(())
+    }
+
+    /// `lo_put(oid, offset, data)`: overwrite `data` into the large object at
+    /// byte `offset`, zero-extending if the offset is past the current end.
+    pub fn lo_put(&mut self, oid: u32, offset: usize, data: &[u8]) -> Result<(), String> {
+        let obj = self
+            .large_objects
+            .get_mut(&oid)
+            .ok_or_else(|| format!("large object {oid} does not exist"))?;
+        let end = offset + data.len();
+        if obj.len() < end {
+            obj.resize(end, 0);
+        }
+        obj[offset..end].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// `lo_get(oid)`: return the full content of a large object.
+    pub fn lo_get(&self, oid: u32) -> Result<&[u8], String> {
+        self.large_objects
+            .get(&oid)
+            .map(|v| v.as_slice())
+            .ok_or_else(|| format!("large object {oid} does not exist"))
+    }
+
+    /// Whether a large object with this OID exists.
+    pub fn lo_exists(&self, oid: u32) -> bool {
+        self.large_objects.contains_key(&oid)
+    }
+
+    // --- autovacuum ----------------------------------------------------------
+
+    /// Vacuum every table whose accumulated dead tuples meet the autovacuum
+    /// threshold (see [`should_autovacuum`]). Returns the names of tables that
+    /// were vacuumed. This is the deterministic core the background worker calls
+    /// each tick, and what the unit tests exercise directly.
+    pub fn autovacuum_once(&mut self) -> Vec<String> {
+        let mut vacuumed = Vec::new();
+        let due: Vec<String> = self
+            .tables
+            .iter()
+            .filter(|(_, t)| should_autovacuum(t))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in due {
+            if let Some(table) = self.tables.get_mut(&name) {
+                table.vacuum_storage();
+                vacuumed.push(name);
+            }
+        }
+        vacuumed.sort();
+        vacuumed
     }
 
     /// Rename a table (and re-key its `serial` sequences).

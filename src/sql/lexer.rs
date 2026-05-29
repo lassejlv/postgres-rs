@@ -113,6 +113,13 @@ impl<'a> Lexer<'a> {
             return Ok(None);
         };
 
+        // Escape string literal `E'...'` / `e'...'` (C-style backslash
+        // escapes). Must be checked before the identifier path since `E` is
+        // also a valid identifier start.
+        if (c == b'E' || c == b'e') && self.peek_at(1) == Some(b'\'') {
+            self.bump(); // consume the E/e prefix
+            return Ok(Some(self.read_escape_string()?));
+        }
         // Identifiers / keywords.
         if c == b'_' || c.is_ascii_alphabetic() {
             return Ok(Some(self.read_word()));
@@ -421,6 +428,41 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) => s.push(c as char),
                 None => return Err("unterminated quoted identifier".to_string()),
+            }
+        }
+    }
+
+    /// Read an `E'...'` escape string (the `E` prefix is already consumed),
+    /// resolving common C-style backslash escapes. `''` is still an escaped
+    /// single quote, matching PostgreSQL.
+    fn read_escape_string(&mut self) -> Result<Token, String> {
+        self.bump(); // opening quote
+        let mut bytes = Vec::new();
+        loop {
+            match self.bump() {
+                Some(b'\'') => {
+                    if self.peek() == Some(b'\'') {
+                        self.bump();
+                        bytes.push(b'\'');
+                    } else {
+                        let s = String::from_utf8(bytes)
+                            .map_err(|_| "invalid UTF-8 in string literal".to_string())?;
+                        return Ok(Token::StringLit(s));
+                    }
+                }
+                Some(b'\\') => match self.bump() {
+                    Some(b'n') => bytes.push(b'\n'),
+                    Some(b't') => bytes.push(b'\t'),
+                    Some(b'r') => bytes.push(b'\r'),
+                    Some(b'b') => bytes.push(0x08),
+                    Some(b'f') => bytes.push(0x0c),
+                    Some(b'\\') => bytes.push(b'\\'),
+                    Some(b'\'') => bytes.push(b'\''),
+                    Some(other) => bytes.push(other),
+                    None => return Err("unterminated string literal".to_string()),
+                },
+                Some(c) => bytes.push(c),
+                None => return Err("unterminated string literal".to_string()),
             }
         }
     }

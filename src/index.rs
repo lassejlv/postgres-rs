@@ -97,8 +97,14 @@ impl IndexKey {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Text(x), Value::Text(y)) => x.cmp(y),
-            // Any numeric mix compares as f64 (matching `compare_values`).
-            (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
+            // Exact decimal comparison when both sides are numeric.
+            (Value::Numeric(x), Value::Numeric(y)) => x.cmp(y),
+            // Any numeric mix (incl. Numeric vs Int/Float) compares as f64,
+            // matching `compare_values`.
+            (
+                Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+                Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+            ) => {
                 let x = numeric(a);
                 let y = numeric(b);
                 x.partial_cmp(&y).unwrap_or(Ordering::Equal)
@@ -116,6 +122,7 @@ fn numeric(v: &Value) -> f64 {
     match v {
         Value::Int(i) => *i as f64,
         Value::Float(f) => *f,
+        Value::Numeric(n) => n.to_f64(),
         _ => unreachable!("numeric() called on non-numeric value"),
     }
 }
@@ -127,6 +134,7 @@ fn type_rank(v: &Value) -> u8 {
         Value::Bool(_) => 0,
         Value::Int(_) => 1,
         Value::Float(_) => 2,
+        Value::Numeric(_) => 2,
         Value::Text(_) => 3,
         Value::Null => 4,
     }
@@ -184,6 +192,17 @@ fn hash_key(values: &[Value]) -> String {
             Value::Float(f) => {
                 s.push('i');
                 s.push_str(&(*f as i64).to_string());
+                if f.fract() != 0.0 {
+                    s.push('f');
+                    s.push_str(&format!("{f}"));
+                }
+            }
+            // Hash like a float so numeric/int/float keys collide consistently
+            // with the B-tree's numeric comparison.
+            Value::Numeric(n) => {
+                let f = n.to_f64();
+                s.push('i');
+                s.push_str(&(f as i64).to_string());
                 if f.fract() != 0.0 {
                     s.push('f');
                     s.push_str(&format!("{f}"));

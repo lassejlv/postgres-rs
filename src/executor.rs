@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::index::Bound;
+use crate::numeric::BigDecimal;
 use crate::sql::ast::*;
 use crate::sql::serialize::{expr_to_sql, select_to_sql};
 use crate::storage::{
@@ -54,12 +55,32 @@ struct ScalarUdf {
     return_type: Option<DataType>,
 }
 
+/// A `LANGUAGE plpgsql` scalar function: its raw body and parameter info. The
+/// body is interpreted by [`crate::plpgsql`] with the call arguments bound.
+#[derive(Clone)]
+struct PlpgsqlUdf {
+    /// Argument names in declaration order (lowercased; empty when unnamed).
+    arg_names: Vec<String>,
+    /// Argument types, used to coerce the bound values.
+    arg_types: Vec<DataType>,
+    /// The verbatim PL/pgSQL body.
+    body: String,
+    /// The declared return type, used to coerce the result.
+    return_type: Option<DataType>,
+}
+
 thread_local! {
     /// Scalar UDFs visible to the currently-executing statement, keyed by
     /// `(lowercased name, arity)`. Populated once per top-level `execute` so
     /// that `eval_scalar_function` (which receives no `Database`) can resolve a
     /// call to a user-defined scalar SQL function.
     static SCALAR_UDFS: std::cell::RefCell<HashMap<(String, usize), ScalarUdf>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// `LANGUAGE plpgsql` scalar functions visible to the currently-executing
+    /// statement, keyed by `(lowercased name, arity)`. Resolved by
+    /// `eval_scalar_function` the same way as `SCALAR_UDFS`.
+    static PLPGSQL_UDFS: std::cell::RefCell<HashMap<(String, usize), PlpgsqlUdf>> =
         std::cell::RefCell::new(HashMap::new());
 
     /// Rendered `CREATE INDEX ...` / constraint definitions keyed by catalog
@@ -113,16 +134,29 @@ fn flush_guc_writes(db: &mut Database) {
 /// surfaces the usual "function does not exist" error from `eval_scalar_function`.
 fn refresh_scalar_udfs(db: &Database) {
     let mut map = HashMap::new();
+    let mut pl_map = HashMap::new();
     for f in db.all_functions() {
+        let arg_names: Vec<String> = f
+            .arg_names
+            .iter()
+            .map(|n| n.clone().unwrap_or_default().to_ascii_lowercase())
+            .collect();
+        if f.language == "plpgsql" {
+            pl_map.insert(
+                (f.name.to_ascii_lowercase(), f.arg_types.len()),
+                PlpgsqlUdf {
+                    arg_names,
+                    arg_types: f.arg_types.clone(),
+                    body: f.body.clone(),
+                    return_type: f.return_type,
+                },
+            );
+            continue;
+        }
         if f.language != "sql" {
             continue;
         }
         if let Some(body) = scalar_udf_body(&f.body) {
-            let arg_names = f
-                .arg_names
-                .iter()
-                .map(|n| n.clone().unwrap_or_default().to_ascii_lowercase())
-                .collect();
             map.insert(
                 (f.name.to_ascii_lowercase(), f.arg_types.len()),
                 ScalarUdf {
@@ -135,6 +169,7 @@ fn refresh_scalar_udfs(db: &Database) {
         }
     }
     SCALAR_UDFS.with(|cell| *cell.borrow_mut() = map);
+    PLPGSQL_UDFS.with(|cell| *cell.borrow_mut() = pl_map);
 }
 
 /// Quote an SQL identifier only when it needs quoting (mirrors psql output:
@@ -474,6 +509,26 @@ fn try_eval_scalar_udf(name: &str, vals: &[Value]) -> Option<Result<Value, Strin
     }
     let substituted = substitute_udf_args(&udf.body, &coerced, &udf.arg_names);
     let result = eval_expr(&substituted, &[], &[]);
+    Some(match (result, udf.return_type) {
+        (Ok(v), Some(ty)) => coerce(v, ty),
+        (other, _) => other,
+    })
+}
+
+/// Evaluate a user-defined `LANGUAGE plpgsql` scalar function call by
+/// interpreting its body with the (coerced) argument values bound. Returns
+/// `None` when no plpgsql function matches the name/arity.
+fn try_eval_plpgsql_udf(name: &str, vals: &[Value]) -> Option<Result<Value, String>> {
+    let key = (name.to_ascii_lowercase(), vals.len());
+    let udf = PLPGSQL_UDFS.with(|cell| cell.borrow().get(&key).cloned())?;
+    let mut coerced = Vec::with_capacity(vals.len());
+    for (v, ty) in vals.iter().zip(udf.arg_types.iter()) {
+        match coerce(v.clone(), *ty) {
+            Ok(c) => coerced.push(c),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    let result = crate::plpgsql::eval_plpgsql(&udf.body, &udf.arg_names, &coerced);
     Some(match (result, udf.return_type) {
         (Ok(v), Some(ty)) => coerce(v, ty),
         (other, _) => other,
@@ -1225,11 +1280,33 @@ fn resolve_source_schema(
     tref: &TableRef,
     ctes: &CteMap,
 ) -> Result<(Vec<String>, Vec<DataType>), String> {
+    // A derived table: derive its schema from the subquery's projection without
+    // executing it (the subquery may carry unresolved outer correlations).
+    if let Some(sub) = &tref.subquery {
+        let fields = select_fields_with_ctes(db, sub, ctes)?;
+        let qual = tref.qualifier();
+        let names: Vec<String> = fields.iter().map(|f| format!("{qual}.{}", f.name)).collect();
+        let types: Vec<DataType> = fields.iter().map(|f| f.data_type).collect();
+        let (names, types, _) = apply_column_aliases(tref, names, types, Vec::new());
+        return Ok((names, types));
+    }
     if let Some(cte) = ctes.get(&tref.name) {
-        return Ok(cte_qualified_schema(cte, tref.qualifier()));
+        let (names, types) = cte_qualified_schema(cte, tref.qualifier());
+        let (names, types, _) = apply_column_aliases(tref, names, types, Vec::new());
+        return Ok((names, types));
     }
     if !tref.args.is_empty() {
-        let (names, types, _) = virtual_set_returning_function(tref)?;
+        // Use the static (argument-independent) schema so correlated arguments
+        // need not be evaluated here.
+        if let Some((names, types)) = virtual_set_returning_function_schema(tref) {
+            return Ok((names, types));
+        }
+        let (mut names, mut types, _) = virtual_set_returning_function(tref)?;
+        if tref.with_ordinality {
+            names.push(format!("{}.ordinality", tref.qualifier()));
+            types.push(DataType::Int8);
+        }
+        let (names, types, _) = apply_column_aliases(tref, names, types, Vec::new());
         return Ok((names, types));
     }
     if tref.schema.as_deref() == Some("information_schema") {
@@ -1505,7 +1582,7 @@ fn resolve_base_source(
                 }
                 let rows = positions
                     .into_iter()
-                    .map(|p| table.rows[p].clone())
+                    .map(|p| table.detoast_row(&table.rows[p]))
                     .collect();
                 return Ok((names, types, rows));
             }
@@ -1613,14 +1690,25 @@ fn resolve_source_table(
 ) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
     // A derived table: a parenthesised subquery in FROM.
     if let Some(sub) = &tref.subquery {
-        return resolve_subquery_source(db, sub, tref.qualifier(), ctes);
+        let (names, types, rows) = resolve_subquery_source(db, sub, tref.qualifier(), ctes)?;
+        return Ok(apply_column_aliases(tref, names, types, rows));
     }
     if let Some(cte) = ctes.get(&tref.name) {
         let (names, types) = cte_qualified_schema(cte, tref.qualifier());
-        return Ok((names, types, cte.rows.clone()));
+        return Ok(apply_column_aliases(tref, names, types, cte.rows.clone()));
     }
     if !tref.args.is_empty() {
-        return virtual_set_returning_function(tref);
+        let (names, types, rows) = virtual_set_returning_function(tref)?;
+        let (mut names, mut types, mut rows) = (names, types, rows);
+        // `WITH ORDINALITY` appends a 1-based bigint column.
+        if tref.with_ordinality {
+            names.push(format!("{}.ordinality", tref.qualifier()));
+            types.push(DataType::Int8);
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.push(Value::Int(i as i64 + 1));
+            }
+        }
+        return Ok(apply_column_aliases(tref, names, types, rows));
     }
     if tref.schema.as_deref() == Some("information_schema") {
         return virtual_information_schema(db, &tref.name, tref.qualifier());
@@ -1658,7 +1746,7 @@ fn resolve_source_table(
         names.push(format!("{}.{}", tref.qualifier(), c.name));
         types.push(c.data_type);
     }
-    let mut rows = table.rows.clone();
+    let mut rows: Vec<Vec<Value>> = table.rows.iter().map(|r| table.detoast_row(r)).collect();
     // Inheritance / partitioning: unless `ONLY` was written, a scan of a parent
     // also returns rows from every descendant table, projected onto the parent's
     // column set (matched by column name; descendant-only columns dropped).
@@ -1678,7 +1766,7 @@ fn resolve_source_table(
                 let projected: Vec<Value> = projection
                     .iter()
                     .map(|slot| match slot {
-                        Some(i) => child_row[*i].clone(),
+                        Some(i) => child.detoast_value(&child_row[*i]),
                         None => Value::Null,
                     })
                     .collect();
@@ -1707,6 +1795,60 @@ fn resolve_subquery_source(
         types.push(f.data_type);
     }
     Ok((names, types, rows))
+}
+
+/// Rename a source's output columns according to a `FROM`-clause column-alias
+/// list (`... AS t(c1, c2)`). Each alias replaces the unqualified part of the
+/// corresponding column name, keeping the table qualifier. Extra produced
+/// columns beyond the alias list keep their original names. A no-op when the
+/// alias list is empty.
+fn apply_column_aliases(
+    tref: &TableRef,
+    mut names: Vec<String>,
+    types: Vec<DataType>,
+    rows: Vec<Vec<Value>>,
+) -> (Vec<String>, Vec<DataType>, Vec<Vec<Value>>) {
+    if !tref.column_aliases.is_empty() {
+        let qual = tref.qualifier();
+        for (slot, alias) in names.iter_mut().zip(tref.column_aliases.iter()) {
+            *slot = format!("{qual}.{alias}");
+        }
+    }
+    (names, types, rows)
+}
+
+/// The output schema (column names + types) of a set-returning function in
+/// FROM, computed *without* evaluating its arguments. The shape of these
+/// functions is fixed regardless of argument values, so this stays valid even
+/// when the args reference an outer (not-yet-substituted) correlated column —
+/// which is exactly when `select_own_columns` needs the schema during
+/// correlation analysis. Returns `None` for functions whose schema this engine
+/// cannot derive statically, letting callers fall back to materialization.
+fn virtual_set_returning_function_schema(
+    tref: &TableRef,
+) -> Option<(Vec<String>, Vec<DataType>)> {
+    let q = tref.qualifier();
+    let (cols, types): (Vec<String>, Vec<DataType>) = match tref.name.to_ascii_lowercase().as_str()
+    {
+        "generate_series" => (vec![format!("{q}.generate_series")], vec![DataType::Int8]),
+        "unnest" => (vec![format!("{q}.unnest")], vec![DataType::Text]),
+        "pg_partition_ancestors" | "pg_partition_root" => (
+            vec![format!("{q}.{}", tref.name.to_ascii_lowercase())],
+            vec![DataType::Int8],
+        ),
+        "pg_options_to_table" => (
+            vec![format!("{q}.option_name"), format!("{q}.option_value")],
+            vec![DataType::Text, DataType::Text],
+        ),
+        _ => return None,
+    };
+    let (mut cols, mut types) = (cols, types);
+    if tref.with_ordinality {
+        cols.push(format!("{q}.ordinality"));
+        types.push(DataType::Int8);
+    }
+    let (cols, types, _) = apply_column_aliases(tref, cols, types, Vec::new());
+    Some((cols, types))
 }
 
 fn virtual_set_returning_function(
@@ -1746,6 +1888,18 @@ fn virtual_set_returning_function(
                 .unwrap_or(0);
             let name = format!("{}.{}", tref.qualifier(), tref.name.to_ascii_lowercase());
             Ok((vec![name], vec![DataType::Int8], vec![vec![Value::Int(oid)]]))
+        }
+        // `pg_options_to_table(text[])` expands a reloptions/foreign-options
+        // array into (option_name, option_value) rows. No object in this engine
+        // carries such options, so it is always empty; pg_dump only calls it on
+        // (always-empty) FDW/server/table option arrays.
+        "pg_options_to_table" => {
+            let q = tref.qualifier();
+            Ok((
+                vec![format!("{q}.option_name"), format!("{q}.option_value")],
+                vec![DataType::Text, DataType::Text],
+                Vec::new(),
+            ))
         }
         other => Err(format!("set-returning function {other}() is not supported")),
     }
@@ -2129,6 +2283,12 @@ fn gin_index_positions(table: &Table, conjuncts: &[&Expr]) -> Option<Vec<usize>>
         let Some(col) = column_index_of(left, table) else {
             continue;
         };
+        // jsonb `@>` is value containment, not array-element containment: the
+        // GIN array tokenizer doesn't apply, so leave it to the exact recheck on
+        // a sequential scan (still correct, just unindexed).
+        if table.columns[col].data_type == DataType::Jsonb {
+            continue;
+        }
         let Some((i, _)) = table.gin_index_on(col) else {
             continue;
         };
@@ -3112,6 +3272,25 @@ fn is_pg_catalog_table(name: &str) -> bool {
             | "pg_publication_rel"
             | "pg_foreign_table"
             | "pg_partitioned_table"
+            | "pg_cast"
+            | "pg_language"
+            | "pg_init_privs"
+            | "pg_largeobject_metadata"
+            | "pg_event_trigger"
+            | "pg_default_acl"
+            | "pg_opclass"
+            | "pg_opfamily"
+            | "pg_conversion"
+            | "pg_ts_parser"
+            | "pg_ts_dict"
+            | "pg_ts_template"
+            | "pg_ts_config"
+            | "pg_aggregate"
+            | "pg_foreign_data_wrapper"
+            | "pg_foreign_server"
+            | "pg_user_mapping"
+            | "pg_transform"
+            | "pg_subscription"
     )
 }
 
@@ -3239,7 +3418,54 @@ const EXTRA_PG_TYPES: &[(i64, &str, &str)] = &[
     (4535, "datemultirange", "R"),
 ];
 
+/// Map a catalog relation name to the pg_class OID of that catalog table
+/// itself, used as the synthetic `tableoid` system column value. pg_dump
+/// selects `x.tableoid` from several catalogs; the exact value only needs to
+/// be a stable OID, so well-known catalog OIDs are returned where known.
+fn catalog_self_oid(name: &str) -> i64 {
+    match name.to_ascii_lowercase().as_str() {
+        "pg_class" => 1259,
+        "pg_namespace" => 2615,
+        "pg_type" => 1247,
+        "pg_attribute" => 1249,
+        "pg_proc" => 1255,
+        "pg_constraint" => 2606,
+        "pg_index" => 2610,
+        "pg_extension" => 3079,
+        "pg_database" => 1262,
+        "pg_attrdef" => 2604,
+        "pg_description" => 2609,
+        "pg_depend" => 2608,
+        "pg_trigger" => 2620,
+        "pg_sequence" => 2224,
+        // Any other catalog: a stable, distinct placeholder OID is fine.
+        _ => 826,
+    }
+}
+
+/// Public catalog entry point. Wraps [`virtual_pg_catalog_inner`] to append a
+/// synthetic `tableoid` system column (present on every real relation), which
+/// pg_dump selects from several catalogs.
 fn virtual_pg_catalog(
+    db: &Database,
+    name: &str,
+    qualifier: &str,
+) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
+    let (mut names, mut types, mut rows) = virtual_pg_catalog_inner(db, name, qualifier)?;
+    // Only add `tableoid` when not already present.
+    let toid_qual = format!("{qualifier}.tableoid");
+    if !names.iter().any(|n| n == "tableoid" || n == &toid_qual) {
+        let self_oid = catalog_self_oid(name);
+        names.push(toid_qual);
+        types.push(DataType::Int8);
+        for row in rows.iter_mut() {
+            row.push(Value::Int(self_oid));
+        }
+    }
+    Ok((names, types, rows))
+}
+
+fn virtual_pg_catalog_inner(
     db: &Database,
     name: &str,
     qualifier: &str,
@@ -3270,6 +3496,10 @@ fn virtual_pg_catalog(
                 ("relreplident", DataType::Text),
                 ("reloptions", DataType::Text),
                 ("relpartbound", DataType::Text),
+                ("relfrozenxid", DataType::Int8),
+                ("relminmxid", DataType::Int8),
+                ("relispopulated", DataType::Bool),
+                ("relacl", DataType::Text),
             ];
             // Build a single row for a relation given the variable fields; the
             // trailing defaults are shared by every relation kind.
@@ -3312,6 +3542,10 @@ fn virtual_pg_catalog(
                     Value::Text("d".to_string()), // relreplident (default)
                     Value::Null,        // reloptions
                     Value::Null,        // relpartbound
+                    Value::Int(0),      // relfrozenxid
+                    Value::Int(0),      // relminmxid
+                    Value::Bool(true),  // relispopulated
+                    Value::Null,        // relacl (default privileges)
                 ]
             };
             let mut rows = Vec::new();
@@ -3460,7 +3694,12 @@ fn virtual_pg_catalog(
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
         "pg_namespace" => {
-            let cols = [("oid", DataType::Int8), ("nspname", DataType::Text)];
+            let cols = [
+                ("oid", DataType::Int8),
+                ("nspname", DataType::Text),
+                ("nspowner", DataType::Int8),
+                ("nspacl", DataType::Text),
+            ];
             let rows = db
                 .schemas()
                 .into_iter()
@@ -3472,7 +3711,8 @@ fn virtual_pg_catalog(
                         "information_schema" => 99,
                         _ => 16000 + i as i64,
                     };
-                    vec![Value::Int(oid), Value::Text(schema)]
+                    // Owner is the bootstrap superuser (OID 10); ACL NULL = default.
+                    vec![Value::Int(oid), Value::Text(schema), Value::Int(10), Value::Null]
                 })
                 .collect();
             Ok(qualify_virtual(qualifier, &cols, rows))
@@ -3578,6 +3818,10 @@ fn virtual_pg_catalog(
                 ("typcollation", DataType::Int8),
                 ("typelem", DataType::Int8),
                 ("typrelid", DataType::Int8),
+                ("typowner", DataType::Int8),
+                ("typacl", DataType::Text),
+                ("typisdefined", DataType::Bool),
+                ("typarray", DataType::Int8),
             ];
             let mut rows: Vec<Vec<Value>> = DataType::ALL
                 .iter()
@@ -3594,6 +3838,10 @@ fn virtual_pg_catalog(
                         Value::Int(collation),
                         Value::Int(0),
                         Value::Int(0),
+                        Value::Int(10),  // typowner
+                        Value::Null,     // typacl
+                        Value::Bool(true), // typisdefined
+                        Value::Int(0),   // typarray
                     ]
                 })
                 .collect();
@@ -3612,6 +3860,10 @@ fn virtual_pg_catalog(
                     Value::Int(0),
                     Value::Int(0),
                     Value::Int(0),
+                    Value::Int(10),  // typowner
+                    Value::Null,     // typacl
+                    Value::Bool(true), // typisdefined
+                    Value::Int(0),   // typarray
                 ]);
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
@@ -3630,6 +3882,10 @@ fn virtual_pg_catalog(
                 ("attgenerated", DataType::Text),
                 ("atthasdef", DataType::Bool),
                 ("attcollation", DataType::Int8),
+                ("attacl", DataType::Text),
+                ("attstattarget", DataType::Int4),
+                ("attoptions", DataType::Text),
+                ("attfdwoptions", DataType::Text),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
@@ -3665,6 +3921,10 @@ fn virtual_pg_catalog(
                             Value::Text(if column.generated.is_some() { "s" } else { "" }.into()),
                             Value::Bool(has_def),
                             Value::Int(collation),
+                            Value::Null,    // attacl (default privileges)
+                            Value::Int(-1), // attstattarget (default)
+                            Value::Null,    // attoptions
+                            Value::Null,    // attfdwoptions
                         ]);
                     }
                 }
@@ -4192,6 +4452,9 @@ fn virtual_pg_catalog(
                 ("prosecdef", DataType::Bool),
                 ("prorettype", DataType::Int8),
                 ("proargtypes", DataType::Text),
+                ("proisagg", DataType::Bool),
+                ("pronargs", DataType::Int2),
+                ("proacl", DataType::Text),
             ];
             let rows = vec![
                 pg_proc_row(2000, "count", "a", DataType::Int8, ""),
@@ -4241,6 +4504,11 @@ fn virtual_pg_catalog(
                 pg_proc_row(2311, "pg_try_advisory_lock", "f", DataType::Bool, "20"),
                 pg_proc_row(2312, "pg_advisory_unlock", "f", DataType::Bool, "20"),
                 pg_proc_row(2313, "pg_advisory_unlock_all", "f", DataType::Text, ""),
+                pg_proc_row(2314, "lo_create", "f", DataType::Int8, "26"),
+                pg_proc_row(2315, "lo_creat", "f", DataType::Int8, "23"),
+                pg_proc_row(2316, "lo_unlink", "f", DataType::Int4, "26"),
+                pg_proc_row(2317, "lo_put", "f", DataType::Text, "26 20 17"),
+                pg_proc_row(2318, "lo_get", "f", DataType::Bytea, "26"),
             ];
             let mut rows = rows;
             // User-defined functions and aggregates appear after the built-ins,
@@ -4283,6 +4551,7 @@ fn virtual_pg_catalog(
                 ("oprleft", DataType::Int8),
                 ("oprright", DataType::Int8),
                 ("oprresult", DataType::Int8),
+                ("oprcode", DataType::Int8),
             ];
             let rows = vec![
                 pg_operator_row(3000, "=", DataType::Int8, DataType::Int8, DataType::Bool),
@@ -4354,6 +4623,8 @@ fn virtual_pg_catalog(
                 ("extnamespace", DataType::Int8),
                 ("extrelocatable", DataType::Bool),
                 ("extversion", DataType::Text),
+                ("extconfig", DataType::Text),
+                ("extcondition", DataType::Text),
             ];
             let rows = db
                 .extensions()
@@ -4367,6 +4638,8 @@ fn virtual_pg_catalog(
                         Value::Int(11),
                         Value::Bool(false),
                         Value::Text(ext.version),
+                        Value::Null,
+                        Value::Null,
                     ]
                 })
                 .collect();
@@ -4529,6 +4802,228 @@ fn virtual_pg_catalog(
             ];
             Ok(qualify_virtual(qualifier, &cols, Vec::new()))
         }
+        // Empty system catalogs that pg_dump probes but which never have rows
+        // in this engine. Columns cover what pg_dump's queries select.
+        "pg_cast" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("castsource", DataType::Int8),
+                ("casttarget", DataType::Int8),
+                ("castfunc", DataType::Int8),
+                ("castcontext", DataType::Text),
+                ("castmethod", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_language" => {
+            // Procedural languages. pg_dump filters on `lanispl`, which is true
+            // only for PL languages (plpgsql et al.). Expose the standard set so
+            // functions written in them resolve, while internal/SQL/C are not PL.
+            let cols = [
+                ("oid", DataType::Int8),
+                ("lanname", DataType::Text),
+                ("lanispl", DataType::Bool),
+                ("lanpltrusted", DataType::Bool),
+                ("lanplcallfoid", DataType::Int8),
+                ("laninline", DataType::Int8),
+                ("lanvalidator", DataType::Int8),
+                ("lanowner", DataType::Int8),
+                ("lanacl", DataType::Text),
+            ];
+            let mk = |oid: i64, name: &str, ispl: bool| {
+                vec![
+                    Value::Int(oid),
+                    Value::Text(name.into()),
+                    Value::Bool(ispl),
+                    Value::Bool(ispl),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(10),
+                    Value::Null,
+                ]
+            };
+            let rows = vec![
+                mk(12, "internal", false),
+                mk(13, "c", false),
+                mk(14, "sql", false),
+                mk(13456, "plpgsql", true),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "pg_init_privs" => {
+            let cols = [
+                ("objoid", DataType::Int8),
+                ("classoid", DataType::Int8),
+                ("objsubid", DataType::Int4),
+                ("privtype", DataType::Text),
+                ("initprivs", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        // Always-empty catalogs pg_dump enumerates at startup. The selected
+        // columns are declared so column resolution succeeds against zero rows.
+        "pg_opclass" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("opcmethod", DataType::Int8),
+                ("opcname", DataType::Text),
+                ("opcnamespace", DataType::Int8),
+                ("opcowner", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_opfamily" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("opfmethod", DataType::Int8),
+                ("opfname", DataType::Text),
+                ("opfnamespace", DataType::Int8),
+                ("opfowner", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_conversion" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("conname", DataType::Text),
+                ("connamespace", DataType::Int8),
+                ("conowner", DataType::Int8),
+                ("conforencoding", DataType::Int4),
+                ("contoencoding", DataType::Int4),
+                ("conproc", DataType::Int8),
+                ("condefault", DataType::Bool),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_ts_parser" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("prsname", DataType::Text),
+                ("prsnamespace", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_ts_dict" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("dictname", DataType::Text),
+                ("dictnamespace", DataType::Int8),
+                ("dictowner", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_ts_template" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("tmplname", DataType::Text),
+                ("tmplnamespace", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_ts_config" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("cfgname", DataType::Text),
+                ("cfgnamespace", DataType::Int8),
+                ("cfgowner", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_aggregate" => {
+            let cols = [
+                ("aggfnoid", DataType::Int8),
+                ("aggtransfn", DataType::Int8),
+                ("aggfinalfn", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_foreign_data_wrapper" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("fdwname", DataType::Text),
+                ("fdwowner", DataType::Int8),
+                ("fdwhandler", DataType::Int8),
+                ("fdwvalidator", DataType::Int8),
+                ("fdwacl", DataType::Text),
+                ("fdwoptions", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_foreign_server" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("srvname", DataType::Text),
+                ("srvowner", DataType::Int8),
+                ("srvfdw", DataType::Int8),
+                ("srvtype", DataType::Text),
+                ("srvversion", DataType::Text),
+                ("srvacl", DataType::Text),
+                ("srvoptions", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_user_mapping" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("umuser", DataType::Int8),
+                ("umserver", DataType::Int8),
+                ("umoptions", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_transform" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("trftype", DataType::Int8),
+                ("trflang", DataType::Int8),
+                ("trffromsql", DataType::Int8),
+                ("trftosql", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_subscription" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("subname", DataType::Text),
+                ("subowner", DataType::Int8),
+                ("subconninfo", DataType::Text),
+                ("subslotname", DataType::Text),
+                ("subsynccommit", DataType::Text),
+                ("subpublications", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_largeobject_metadata" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("lomowner", DataType::Int8),
+                ("lomacl", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_event_trigger" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("evtname", DataType::Text),
+                ("evtevent", DataType::Text),
+                ("evtowner", DataType::Int8),
+                ("evtfoid", DataType::Int8),
+                ("evtenabled", DataType::Text),
+                ("evttags", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_default_acl" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("defaclrole", DataType::Int8),
+                ("defaclnamespace", DataType::Int8),
+                ("defaclobjtype", DataType::Text),
+                ("defaclacl", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
         other => Err(format!("pg_catalog.{other} is not supported")),
     }
 }
@@ -4569,6 +5064,13 @@ fn pg_proc_row_full(
         Value::Bool(secdef), // prosecdef
         Value::Int(ret.oid() as i64),
         Value::Text(argtypes.into()),
+        Value::Bool(kind == "a"), // proisagg
+        Value::Int(if argtypes.trim().is_empty() {
+            0
+        } else {
+            argtypes.split_whitespace().count() as i64
+        }), // pronargs
+        Value::Null, // proacl
     ]
 }
 
@@ -4590,6 +5092,7 @@ fn pg_operator_row(
         Value::Int(left.oid() as i64),
         Value::Int(right.oid() as i64),
         Value::Int(result.oid() as i64),
+        Value::Int(0), // oprcode (implementation function oid; 0 = none)
     ]
 }
 
@@ -4943,8 +5446,59 @@ fn constraint_column_indices(table: &Table, columns: &[String]) -> Result<Vec<us
 }
 
 fn exec_create_extension(db: &mut Database, c: CreateExtension) -> Result<ExecResult, String> {
-    db.create_extension(c.name, c.version, c.if_not_exists)?;
+    let name = c.name.clone();
+    let installed = db.create_extension(c.name, c.version, c.if_not_exists)?;
+    // For a recognized built-in extension, run its bundled install script so the
+    // objects it provides (functions, etc.) actually exist. `installed` is false
+    // when `IF NOT EXISTS` matched an existing extension — skip re-running then.
+    if installed && let Some(script) = builtin_extension_script(&name) {
+        run_extension_script(db, script)
+            .map_err(|e| format!("failed to install extension \"{name}\": {e}"))?;
+    }
     Ok(ExecResult::Command("CREATE EXTENSION".into()))
+}
+
+/// Run each statement of a built-in extension's bundled SQL install/uninstall
+/// script against `db`.
+fn run_extension_script(db: &mut Database, script: &str) -> Result<(), String> {
+    for stmt in crate::sql::Parser::parse_sql(script)? {
+        if matches!(stmt, Statement::Empty) {
+            continue;
+        }
+        execute_dispatch(db, stmt)?;
+    }
+    Ok(())
+}
+
+/// The bundled install SQL script for a recognized built-in extension, or
+/// `None` for an unknown extension (which is then merely catalogued by name).
+///
+/// These are minimal stand-ins for the real contrib extensions: they install
+/// working SQL objects so `CREATE EXTENSION <name>` has an observable effect.
+fn builtin_extension_script(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        // A tiny analogue of contrib's "fuzzystrmatch": a SQL function that
+        // returns the absolute difference between two integers.
+        "pgrs_demo" => Some(
+            "CREATE FUNCTION pgrs_demo_add(a integer, b integer) RETURNS integer \
+             AS $$ SELECT a + b $$ LANGUAGE sql; \
+             CREATE FUNCTION pgrs_demo_answer() RETURNS integer \
+             AS $$ SELECT 42 $$ LANGUAGE sql;",
+        ),
+        _ => None,
+    }
+}
+
+/// The bundled uninstall script (drops the objects installed by
+/// [`builtin_extension_script`]) for a recognized built-in extension.
+fn builtin_extension_uninstall_script(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "pgrs_demo" => Some(
+            "DROP FUNCTION IF EXISTS pgrs_demo_add(integer, integer); \
+             DROP FUNCTION IF EXISTS pgrs_demo_answer();",
+        ),
+        _ => None,
+    }
 }
 
 fn exec_create_role(db: &mut Database, c: CreateRole) -> Result<ExecResult, String> {
@@ -5390,7 +5944,12 @@ fn exec_drop_table(db: &mut Database, d: DropTable) -> Result<ExecResult, String
 }
 
 fn exec_drop_extension(db: &mut Database, d: DropExtension) -> Result<ExecResult, String> {
-    db.drop_extension(&d.name, d.if_exists)?;
+    let removed = db.drop_extension(&d.name, d.if_exists)?;
+    // When a recognized built-in extension is actually removed, run its
+    // uninstall script to drop the objects its install script created.
+    if removed && let Some(script) = builtin_extension_uninstall_script(&d.name) {
+        run_extension_script(db, script)?;
+    }
     Ok(ExecResult::Command("DROP EXTENSION".into()))
 }
 
@@ -5813,7 +6372,8 @@ fn exec_alter_sequence(db: &mut Database, alter: AlterSequence) -> Result<ExecRe
 fn validate_check_constraint(table: &Table, name: &str, expr: &Expr) -> Result<(), String> {
     let col_names = table.column_names();
     for row in &table.rows {
-        if !eval_expr(expr, &col_names, row)?.is_true() {
+        let row = table.detoast_row(row);
+        if !eval_expr(expr, &col_names, &row)?.is_true() {
             return Err(format!(
                 "check constraint \"{name}\" of relation \"{}\" is violated by some row",
                 table.name
@@ -5918,7 +6478,7 @@ fn validate_foreign_key_existing_rows(
     for row in &table.rows {
         check_foreign_key_value(
             db,
-            &row[column],
+            &table.detoast_value(&row[column]),
             ref_table,
             ref_column,
             table_name,
@@ -5946,7 +6506,7 @@ fn check_foreign_key_value(
     let found = referenced
         .rows
         .iter()
-        .any(|row| compare_values(&row[ref_idx], value) == Some(Ordering::Equal));
+        .any(|row| compare_values(&referenced.detoast_value(&row[ref_idx]), value) == Some(Ordering::Equal));
     if found {
         Ok(())
     } else {
@@ -5997,7 +6557,8 @@ fn check_parent_key_not_referenced(
                 continue;
             }
             let referenced = child.rows.iter().any(|child_row| {
-                compare_values(&child_row[constraint.column], parent_value) == Some(Ordering::Equal)
+                compare_values(&child.detoast_value(&child_row[constraint.column]), parent_value)
+                    == Some(Ordering::Equal)
             });
             if referenced {
                 return Err(format!(
@@ -6208,7 +6769,8 @@ fn exec_insert(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
                             "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
                         );
                     }
-                    let existing = &table.rows[conflict_pos];
+                    let existing = table.detoast_row(&table.rows[conflict_pos]);
+                    let existing = &existing;
                     let eval_names = on_conflict_eval_names(&columns);
                     let mut eval_row = existing.clone();
                     eval_row.extend(row.clone());
@@ -6565,6 +7127,10 @@ fn partition_hash(value: &Value) -> i64 {
         Value::Float(f) => {
             3u8.hash(&mut hasher);
             f.to_bits().hash(&mut hasher);
+        }
+        Value::Numeric(n) => {
+            5u8.hash(&mut hasher);
+            n.to_canonical_string().hash(&mut hasher);
         }
         Value::Text(s) => {
             4u8.hash(&mut hasher);
@@ -7160,7 +7726,11 @@ fn select_own_columns(
     ctes: &CteMap,
 ) -> Result<Vec<String>, String> {
     match &sel.from {
-        Some(fc) => Ok(build_source_with_ctes(db, fc, None, ctes)?.0),
+        // Resolve the FROM schema without materializing rows: a correlated
+        // subquery's FROM clause may reference an outer column that has not yet
+        // been substituted, which would make execution fail, but the column
+        // shape never depends on those values.
+        Some(fc) => Ok(from_schema_with_ctes(db, fc, ctes)?.0),
         None => Ok(Vec::new()),
     }
 }
@@ -7198,6 +7768,23 @@ fn select_correlated_inner(
         }
         Ok(())
     })?;
+    if found {
+        return Ok(true);
+    }
+    // Derived tables (subqueries in FROM) form nested scopes: a reference to an
+    // `outer_cols` column inside one is a correlation against us. Their own
+    // FROM columns shadow, exactly like a scalar/EXISTS subquery's would.
+    if let Some(fc) = &sel.from {
+        for tref in std::iter::once(&fc.base).chain(fc.joins.iter().map(|j| &j.table)) {
+            if let Some(sub) = &tref.subquery {
+                let mut inner = visible.to_vec();
+                inner.extend(select_own_columns(db, sub, ctes)?);
+                if select_correlated_inner(db, sub, &inner, outer_cols, ctes)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     Ok(found)
 }
 
@@ -7345,7 +7932,20 @@ fn specialize_select_inner(
 ) -> Result<(), String> {
     visit_select_exprs_mut(sel, &mut |e| {
         specialize_expr(db, e, shadow, outer_cols, outer_row, ctes)
-    })
+    })?;
+    // Substitute outer references inside derived-table subqueries too, adding
+    // each derived table's own columns to the shadow set so a same-named inner
+    // column is not clobbered.
+    if let Some(fc) = &mut sel.from {
+        for tref in std::iter::once(&mut fc.base).chain(fc.joins.iter_mut().map(|j| &mut j.table)) {
+            if let Some(sub) = &mut tref.subquery {
+                let mut inner = shadow.to_vec();
+                inner.extend(select_own_columns(db, sub, ctes)?);
+                specialize_select_inner(db, sub, &inner, outer_cols, outer_row, ctes)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn specialize_expr(
@@ -7396,6 +7996,10 @@ fn value_to_literal(v: Value) -> Expr {
         Value::Null => Expr::Null,
         Value::Int(i) => Expr::Int(i),
         Value::Float(f) => Expr::Float(f),
+        Value::Numeric(n) => Expr::Cast {
+            expr: Box::new(Expr::Str(n.to_canonical_string())),
+            target: DataType::Numeric,
+        },
         Value::Text(s) => Expr::Str(s),
         Value::Bool(b) => Expr::Bool(b),
     }
@@ -7736,6 +8340,9 @@ fn exec_select_with_ctes(
     }
     if sel.from.is_none() && is_replication_slot_projection(&sel.projection) {
         return select_replication_slot_functions(db, &sel);
+    }
+    if sel.from.is_none() && is_large_object_projection(&sel.projection) {
+        return select_large_object_functions(db, &sel);
     }
 
     // Resolve the source: the (possibly joined) FROM rows with qualified
@@ -8246,6 +8853,123 @@ fn select_advisory_lock_functions(db: &mut Database, sel: &Select) -> Result<Exe
     })
 }
 
+fn is_large_object_projection(items: &[SelectItem]) -> bool {
+    items.len() == 1
+        && matches!(
+            &items[0],
+            SelectItem::Expr {
+                expr: Expr::Function { name, star: false, .. },
+                ..
+            } if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "lo_create" | "lo_creat" | "lo_unlink" | "lo_put" | "lo_get"
+            )
+        )
+}
+
+/// Decode a `bytea` text representation into raw bytes. Accepts PostgreSQL hex
+/// format (`\x48656c6c6f`); any other text is taken as its raw UTF-8 bytes.
+fn bytea_to_bytes(text: &str) -> Result<Vec<u8>, String> {
+    if let Some(hex) = text.strip_prefix("\\x").or_else(|| text.strip_prefix("\\X")) {
+        let hex: String = hex.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        if !hex.len().is_multiple_of(2) {
+            return Err("invalid hexadecimal data: odd number of digits".into());
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let bytes = hex.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let hi = (bytes[i] as char)
+                .to_digit(16)
+                .ok_or("invalid hexadecimal digit")?;
+            let lo = (bytes[i + 1] as char)
+                .to_digit(16)
+                .ok_or("invalid hexadecimal digit")?;
+            out.push((hi * 16 + lo) as u8);
+            i += 2;
+        }
+        Ok(out)
+    } else {
+        Ok(text.as_bytes().to_vec())
+    }
+}
+
+/// Encode raw bytes into the PostgreSQL hex `bytea` text representation.
+fn bytes_to_bytea(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Handle `SELECT lo_create(...)` and friends. These mutate the database's
+/// `pg_largeobject` store and return a single row, as the server-side functions
+/// do (OID for create/creat, the bytea for get, NULL for put/unlink).
+fn select_large_object_functions(db: &mut Database, sel: &Select) -> Result<ExecResult, String> {
+    let SelectItem::Expr { expr, alias } = &sel.projection[0] else {
+        unreachable!()
+    };
+    let Expr::Function { name, args, .. } = expr else {
+        unreachable!()
+    };
+    let lname = name.to_ascii_lowercase();
+    let int_arg = |i: usize| -> Result<i64, String> {
+        match eval_expr(&args[i], &[], &[])? {
+            Value::Int(v) => Ok(v),
+            Value::Null => Err(format!("{lname}() argument must not be null")),
+            other => Err(format!(
+                "{lname}() argument must be integer, got {}",
+                other.inferred_type().sql_name()
+            )),
+        }
+    };
+    let (value, data_type) = match lname.as_str() {
+        "lo_create" => {
+            let oid = int_arg(0)? as u32;
+            (Value::Int(db.lo_create(oid)? as i64), DataType::Int8)
+        }
+        "lo_creat" => {
+            let mode = args.first().map(|_| int_arg(0)).transpose()?.unwrap_or(0);
+            (Value::Int(db.lo_creat(mode) as i64), DataType::Int8)
+        }
+        "lo_unlink" => {
+            let oid = int_arg(0)? as u32;
+            db.lo_unlink(oid)?;
+            (Value::Int(1), DataType::Int8)
+        }
+        "lo_put" => {
+            if args.len() != 3 {
+                return Err("lo_put(oid, offset, data) expects three arguments".into());
+            }
+            let oid = int_arg(0)? as u32;
+            let offset = int_arg(1)?;
+            if offset < 0 {
+                return Err("lo_put() offset must be non-negative".into());
+            }
+            let data = eval_expr(&args[2], &[], &[])?
+                .to_text()
+                .ok_or("lo_put() data must not be null")?;
+            db.lo_put(oid, offset as usize, &bytea_to_bytes(&data)?)?;
+            (Value::Null, DataType::Text)
+        }
+        "lo_get" => {
+            let oid = int_arg(0)? as u32;
+            (Value::Text(bytes_to_bytea(db.lo_get(oid)?)), DataType::Bytea)
+        }
+        _ => unreachable!(),
+    };
+    Ok(ExecResult::Rows {
+        fields: vec![FieldDescription {
+            name: alias.clone().unwrap_or(lname),
+            data_type,
+        }],
+        rows: vec![vec![value]],
+        tag: "SELECT 1".into(),
+    })
+}
+
 fn is_replication_slot_projection(items: &[SelectItem]) -> bool {
     items.len() == 1
         && matches!(
@@ -8456,6 +9180,7 @@ fn eval_int_arg(expr: &Expr) -> Result<i64, String> {
     match eval_expr(expr, &[], &[])? {
         Value::Int(i) => Ok(i),
         Value::Float(f) => Ok(f.round() as i64),
+        Value::Numeric(n) => Ok(n.to_f64().round() as i64),
         Value::Text(s) => s
             .trim()
             .parse::<i64>()
@@ -8947,7 +9672,8 @@ fn exec_update(db: &mut Database, mut upd: Update) -> Result<ExecResult, String>
     let mut new_versions: Vec<(usize, Vec<Value>)> = Vec::new();
     let mut affected = Vec::new();
     for pos in candidates {
-        let row = &table.rows[pos];
+        let row = table.detoast_row(&table.rows[pos]);
+        let row = &row;
         let source_row = first_dml_source_row(row, from_source.as_ref(), &upd.filter, &col_names)?;
         let Some(source_row) = source_row else {
             continue;
@@ -9103,7 +9829,7 @@ fn exec_delete(db: &mut Database, mut del: Delete) -> Result<ExecResult, String>
     let mut matching = std::collections::BTreeSet::new();
     for pos in candidates {
         if first_dml_source_row(
-            &table.rows[pos],
+            &table.detoast_row(&table.rows[pos]),
             using_source.as_ref(),
             &del.filter,
             &col_names,
@@ -9114,7 +9840,10 @@ fn exec_delete(db: &mut Database, mut del: Delete) -> Result<ExecResult, String>
         }
     }
     let positions: Vec<usize> = matching.into_iter().collect();
-    let affected: Vec<Vec<Value>> = positions.iter().map(|&p| table.rows[p].clone()).collect();
+    let affected: Vec<Vec<Value>> = positions
+        .iter()
+        .map(|&p| table.detoast_row(&table.rows[p]))
+        .collect();
     for row in &affected {
         check_parent_key_not_referenced(db, &del.table, row)?;
     }
@@ -9147,6 +9876,8 @@ fn build_merge_source(
                 subquery: None,
                 lateral: false,
                 only: false,
+                column_aliases: Vec::new(),
+                with_ordinality: false,
             };
             let (names, _, rows) = resolve_source_table(db, &tref, &CteMap::new())?;
             Ok((names, rows))
@@ -9298,7 +10029,7 @@ fn exec_merge(db: &mut Database, mut merge: Merge) -> Result<ExecResult, String>
             if touched.contains(&pos) {
                 continue;
             }
-            let mut eval_row = table.rows[pos].clone();
+            let mut eval_row = table.detoast_row(&table.rows[pos]);
             eval_row.extend(source_row.iter().cloned());
             if eval_expr(&merge.on, &cond_names, &eval_row)?.is_true() {
                 matches.push(pos);
@@ -9372,11 +10103,10 @@ fn exec_merge(db: &mut Database, mut merge: Merge) -> Result<ExecResult, String>
             // MATCHED: pick the first applicable WHEN MATCHED clause, then apply
             // it to every matched target row.
             for &pos in &matches {
-                let existing = db
-                    .table(&merge.target)
-                    .expect("target existed above")
-                    .rows[pos]
-                    .clone();
+                let existing = {
+                    let t = db.table(&merge.target).expect("target existed above");
+                    t.detoast_row(&t.rows[pos])
+                };
                 let mut action_row = existing.clone();
                 action_row.extend(existing.iter().cloned());
                 action_row.extend(source_row.iter().cloned());
@@ -9845,6 +10575,14 @@ fn array_operator(op: BinaryOp, left: Value, right: Value) -> Result<Value, Stri
     };
     // Range operators: `range @> element/range`, `range <@ range`, `range && range`.
     if let Some(result) = range_operator(op, &left_text, &right_text) {
+        return Ok(Value::Bool(result));
+    }
+    // jsonb containment: `jsonb @> jsonb` / `jsonb <@ jsonb`. Recognized when both
+    // operands parse as JSON objects/arrays (so plain SQL arrays still use the
+    // array path below).
+    if matches!(op, BinaryOp::ArrayContains | BinaryOp::ArrayContainedBy)
+        && let Some(result) = jsonb_contains_operator(op, &left_text, &right_text)
+    {
         return Ok(Value::Bool(result));
     }
     let left_values = parse_array_text(&left_text)
@@ -10499,6 +11237,248 @@ fn json_unescape(input: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// A parsed JSON value, used to normalize text into canonical `jsonb` form.
+#[derive(Debug, Clone)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<JsonValue>),
+    /// Object members in insertion order; duplicates are resolved at build time.
+    Object(Vec<(String, JsonValue)>),
+}
+
+/// Normalize a JSON text into PostgreSQL `jsonb` canonical form: parse the JSON,
+/// drop duplicate object keys keeping the last occurrence, order object keys
+/// (PostgreSQL orders by key length then bytewise; we match that), and emit with
+/// canonical whitespace (`", "` between elements, `": "` after keys). Returns an
+/// error for invalid JSON (matching jsonb's strict input).
+fn normalize_jsonb(text: &str) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let (value, end) = parse_json_value(bytes, skip_json_ws(bytes, 0))?;
+    let end = skip_json_ws(bytes, end);
+    if end != bytes.len() {
+        return Err(format!("invalid input syntax for type json: \"{text}\""));
+    }
+    let mut out = String::new();
+    write_jsonb(&value, &mut out);
+    Ok(out)
+}
+
+fn parse_json_value(bytes: &[u8], pos: usize) -> Result<(JsonValue, usize), String> {
+    let err = || "invalid input syntax for type json".to_string();
+    match bytes.get(pos) {
+        Some(b'{') => parse_json_object(bytes, pos),
+        Some(b'[') => parse_json_array(bytes, pos),
+        Some(b'"') => {
+            let end = json_string_end(bytes, pos)?;
+            let s = json_unescape(std::str::from_utf8(&bytes[pos + 1..end]).map_err(|_| err())?)?;
+            Ok((JsonValue::String(s), end + 1))
+        }
+        Some(_) => {
+            let end = json_value_end(bytes, pos)?;
+            let tok = std::str::from_utf8(&bytes[pos..end])
+                .map_err(|_| err())?
+                .trim();
+            let value = match tok {
+                "null" => JsonValue::Null,
+                "true" => JsonValue::Bool(true),
+                "false" => JsonValue::Bool(false),
+                _ => {
+                    if tok.parse::<f64>().is_ok() {
+                        JsonValue::Number(tok.to_string())
+                    } else {
+                        return Err(err());
+                    }
+                }
+            };
+            Ok((value, end))
+        }
+        None => Err(err()),
+    }
+}
+
+fn parse_json_object(bytes: &[u8], start: usize) -> Result<(JsonValue, usize), String> {
+    let err = || "invalid input syntax for type json".to_string();
+    let mut members: Vec<(String, JsonValue)> = Vec::new();
+    let mut pos = skip_json_ws(bytes, start + 1);
+    if bytes.get(pos) == Some(&b'}') {
+        return Ok((JsonValue::Object(members), pos + 1));
+    }
+    loop {
+        pos = skip_json_ws(bytes, pos);
+        if bytes.get(pos) != Some(&b'"') {
+            return Err(err());
+        }
+        let key_end = json_string_end(bytes, pos)?;
+        let key = json_unescape(std::str::from_utf8(&bytes[pos + 1..key_end]).map_err(|_| err())?)?;
+        pos = skip_json_ws(bytes, key_end + 1);
+        if bytes.get(pos) != Some(&b':') {
+            return Err(err());
+        }
+        pos = skip_json_ws(bytes, pos + 1);
+        let (value, next) = parse_json_value(bytes, pos)?;
+        // Duplicate keys: last value wins (drop any earlier member).
+        members.retain(|(k, _)| k != &key);
+        members.push((key, value));
+        pos = skip_json_ws(bytes, next);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b'}') => return Ok((JsonValue::Object(members), pos + 1)),
+            _ => return Err(err()),
+        }
+    }
+}
+
+fn parse_json_array(bytes: &[u8], start: usize) -> Result<(JsonValue, usize), String> {
+    let err = || "invalid input syntax for type json".to_string();
+    let mut elems = Vec::new();
+    let mut pos = skip_json_ws(bytes, start + 1);
+    if bytes.get(pos) == Some(&b']') {
+        return Ok((JsonValue::Array(elems), pos + 1));
+    }
+    loop {
+        pos = skip_json_ws(bytes, pos);
+        let (value, next) = parse_json_value(bytes, pos)?;
+        elems.push(value);
+        pos = skip_json_ws(bytes, next);
+        match bytes.get(pos) {
+            Some(b',') => pos += 1,
+            Some(b']') => return Ok((JsonValue::Array(elems), pos + 1)),
+            _ => return Err(err()),
+        }
+    }
+}
+
+fn write_jsonb(value: &JsonValue, out: &mut String) {
+    match value {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        JsonValue::Number(n) => out.push_str(n),
+        JsonValue::String(s) => write_json_string(s, out),
+        JsonValue::Array(elems) => {
+            out.push('[');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_jsonb(e, out);
+            }
+            out.push(']');
+        }
+        JsonValue::Object(members) => {
+            // PostgreSQL orders jsonb object keys by length, then bytewise.
+            let mut ordered: Vec<&(String, JsonValue)> = members.iter().collect();
+            ordered.sort_by(|a, b| {
+                a.0.len()
+                    .cmp(&b.0.len())
+                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            });
+            out.push('{');
+            for (i, (k, v)) in ordered.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json_string(k, out);
+                out.push_str(": ");
+                write_jsonb(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Parse a complete JSON text into a `JsonValue`, or `None` if it isn't valid
+/// JSON (used to gate the jsonb `@>` path so non-JSON arrays fall through).
+fn parse_json_full(text: &str) -> Option<JsonValue> {
+    let bytes = text.as_bytes();
+    let (value, end) = parse_json_value(bytes, skip_json_ws(bytes, 0)).ok()?;
+    if skip_json_ws(bytes, end) == bytes.len() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Evaluate `left @> right` / `left <@ right` for two JSON texts. Returns `None`
+/// unless both are containers (object/array) — scalars are left to the array
+/// path so SQL array literals keep their semantics.
+fn jsonb_contains_operator(op: BinaryOp, left: &str, right: &str) -> Option<bool> {
+    let lv = parse_json_full(left)?;
+    let rv = parse_json_full(right)?;
+    let containers = |v: &JsonValue| matches!(v, JsonValue::Object(_) | JsonValue::Array(_));
+    if !containers(&lv) || !containers(&rv) {
+        return None;
+    }
+    match op {
+        BinaryOp::ArrayContains => Some(json_contains(&lv, &rv)),
+        BinaryOp::ArrayContainedBy => Some(json_contains(&rv, &lv)),
+        _ => None,
+    }
+}
+
+/// PostgreSQL `jsonb` containment: does `outer` contain `inner`? Objects contain
+/// when every key/value of `inner` is present (recursively). Arrays contain when
+/// every element of `inner` is contained by some element of `outer`. Scalars
+/// contain when equal.
+fn json_contains(outer: &JsonValue, inner: &JsonValue) -> bool {
+    match (outer, inner) {
+        (JsonValue::Object(o), JsonValue::Object(i)) => i.iter().all(|(k, iv)| {
+            o.iter()
+                .find(|(ok, _)| ok == k)
+                .is_some_and(|(_, ov)| json_contains(ov, iv))
+        }),
+        (JsonValue::Array(o), JsonValue::Array(i)) => i
+            .iter()
+            .all(|ie| o.iter().any(|oe| json_contains(oe, ie))),
+        // A top-level array contains a scalar if that scalar is an element.
+        (JsonValue::Array(o), scalar) => o.iter().any(|oe| json_equal(oe, scalar)),
+        (a, b) => json_equal(a, b),
+    }
+}
+
+fn json_equal(a: &JsonValue, b: &JsonValue) -> bool {
+    match (a, b) {
+        (JsonValue::Null, JsonValue::Null) => true,
+        (JsonValue::Bool(x), JsonValue::Bool(y)) => x == y,
+        (JsonValue::Number(x), JsonValue::Number(y)) => {
+            x == y || x.parse::<f64>().ok() == y.parse::<f64>().ok()
+        }
+        (JsonValue::String(x), JsonValue::String(y)) => x == y,
+        (JsonValue::Array(x), JsonValue::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_equal(a, b))
+        }
+        (JsonValue::Object(x), JsonValue::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, xv)| {
+                    y.iter()
+                        .find(|(yk, _)| yk == k)
+                        .is_some_and(|(_, yv)| json_equal(xv, yv))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn write_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
     use BinaryOp::*;
     if matches!(op, Add | Sub) {
@@ -10543,6 +11523,24 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
             _ => unreachable!(),
         };
     }
+    // Exact decimal arithmetic when a numeric is involved and no float is.
+    // numeric op {numeric,int} -> numeric; numeric op float -> float (below).
+    let has_numeric = matches!(l, Value::Numeric(_)) || matches!(r, Value::Numeric(_));
+    let has_float = matches!(l, Value::Float(_)) || matches!(r, Value::Float(_));
+    if has_numeric && !has_float {
+        if let (Some(a), Some(b)) = (to_bigdecimal(&l), to_bigdecimal(&r)) {
+            let v = match op {
+                Add => a.add(&b),
+                Sub => a.sub(&b),
+                Mul => a.mul(&b),
+                Div => a.div(&b).ok_or("division by zero")?,
+                Mod => a.rem(&b).ok_or("division by zero")?,
+                _ => unreachable!(),
+            };
+            return Ok(Value::Numeric(v));
+        }
+    }
+
     let a = to_f64(&l)?;
     let b = to_f64(&r)?;
     let v = match op {
@@ -10559,6 +11557,17 @@ fn arithmetic(op: BinaryOp, l: Value, r: Value) -> Result<Value, String> {
         _ => unreachable!(),
     };
     Ok(Value::Float(v))
+}
+
+/// Convert a numeric-ish value into an exact [`BigDecimal`], or `None` for
+/// non-numeric kinds (which fall back to float arithmetic).
+fn to_bigdecimal(v: &Value) -> Option<BigDecimal> {
+    match v {
+        Value::Numeric(n) => Some(n.clone()),
+        Value::Int(i) => Some(BigDecimal::from_i64(*i)),
+        Value::Text(s) => BigDecimal::parse(s.trim()),
+        _ => None,
+    }
 }
 
 fn date_arithmetic(op: BinaryOp, left: &Value, right: &Value) -> Option<Value> {
@@ -10744,6 +11753,7 @@ fn to_f64(v: &Value) -> Result<f64, String> {
     match v {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
+        Value::Numeric(n) => Ok(n.to_f64()),
         Value::Text(s) => s.parse::<f64>().map_err(|_| format!("invalid number: {s}")),
         Value::Bool(_) | Value::Null => Err("operand is not numeric".into()),
     }
@@ -10759,28 +11769,24 @@ fn compare_values(l: &Value, r: &Value) -> Option<Ordering> {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
-        // Mixed numeric.
-        (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) => {
-            let a = match l {
-                Value::Int(i) => *i as f64,
-                Value::Float(f) => *f,
-                _ => unreachable!(),
-            };
-            let b = match r {
-                Value::Int(i) => *i as f64,
-                Value::Float(f) => *f,
-                _ => unreachable!(),
-            };
+        // Exact decimal comparison when both sides are numeric.
+        (Value::Numeric(a), Value::Numeric(b)) => Some(a.cmp(b)),
+        // Numeric vs integer: compare exactly (integer is an exact decimal).
+        (Value::Numeric(a), Value::Int(b)) => Some(a.cmp(&BigDecimal::from_i64(*b))),
+        (Value::Int(a), Value::Numeric(b)) => Some(BigDecimal::from_i64(*a).cmp(b)),
+        // Mixed numeric (anything involving a float compares in f64).
+        (
+            Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+            Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+        ) => {
+            let a = num_to_f64(l);
+            let b = num_to_f64(r);
             a.partial_cmp(&b)
         }
         // Number vs text: compare numerically when the text parses as a number
         // (e.g. `oid = '16384'`), otherwise compare as text.
-        (Value::Int(_) | Value::Float(_), Value::Text(s)) => {
-            let a = match l {
-                Value::Int(i) => *i as f64,
-                Value::Float(f) => *f,
-                _ => unreachable!(),
-            };
+        (Value::Int(_) | Value::Float(_) | Value::Numeric(_), Value::Text(s)) => {
+            let a = num_to_f64(l);
             match s.parse::<f64>() {
                 Ok(b) => a.partial_cmp(&b),
                 Err(_) => l
@@ -10788,12 +11794,8 @@ fn compare_values(l: &Value, r: &Value) -> Option<Ordering> {
                     .and_then(|ls| ls.as_str().partial_cmp(s.as_str())),
             }
         }
-        (Value::Text(s), Value::Int(_) | Value::Float(_)) => {
-            let b = match r {
-                Value::Int(i) => *i as f64,
-                Value::Float(f) => *f,
-                _ => unreachable!(),
-            };
+        (Value::Text(s), Value::Int(_) | Value::Float(_) | Value::Numeric(_)) => {
+            let b = num_to_f64(r);
             match s.parse::<f64>() {
                 Ok(a) => a.partial_cmp(&b),
                 Err(_) => r
@@ -10802,6 +11804,16 @@ fn compare_values(l: &Value, r: &Value) -> Option<Ordering> {
             }
         }
         _ => None,
+    }
+}
+
+/// Coerce a numeric-ish value to `f64` for cross-kind comparison.
+fn num_to_f64(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Numeric(n) => n.to_f64(),
+        _ => f64::NAN,
     }
 }
 
@@ -11219,6 +12231,23 @@ fn eval_scalar_function(
             values.append(&mut right_values);
             Ok(Value::Text(array_text_from_elements(&values)))
         }
+        "array_remove" => {
+            // array_remove(array, elem) -> array with every element equal to
+            // `elem` removed. NULL array yields NULL (pg_dump uses this on the
+            // always-NULL reloptions column).
+            let array = arg(&vals, 0)?;
+            let elem = arg(&vals, 1)?;
+            if array.is_null() {
+                return Ok(Value::Null);
+            }
+            let text = array.to_text().unwrap_or_default();
+            let values = parse_array_text(&text)
+                .ok_or_else(|| "array_remove() requires an array".to_string())?;
+            let target = elem.to_text();
+            let kept: Vec<Option<String>> =
+                values.into_iter().filter(|v| *v != target).collect();
+            Ok(Value::Text(array_text_from_elements(&kept)))
+        }
         "__subscript" => {
             // Array element access `arr[idx]` (1-based). Out-of-range or NULL
             // yields NULL, matching PostgreSQL.
@@ -11234,8 +12263,12 @@ fn eval_scalar_function(
                 )?,
             };
             let text = array.to_text().unwrap_or_default();
-            let values = parse_array_text(&text)
-                .ok_or_else(|| "array subscript requires an array".to_string())?;
+            // A non-array scalar (e.g. pg_dump's `typname[0]` on a `name`
+            // value) is not subscriptable as an array; PostgreSQL yields NULL
+            // for any index rather than erroring, so mirror that.
+            let Some(values) = parse_array_text(&text) else {
+                return Ok(Value::Null);
+            };
             if i < 1 || i as usize > values.len() {
                 return Ok(Value::Null);
             }
@@ -11839,6 +12872,8 @@ fn eval_scalar_function(
         | "__cast_regdictionary" => Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null)),
         // Catalog helpers used by psql meta-commands.
         "pg_get_userbyid" => Ok(Value::Text("postgres".to_string())),
+        // We are always a primary, never in recovery (pg_dump checks this).
+        "pg_is_in_recovery" => Ok(Value::Bool(false)),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(Value::Bool(true))
         }
@@ -11864,6 +12899,12 @@ fn eval_scalar_function(
         // `pg_get_expr(adbin, ...)` echoes its first argument, which by
         // construction already holds the rendered SQL (pg_attrdef.adbin).
         "pg_get_expr" => Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null)),
+        // `acldefault(objtype, ownerId)` returns the hard-wired default access
+        // privileges for an object as an `aclitem[]`. This engine does not model
+        // per-object grants, so the effective default ACL is empty; pg_dump uses
+        // it only to diff against (always-NULL) stored ACLs, where an empty
+        // array yields "no explicit privileges" — exactly our intent.
+        "acldefault" => Ok(Value::Text("{}".to_string())),
         // `pg_get_indexdef(oid, ...)` / `pg_get_constraintdef(oid, ...)` resolve
         // the catalog OID to the definition rendered for the current statement.
         "pg_get_indexdef" | "pg_get_constraintdef" => {
@@ -11904,10 +12945,13 @@ fn eval_scalar_function(
         "count" | "sum" | "avg" | "min" | "max" => {
             Err(format!("aggregate function {lname}() is not allowed here"))
         }
-        // Fall through to user-defined scalar SQL functions.
+        // Fall through to user-defined scalar SQL / PL/pgSQL functions.
         other => match try_eval_scalar_udf(other, &vals) {
             Some(result) => result,
-            None => Err(format!("function {other}() does not exist")),
+            None => match try_eval_plpgsql_udf(other, &vals) {
+                Some(result) => result,
+                None => Err(format!("function {other}() does not exist")),
+            },
         },
     }
 }
@@ -12540,6 +13584,17 @@ fn eval_aggregate(
             if vals.is_empty() {
                 return Ok(Value::Null);
             }
+            // If any input is numeric (and none is float), accumulate exactly.
+            let has_numeric = vals.iter().any(|v| matches!(v, Value::Numeric(_)));
+            let has_float = vals.iter().any(|v| matches!(v, Value::Float(_)));
+            if has_numeric && !has_float {
+                let mut acc = BigDecimal::zero();
+                for v in &vals {
+                    let d = to_bigdecimal(v).ok_or("sum() requires numeric input")?;
+                    acc = acc.add(&d);
+                }
+                return Ok(Value::Numeric(acc));
+            }
             let mut int_sum: i64 = 0;
             let mut float_sum: f64 = 0.0;
             let mut is_float = false;
@@ -12565,6 +13620,20 @@ fn eval_aggregate(
         "avg" => {
             if vals.is_empty() {
                 return Ok(Value::Null);
+            }
+            // Exact numeric average when inputs are numeric and not floats.
+            let has_numeric = vals.iter().any(|v| matches!(v, Value::Numeric(_)));
+            let has_float = vals.iter().any(|v| matches!(v, Value::Float(_)));
+            if has_numeric && !has_float {
+                let mut acc = BigDecimal::zero();
+                for v in &vals {
+                    let d = to_bigdecimal(v).ok_or("avg() requires numeric input")?;
+                    acc = acc.add(&d);
+                }
+                let n = BigDecimal::from_i64(vals.len() as i64);
+                // PostgreSQL gives avg a fractional scale; divide exactly with
+                // rounding to the default division scale.
+                return Ok(Value::Numeric(acc.div(&n).ok_or("division by zero")?));
             }
             let mut sum = 0.0;
             for v in &vals {
@@ -12690,6 +13759,12 @@ fn eval_count(expr: &Option<Expr>, col_names: &[String]) -> Result<Option<usize>
 
 /// Coerce a value to a target column type, applying lenient conversions that
 /// match what PostgreSQL accepts for literals.
+/// Coerce a value to `target`, exposed so the PL/pgSQL interpreter can apply
+/// declared-type coercion to variables and loop bounds.
+pub(crate) fn coerce_value(v: Value, target: DataType) -> Result<Value, String> {
+    coerce(v, target)
+}
+
 fn coerce(v: Value, target: DataType) -> Result<Value, String> {
     if v.is_null() {
         return Ok(Value::Null);
@@ -12708,9 +13783,28 @@ fn coerce(v: Value, target: DataType) -> Result<Value, String> {
             Value::Bool(b) => Ok(Value::Int(b as i64)),
             _ => Err(err("value")),
         },
-        DataType::Float4 | DataType::Float8 | DataType::Numeric | DataType::Money => match v {
+        // Exact arbitrary-precision decimal. Parse from the literal text/int so
+        // the value is exact (converting an existing f64 would be lossy).
+        DataType::Numeric => match v {
+            Value::Numeric(n) => Ok(Value::Numeric(n)),
+            Value::Int(i) => Ok(Value::Numeric(BigDecimal::from_i64(i))),
+            // Float -> numeric: round-trip through the float's shortest text so
+            // e.g. `0.1::float8::numeric` reads as `0.1`.
+            Value::Float(f) => {
+                let text = Value::Float(f).to_text().unwrap_or_default();
+                BigDecimal::parse(&text).map(Value::Numeric).ok_or_else(|| {
+                    format!("invalid input syntax for type numeric: \"{text}\"")
+                })
+            }
+            Value::Text(s) => BigDecimal::parse(s.trim())
+                .map(Value::Numeric)
+                .ok_or_else(|| format!("invalid input syntax for type numeric: \"{s}\"")),
+            _ => Err(err("value")),
+        },
+        DataType::Float4 | DataType::Float8 | DataType::Money => match v {
             Value::Float(f) => Ok(Value::Float(f)),
             Value::Int(i) => Ok(Value::Float(i as f64)),
+            Value::Numeric(n) => Ok(Value::Float(n.to_f64())),
             Value::Text(s) => s.trim().parse::<f64>().map(Value::Float).map_err(|_| {
                 format!(
                     "invalid input syntax for type {}: \"{s}\"",
@@ -12734,6 +13828,12 @@ fn coerce(v: Value, target: DataType) -> Result<Value, String> {
             let text = v.to_text().unwrap_or_default();
             Ok(Value::Text(normalize_interval(&text)?))
         }
+        // jsonb normalizes on input: parse, dedup keys (last wins), order keys,
+        // canonical whitespace — matching PostgreSQL's binary jsonb semantics.
+        DataType::Jsonb => {
+            let text = v.to_text().unwrap_or_default();
+            Ok(Value::Text(normalize_jsonb(&text)?))
+        }
         // Text and the date/time/uuid/json family are stored as text.
         DataType::Text
         | DataType::Bytea
@@ -12748,7 +13848,6 @@ fn coerce(v: Value, target: DataType) -> Result<Value, String> {
         | DataType::Macaddr8
         | DataType::Uuid
         | DataType::Json
-        | DataType::Jsonb
         | DataType::Xml
         | DataType::TsVector
         | DataType::TsQuery => Ok(Value::Text(v.to_text().unwrap_or_default())),

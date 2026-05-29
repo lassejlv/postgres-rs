@@ -289,6 +289,12 @@ pub enum DiscardTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockTable {
     pub tables: Vec<String>,
+    /// The requested mode spelling (e.g. "ACCESS EXCLUSIVE"); `None` means the
+    /// PostgreSQL default of ACCESS EXCLUSIVE. Kept as text so the AST stays
+    /// independent of the lock manager's `LockMode` type.
+    pub mode: Option<String>,
+    /// `LOCK TABLE ... NOWAIT`: fail instead of blocking on a conflict.
+    pub nowait: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1160,6 +1166,14 @@ pub struct TableRef {
     /// `true` when prefixed with `ONLY`: restrict the scan to this table's own
     /// rows, excluding inheritance children / partitions.
     pub only: bool,
+    /// Explicit output column-alias list, e.g. `AS perm(acl, row_n)`. Empty when
+    /// none was written. For set-returning functions these rename the produced
+    /// columns; combined with `with_ordinality` the trailing alias names the
+    /// ordinality column.
+    pub column_aliases: Vec<String>,
+    /// `true` when `WITH ORDINALITY` was written on a set-returning function in
+    /// FROM, appending a `bigint` ordinality column (1-based) to the output.
+    pub with_ordinality: bool,
 }
 
 impl TableRef {

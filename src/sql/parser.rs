@@ -701,7 +701,11 @@ impl Parser {
                 break;
             }
         }
+        let mut mode = None;
         if self.eat_keyword("in") {
+            // Collect the mode words up to the `MODE` keyword (e.g. "ACCESS
+            // EXCLUSIVE"), so the lock manager can interpret it.
+            let mut words: Vec<String> = Vec::new();
             while self.peek().is_some()
                 && !matches!(self.peek(), Some(Token::Semicolon))
                 && !self.is_keyword("nowait")
@@ -709,11 +713,21 @@ impl Parser {
                 if self.eat_keyword("mode") {
                     break;
                 }
+                if let Some(Token::Word(w)) = self.peek() {
+                    words.push(w.clone());
+                }
                 self.advance();
             }
+            if !words.is_empty() {
+                mode = Some(words.join(" ").to_ascii_uppercase());
+            }
         }
-        self.eat_keyword("nowait");
-        Ok(Statement::LockTable(LockTable { tables }))
+        let nowait = self.eat_keyword("nowait");
+        Ok(Statement::LockTable(LockTable {
+            tables,
+            mode,
+            nowait,
+        }))
     }
 
     fn parse_column_comment_target(&mut self) -> Result<(String, String), String> {
@@ -988,7 +1002,9 @@ impl Parser {
             {
                 constraints.push(self.parse_table_constraint(&name)?);
             } else {
-                columns.push(self.parse_column_def()?);
+                let (col, mut inline) = self.parse_column_def_with_constraints(&name)?;
+                columns.push(col);
+                constraints.append(&mut inline);
             }
             if self.eat(&Token::Comma) {
                 continue;
@@ -1187,6 +1203,20 @@ impl Parser {
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef, String> {
+        // Used by ALTER TABLE ADD COLUMN, where inline table constraints
+        // (REFERENCES/UNIQUE/PRIMARY KEY/CHECK) are uncommon; collect and drop.
+        Ok(self.parse_column_def_with_constraints("")?.0)
+    }
+
+    /// Parse a column definition, returning the column plus any inline
+    /// column-level constraints (`REFERENCES`, `UNIQUE`, `CHECK`) translated
+    /// into the equivalent table-level [`TableConstraint`]s so the executor's
+    /// existing constraint machinery applies. `table` names the owning table
+    /// for default constraint naming.
+    fn parse_column_def_with_constraints(
+        &mut self,
+        table: &str,
+    ) -> Result<(ColumnDef, Vec<TableConstraint>), String> {
         let name = self.parse_ident()?;
         let (data_type, type_name, serial) = self.parse_column_type()?;
         // `serial` types are implicitly NOT NULL with a sequence default.
@@ -1196,11 +1226,59 @@ impl Parser {
         let mut identity = false;
         let mut identity_always = false;
         let mut generated = None;
+        let mut inline: Vec<TableConstraint> = Vec::new();
         loop {
+            // Optional `CONSTRAINT name` prefix for a column-level constraint.
+            // Only consume it when a constraint keyword actually follows.
+            let explicit_name = if self.is_keyword("constraint")
+                && ["primary", "references", "check", "unique", "not", "null", "default"]
+                    .iter()
+                    .any(|kw| self.is_keyword_at(2, kw))
+            {
+                self.advance();
+                Some(self.parse_ident()?)
+            } else {
+                None
+            };
             if self.eat_keyword("primary") {
                 self.expect_keyword("key")?;
                 primary_key = true;
                 not_null = true;
+            } else if self.eat_keyword("references") {
+                // Column-level FK: `REFERENCES reftable [(refcol)] [actions]`.
+                let ref_table = self.parse_object_name()?;
+                let ref_column = if self.eat(&Token::LParen) {
+                    let c = self.parse_ident()?;
+                    self.expect(&Token::RParen)?;
+                    c
+                } else {
+                    // Default to the referenced table's primary key column.
+                    "id".to_string()
+                };
+                self.parse_fk_actions_tail();
+                let validated = !self.parse_not_valid();
+                self.parse_deferrable_tail();
+                let cname =
+                    explicit_name.unwrap_or_else(|| format!("{table}_{name}_fkey"));
+                inline.push(TableConstraint::ForeignKey {
+                    name: cname,
+                    column: name.clone(),
+                    ref_table,
+                    ref_column,
+                    validated,
+                });
+            } else if self.eat_keyword("check") {
+                self.expect(&Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                let validated = !self.parse_not_valid();
+                self.parse_deferrable_tail();
+                let cname = explicit_name.unwrap_or_else(|| format!("{table}_{name}_check"));
+                inline.push(TableConstraint::Check {
+                    name: cname,
+                    expr,
+                    validated,
+                });
             } else if self.is_keyword("not") && self.is_keyword_at(1, "null") {
                 self.advance();
                 self.advance();
@@ -1208,7 +1286,12 @@ impl Parser {
             } else if self.eat_keyword("null") {
                 // explicit nullable
             } else if self.eat_keyword("unique") {
-                // accepted, not yet enforced
+                let cname = explicit_name.unwrap_or_else(|| format!("{table}_{name}_key"));
+                inline.push(TableConstraint::Unique {
+                    name: cname,
+                    columns: vec![name.clone()],
+                    primary_key: false,
+                });
             } else if self.is_keyword("deferrable")
                 || self.is_keyword("initially")
                 || (self.is_keyword("not") && self.is_keyword_at(1, "deferrable"))
@@ -1248,7 +1331,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(ColumnDef {
+        Ok((ColumnDef {
             name,
             data_type,
             type_name,
@@ -1259,7 +1342,7 @@ impl Parser {
             identity,
             identity_always,
             generated,
-        })
+        }, inline))
     }
 
     fn skip_identity_options(&mut self) {
@@ -3571,6 +3654,18 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 let alias = self.parse_optional_table_alias()?;
                 let name = alias.clone().unwrap_or_default();
+                // Optional column-alias list for the derived table.
+                let mut column_aliases = Vec::new();
+                if self.eat(&Token::LParen) {
+                    loop {
+                        column_aliases.push(self.parse_ident()?);
+                        if self.eat(&Token::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                    self.expect(&Token::RParen)?;
+                }
                 return Ok(TableRef {
                     schema: None,
                     name,
@@ -3579,6 +3674,8 @@ impl Parser {
                     subquery: Some(Box::new(sub)),
                     lateral,
                     only: false,
+                    column_aliases,
+                    with_ordinality: false,
                 });
             }
         }
@@ -3592,18 +3689,20 @@ impl Parser {
         } else {
             Vec::new()
         };
-        // `WITH ORDINALITY` on a set-returning function: accepted, no extra
-        // ordinality column is materialised (the relations psql uses it on are
-        // empty in this engine).
+        // `WITH ORDINALITY` on a set-returning function appends a 1-based
+        // ordinality column to the output.
+        let mut with_ordinality = false;
         if self.is_keyword("with") && self.is_keyword_at(1, "ordinality") {
             self.advance();
             self.advance();
+            with_ordinality = true;
         }
         let alias = self.parse_optional_table_alias()?;
         // Optional column-alias list: `AS a(c1, c2)` / `a(c1, c2)`.
+        let mut column_aliases = Vec::new();
         if self.eat(&Token::LParen) {
             loop {
-                let _ = self.parse_ident()?;
+                column_aliases.push(self.parse_ident()?);
                 if self.eat(&Token::Comma) {
                     continue;
                 }
@@ -3619,6 +3718,8 @@ impl Parser {
             subquery: None,
             lateral,
             only,
+            column_aliases,
+            with_ordinality,
         })
     }
 
@@ -4705,6 +4806,15 @@ impl Parser {
                 }
                 break;
             }
+        }
+        // Aggregate-call `ORDER BY` (e.g. `array_agg(x ORDER BY y)`): we accept
+        // and discard the ordering. The aggregates that carry it in the catalog
+        // queries pg_dump issues are order-insensitive for our purposes; we do
+        // not currently produce ordered aggregate output.
+        if self.is_keyword("order") {
+            self.expect_keyword("order")?;
+            self.expect_keyword("by")?;
+            let _ = self.parse_order_by_items()?;
         }
         self.expect(&Token::RParen)?;
         Ok(args)
