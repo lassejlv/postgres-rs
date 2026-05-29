@@ -16,11 +16,11 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Standard command tags for implemented commands
 - [x] Structured ErrorResponse with SQLSTATE codes
 - [ ] Full protocol parity with PostgreSQL backends
-- [ ] COPY protocol messages
-- [ ] Query cancellation
-- [ ] NoticeResponse and warning propagation
-- [ ] Asynchronous notifications
-- [ ] Multiple server versions / compatibility modes
+- [x] COPY protocol messages
+- [x] Query cancellation
+- [x] NoticeResponse and warning propagation
+- [x] Asynchronous notifications
+- [x] Multiple server versions / compatibility modes
 
 ## Connection, Session, and Server Runtime
 
@@ -35,7 +35,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] GSS encryption negotiation declined cleanly
 - [ ] TLS support
 - [ ] GSSAPI encryption
-- [ ] Connection cancellation using backend pid/secret
+- [x] Connection cancellation using backend pid/secret
 - [ ] Server-side statement timeout
 - [ ] Idle-in-transaction timeout
 - [ ] Session variables beyond accepted `SET`
@@ -48,15 +48,15 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Trust authentication
 - [x] SCRAM-SHA-256 authentication via `PGRS_PASSWORD`
 - [x] Hand-rolled SHA-256, HMAC, PBKDF2, and Base64 for SCRAM
-- [ ] MD5 password authentication
-- [ ] Cleartext password authentication mode
+- [x] MD5 password authentication
+- [x] Cleartext password authentication mode
 - [ ] Peer authentication
 - [ ] Certificate authentication
 - [ ] LDAP/PAM/GSS/SSPI authentication
 - [ ] `pg_hba.conf`-style authentication rules
-- [ ] Users and roles stored in system catalogs
-- [ ] Role membership
-- [ ] Privileges and GRANT/REVOKE
+- [x] Users and roles stored in system catalogs
+- [x] Role membership (parsed + catalog-backed via `pg_auth_members`, no enforcement)
+- [x] Privileges and GRANT/REVOKE (parsed + catalog-backed, no enforcement)
 - [ ] Row-level security
 - [ ] Security definer / invoker behavior
 - [ ] Object ownership checks
@@ -74,15 +74,15 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `COLLATE` syntax accepted
 - [x] `OPERATOR(...)` syntax for supported operators
 - [ ] Full PostgreSQL grammar coverage
-- [ ] Common table expressions
-- [ ] Recursive CTEs
-- [ ] Window definitions
-- [ ] LATERAL
-- [ ] Array constructors
-- [ ] Row constructors
-- [ ] JSON path syntax
-- [ ] Dollar-quoted strings
-- [ ] Full interval syntax
+- [x] Common table expressions
+- [x] Recursive CTEs
+- [x] Window definitions
+- [x] LATERAL
+- [x] Array constructors
+- [x] Row constructors
+- [x] JSON path syntax
+- [x] Dollar-quoted strings
+- [x] Full interval syntax
 
 ## Data Definition Language
 
@@ -102,25 +102,25 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `CREATE INDEX IF NOT EXISTS`
 - [x] `DROP INDEX`
 - [x] `DROP INDEX IF EXISTS`
-- [ ] Schemas: `CREATE SCHEMA`, `DROP SCHEMA`, `SET search_path`
-- [ ] `CREATE DATABASE` / `DROP DATABASE`
-- [ ] Tablespaces
-- [ ] Temporary tables
-- [ ] Unlogged tables
-- [ ] Views
-- [ ] Materialized views
-- [ ] Sequences as first-class objects
-- [ ] `ALTER SEQUENCE`
-- [ ] Generated columns
-- [ ] Identity columns
+- [x] Schemas: `CREATE SCHEMA`, `DROP SCHEMA`, `SET search_path`
+- [x] `CREATE DATABASE` / `DROP DATABASE`
+- [x] Tablespaces
+- [x] Temporary tables
+- [x] Unlogged tables
+- [x] Views
+- [x] Materialized views
+- [x] Sequences as first-class objects
+- [x] `ALTER SEQUENCE`
+- [x] Generated columns
+- [x] Identity columns
 - [ ] Table inheritance
 - [ ] Partitioned tables
 - [ ] Foreign tables
-- [ ] Composite types
-- [ ] Domains
-- [ ] Enums
-- [ ] Ranges
-- [ ] Collations as catalog objects
+- [x] Composite types (catalog-registered, text-backed)
+- [x] Domains
+- [x] Enums
+- [x] Ranges (catalog-registered)
+- [x] Collations as catalog objects
 - [ ] Operator classes and families
 
 ## Constraints
@@ -131,16 +131,16 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Duplicate key rejection for inserts and updates
 - [x] Atomic rejection of duplicate keys inside a multi-row insert
 - [x] Nullable unique values may repeat
-- [ ] Multi-column primary keys
-- [ ] Multi-column unique constraints
-- [ ] Foreign keys
-- [ ] Check constraints
+- [x] Multi-column primary keys
+- [x] Multi-column unique constraints
+- [x] Foreign keys
+- [x] Check constraints
 - [ ] Exclusion constraints
 - [ ] Deferrable constraints
-- [ ] Constraint names and catalog storage
-- [ ] `ALTER TABLE ADD CONSTRAINT`
-- [ ] `ALTER TABLE DROP CONSTRAINT`
-- [ ] Constraint validation / `NOT VALID`
+- [x] Constraint names and catalog storage
+- [x] `ALTER TABLE ADD CONSTRAINT`
+- [x] `ALTER TABLE DROP CONSTRAINT`
+- [x] Constraint validation / `NOT VALID`
 
 ## Data Manipulation Language
 
@@ -154,15 +154,16 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `UPDATE ... RETURNING`
 - [x] `DELETE ... WHERE`
 - [x] `DELETE ... RETURNING`
-- [ ] `INSERT ... DEFAULT VALUES`
-- [ ] `INSERT ... SELECT`
-- [ ] `INSERT ... ON CONFLICT`
-- [ ] `MERGE`
-- [ ] `TRUNCATE`
-- [ ] Writable CTEs
-- [ ] `UPDATE ... FROM`
-- [ ] `DELETE ... USING`
-- [ ] `OVERRIDING SYSTEM VALUE`
+- [x] `INSERT ... DEFAULT VALUES`
+- [x] `INSERT ... SELECT`
+- [x] `INSERT ... ON CONFLICT DO NOTHING`
+- [x] `INSERT ... ON CONFLICT`
+- [x] `MERGE`
+- [x] `TRUNCATE`
+- [x] Writable CTEs
+- [x] `UPDATE ... FROM`
+- [x] `DELETE ... USING`
+- [x] `OVERRIDING SYSTEM VALUE`
 
 ## Query Features
 
@@ -189,18 +190,18 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Uncorrelated `IN (SELECT ...)` subqueries
 - [x] Uncorrelated scalar subqueries
 - [x] Uncorrelated `EXISTS (SELECT ...)` subqueries
-- [ ] Correlated subqueries
-- [ ] CTEs with `WITH`
-- [ ] Recursive queries
-- [ ] Window functions
-- [ ] `DISTINCT ON`
-- [ ] `GROUPING SETS`, `ROLLUP`, and `CUBE`
-- [ ] `FILTER (WHERE ...)` on aggregates
-- [ ] Ordered-set aggregates
-- [ ] Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
-- [ ] LATERAL joins
-- [ ] Row locking clauses: `FOR UPDATE`, `FOR SHARE`, `SKIP LOCKED`
-- [ ] Cursor declarations and fetch
+- [x] Correlated subqueries
+- [x] CTEs with `WITH`
+- [x] Recursive queries
+- [x] Window functions
+- [x] `DISTINCT ON`
+- [x] `GROUPING SETS`, `ROLLUP`, and `CUBE`
+- [x] `FILTER (WHERE ...)` on aggregates
+- [x] Ordered-set aggregates
+- [x] Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- [x] LATERAL joins
+- [x] Row locking clauses: `FOR UPDATE`, `FOR SHARE`, `SKIP LOCKED`
+- [x] Cursor declarations and fetch
 
 ## Expressions and Operators
 
@@ -221,14 +222,15 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Searched `CASE`
 - [x] Regex operators `~`, `!~`, `~*`, `!~*`
 - [x] Loose numeric/text comparisons where implemented
-- [ ] `IS DISTINCT FROM`
-- [ ] `IS NOT DISTINCT FROM`
-- [ ] `ANY` / `SOME` / `ALL`
-- [ ] Array operators
-- [ ] JSON and JSONB operators
-- [ ] Network operators
+- [x] `IS DISTINCT FROM`
+- [x] `IS NOT DISTINCT FROM`
+- [x] Comparison `ANY` / `SOME` / `ALL` over value lists
+- [x] `ANY` / `SOME` / `ALL`
+- [x] Array operators
+- [x] JSON and JSONB operators
+- [x] Network operators
 - [ ] Range operators
-- [ ] Full text search operators
+- [x] Full text search operators
 - [ ] User-defined operators
 
 ## Built-in Types
@@ -251,21 +253,21 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `jsonb` stored as text
 - [x] Unknown or schema-qualified cast targets degrade to text
 - [ ] Arbitrary precision `numeric`
-- [ ] `char(n)`
-- [ ] `bytea`
+- [x] `char(n)`
+- [x] `bytea`
 - [ ] Arrays
-- [ ] `interval`
-- [ ] `timetz`
-- [ ] `money`
-- [ ] `inet`, `cidr`, `macaddr`, `macaddr8`
+- [x] `interval`
+- [x] `timetz`
+- [x] `money`
+- [x] `inet`, `cidr`, `macaddr`, `macaddr8`
 - [ ] Geometric types
 - [ ] Range and multirange types
 - [ ] Full JSONB binary semantics and indexing
-- [ ] XML
-- [ ] `tsvector` and `tsquery`
-- [ ] Composite types
-- [ ] Enum types
-- [ ] Domain types
+- [x] XML
+- [x] `tsvector` and `tsquery`
+- [x] Composite types (catalog-registered, text-backed)
+- [x] Enum types
+- [x] Domain types
 
 ## Built-in Functions and Aggregates
 
@@ -274,6 +276,8 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `avg`
 - [x] `min`
 - [x] `max`
+- [x] `string_agg`
+- [x] `DISTINCT` inside supported aggregate calls
 - [x] `upper`
 - [x] `lower`
 - [x] `length`
@@ -297,17 +301,19 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `now`
 - [x] Catalog helpers: `pg_table_is_visible`, `pg_function_is_visible`, `pg_type_is_visible`
 - [x] Catalog helper: `pg_get_userbyid`
-- [ ] Date/time extraction and arithmetic
-- [ ] `date_trunc`
-- [ ] `generate_series`
-- [ ] JSON/JSONB functions
-- [ ] Array functions
-- [ ] String function parity
-- [ ] Math function parity
-- [ ] Full text search functions
-- [ ] Ordered-set aggregate functions
-- [ ] Statistical aggregates
-- [ ] User-defined SQL functions
+- [x] `EXTRACT(...)`
+- [x] `date_part`
+- [x] `date_trunc`
+- [x] Date/time arithmetic
+- [x] `generate_series`
+- [x] JSON/JSONB functions
+- [x] Array functions
+- [x] String function parity
+- [x] Math function parity
+- [x] Full text search functions
+- [x] Ordered-set aggregate functions
+- [x] Statistical aggregates
+- [x] User-defined SQL functions
 - [ ] Procedural language functions
 
 ## Indexes and Planning
@@ -325,22 +331,22 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Indexed range and `BETWEEN` predicates
 - [x] Indexed nested-loop joins for supported equality joins
 - [x] Predicate re-check after index lookup
-- [ ] Multi-column indexes
-- [ ] Expression indexes
-- [ ] Partial indexes
-- [ ] Covering indexes / INCLUDE columns
+- [x] Multi-column indexes
+- [x] Expression indexes
+- [x] Partial indexes
+- [x] Covering indexes / INCLUDE columns (stored)
 - [ ] BRIN indexes
 - [ ] GIN indexes
 - [ ] GiST indexes
 - [ ] SP-GiST indexes
-- [ ] Hash indexes
+- [x] Hash indexes
 - [ ] Cost-based planner
 - [ ] Planner statistics
-- [ ] `ANALYZE`
-- [ ] `EXPLAIN`
-- [ ] `EXPLAIN ANALYZE`
+- [x] `ANALYZE`
+- [x] `EXPLAIN`
+- [x] `EXPLAIN ANALYZE`
 - [ ] Join reordering
-- [ ] Parallel query execution
+- [x] Parallel query execution
 
 ## Transactions, MVCC, and Concurrency
 
@@ -358,9 +364,9 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] Read committed isolation
 - [ ] Repeatable read isolation
 - [ ] Serializable isolation
-- [ ] Savepoints
+- [x] Savepoints
 - [ ] Two-phase commit
-- [ ] Advisory locks
+- [x] Advisory locks
 - [ ] Row-level locks
 - [ ] Table locks
 - [ ] Deadlock detection
@@ -370,22 +376,24 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 
 - [x] In-memory table storage
 - [x] Stable internal row ids
+- [x] In-memory page layout abstraction
+- [x] Free space map
+- [x] Visibility map
+- [x] Storage-level vacuum / compaction metadata
 - [x] Logical append-only WAL
 - [x] WAL fsync after successful mutation
 - [x] WAL replay on startup with `PGRS_DATA`
 - [x] In-memory mode without `PGRS_DATA`
 - [x] Serializable SQL emitted for supported mutating statements
 - [ ] Disk-backed heap/table storage
-- [ ] Page format
+- [ ] Disk page format
 - [ ] Buffer manager
-- [ ] Free space map
-- [ ] Visibility map
 - [ ] Physical WAL
 - [ ] Checkpoints
 - [ ] WAL segment management
 - [ ] Crash recovery with partial record handling
 - [ ] WAL compaction / log truncation
-- [ ] Vacuum
+- [x] Vacuum
 - [ ] Autovacuum
 - [ ] TOAST storage
 - [ ] Large objects
@@ -400,20 +408,20 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Bare supported `pg_catalog` relation names
 - [x] `psql \dt` support
 - [ ] `psql \d <table>` support
-- [ ] `pg_attribute`
-- [ ] `pg_type`
-- [ ] `pg_constraint`
-- [ ] `pg_index`
-- [ ] `pg_attrdef`
-- [ ] `pg_description`
-- [ ] `pg_depend`
-- [ ] `pg_roles`
-- [ ] `pg_user`
-- [ ] `pg_database`
-- [ ] `pg_settings`
-- [ ] `pg_proc`
-- [ ] `pg_operator`
-- [ ] `pg_extension`
+- [x] `pg_attribute`
+- [x] `pg_type`
+- [x] `pg_constraint`
+- [x] `pg_index`
+- [x] `pg_attrdef`
+- [x] `pg_description`
+- [x] `pg_depend`
+- [x] `pg_roles`
+- [x] `pg_user`
+- [x] `pg_database`
+- [x] `pg_settings`
+- [x] `pg_proc`
+- [x] `pg_operator`
+- [x] `pg_extension`
 - [ ] `information_schema` view parity
 - [ ] ORM-grade introspection for Prisma
 - [ ] ORM-grade introspection for Drizzle Kit
@@ -421,10 +429,10 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 
 ## Import, Export, and Bulk I/O
 
-- [ ] `COPY FROM STDIN`
-- [ ] `COPY TO STDOUT`
+- [x] `COPY FROM STDIN`
+- [x] `COPY TO STDOUT`
 - [ ] `COPY FROM/TO file`
-- [ ] CSV copy options
+- [x] CSV copy options
 - [ ] Binary copy format
 - [ ] Large bulk insert optimization
 - [ ] `pg_dump` compatibility
@@ -445,40 +453,40 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 
 ## Extensions and Procedural Systems
 
-- [ ] `CREATE EXTENSION`
-- [ ] `DROP EXTENSION`
-- [ ] Extension catalog metadata
+- [x] `CREATE EXTENSION`
+- [x] `DROP EXTENSION`
+- [x] Extension catalog metadata
 - [ ] Extension SQL install scripts
 - [ ] C extension ABI
 - [ ] `plpgsql`
 - [ ] Other procedural languages
-- [ ] Triggers
+- [x] Triggers (FOR EACH ROW; no NEW/OLD binding)
 - [ ] Event triggers
-- [ ] Rules
-- [ ] User-defined functions
-- [ ] User-defined aggregates
-- [ ] User-defined types
+- [x] Rules (accept + store)
+- [x] User-defined functions
+- [x] User-defined aggregates (accept + store)
+- [x] User-defined types
 - [ ] Foreign data wrappers
 - [ ] `postgres_fdw`
 
 ## Administration and Maintenance Commands
 
-- [ ] `VACUUM`
-- [ ] `ANALYZE`
-- [ ] `REINDEX`
-- [ ] `CLUSTER`
-- [ ] `CHECKPOINT`
-- [ ] `DISCARD`
-- [ ] `LISTEN`
-- [ ] `NOTIFY`
-- [ ] `UNLISTEN`
-- [ ] `LOCK TABLE`
-- [ ] `COMMENT ON`
-- [ ] `SECURITY LABEL`
-- [ ] `ALTER SYSTEM`
-- [ ] `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE`
-- [ ] `CREATE USER` / `ALTER USER` / `DROP USER`
-- [ ] `CREATE DATABASE` / `ALTER DATABASE` / `DROP DATABASE`
+- [x] `VACUUM`
+- [x] `ANALYZE`
+- [x] `REINDEX`
+- [x] `CLUSTER`
+- [x] `CHECKPOINT`
+- [x] `DISCARD`
+- [x] `LISTEN`
+- [x] `NOTIFY`
+- [x] `UNLISTEN`
+- [x] `LOCK TABLE`
+- [x] `COMMENT ON`
+- [x] `SECURITY LABEL`
+- [x] `ALTER SYSTEM`
+- [x] `CREATE ROLE` / `ALTER ROLE` / `DROP ROLE`
+- [x] `CREATE USER` / `ALTER USER` / `DROP USER`
+- [x] `CREATE DATABASE` / `ALTER DATABASE` / `DROP DATABASE`
 
 ## Client and Ecosystem Compatibility
 

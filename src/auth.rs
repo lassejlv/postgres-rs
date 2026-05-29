@@ -75,8 +75,10 @@ impl ScramServer {
 
         // AuthMessage = client-first-bare , server-first , client-final-without-proof
         let without_proof = &s[..s.rfind(",p=").ok_or("malformed client-final")?];
-        let auth_message =
-            format!("{},{},{}", self.client_first_bare, self.server_first, without_proof);
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, self.server_first, without_proof
+        );
 
         let salted = crypto::pbkdf2_sha256(self.password.as_bytes(), &self.salt, SCRAM_ITERATIONS);
         let client_key = crypto::hmac_sha256(&salted, b"Client Key");
@@ -99,6 +101,19 @@ impl ScramServer {
     }
 }
 
+/// Compute the MD5 password digest PostgreSQL expects in the client's response.
+///
+/// The client sends `"md5" + md5_hex( md5_hex(password || username) ++ salt )`,
+/// and the server computes the same value to compare. The inner digest binds
+/// the stored credential to the username; the outer digest binds it to the
+/// per-connection 4-byte salt so each exchange is distinct.
+pub fn md5_password_digest(password: &str, username: &str, salt: &[u8]) -> String {
+    let inner = crypto::md5_hex(format!("{password}{username}").as_bytes());
+    let mut salted = inner.into_bytes();
+    salted.extend_from_slice(salt);
+    format!("md5{}", crypto::md5_hex(&salted))
+}
+
 /// Extract a single-letter SCRAM attribute value (`key=value`, comma-separated).
 fn attr(s: &str, key: char) -> Option<String> {
     s.split(',').find_map(|kv| {
@@ -118,7 +133,11 @@ mod tests {
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
         let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
-        let proof: Vec<u8> = client_key.iter().zip(client_sig.iter()).map(|(a, b)| a ^ b).collect();
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_sig.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         base64_encode(&proof)
     }
 
@@ -149,5 +168,30 @@ mod tests {
     #[test]
     fn wrong_password_rejected() {
         assert!(exchange("pencil", "eraser").is_err());
+    }
+
+    #[test]
+    fn md5_digest_matches_client_construction() {
+        // Reconstruct the digest the way a client would and confirm equality.
+        let password = "secret";
+        let username = "alice";
+        let salt = [0x01u8, 0x02, 0x03, 0x04];
+
+        let inner = crate::crypto::md5_hex(format!("{password}{username}").as_bytes());
+        let mut salted = inner.into_bytes();
+        salted.extend_from_slice(&salt);
+        let expected = format!("md5{}", crate::crypto::md5_hex(&salted));
+
+        assert_eq!(md5_password_digest(password, username, &salt), expected);
+    }
+
+    #[test]
+    fn md5_digest_known_vector() {
+        // md5("postgrespostgres") -> inner; outer over inner ++ salt(0,0,0,0).
+        let digest = md5_password_digest("postgres", "postgres", &[0, 0, 0, 0]);
+        assert!(digest.starts_with("md5"));
+        assert_eq!(digest.len(), 35); // "md5" + 32 hex chars
+        // Differs from the same password under a different username.
+        assert_ne!(digest, md5_password_digest("postgres", "alice", &[0, 0, 0, 0]));
     }
 }

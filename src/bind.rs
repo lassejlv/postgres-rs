@@ -18,6 +18,9 @@ pub fn bind_statement(stmt: &mut Statement, params: &[Value]) -> Result<(), Stri
                     bind_expr(e, params)?;
                 }
             }
+            if let Some(select) = &mut i.select {
+                bind_select(select, params)?;
+            }
         }
         Statement::Select(s) => bind_select(s, params)?,
         Statement::Update(u) => {
@@ -33,6 +36,7 @@ pub fn bind_statement(stmt: &mut Statement, params: &[Value]) -> Result<(), Stri
                 bind_expr(f, params)?;
             }
         }
+        Statement::Explain(e) => bind_statement(&mut e.statement, params)?,
         // Other statements never contain parameters.
         _ => {}
     }
@@ -48,6 +52,24 @@ fn bind_select(s: &mut Select, params: &[Value]) -> Result<(), String> {
     if let Some(f) = &mut s.filter {
         bind_expr(f, params)?;
     }
+    if let Some(from) = &mut s.from {
+        bind_table_ref(&mut from.base, params)?;
+        for join in &mut from.joins {
+            bind_table_ref(&mut join.table, params)?;
+            if let Some(on) = &mut join.on {
+                bind_expr(on, params)?;
+            }
+        }
+    }
+    for g in &mut s.group_by {
+        bind_expr(g, params)?;
+    }
+    if let Some(h) = &mut s.having {
+        bind_expr(h, params)?;
+    }
+    for e in &mut s.distinct_on {
+        bind_expr(e, params)?;
+    }
     for o in &mut s.order_by {
         bind_expr(&mut o.expr, params)?;
     }
@@ -56,6 +78,16 @@ fn bind_select(s: &mut Select, params: &[Value]) -> Result<(), String> {
     }
     if let Some(o) = &mut s.offset {
         bind_expr(o, params)?;
+    }
+    for set_op in &mut s.set_ops {
+        bind_select(&mut set_op.select, params)?;
+    }
+    Ok(())
+}
+
+fn bind_table_ref(t: &mut TableRef, params: &[Value]) -> Result<(), String> {
+    for arg in &mut t.args {
+        bind_expr(arg, params)?;
     }
     Ok(())
 }
@@ -77,7 +109,18 @@ fn bind_expr(expr: &mut Expr, params: &[Value]) -> Result<(), String> {
             bind_expr(left, params)?;
             bind_expr(right, params)
         }
+        Expr::QuantifiedCompare { left, list, .. } => {
+            bind_expr(left, params)?;
+            for e in list {
+                bind_expr(e, params)?;
+            }
+            Ok(())
+        }
         Expr::IsNull { expr, .. } => bind_expr(expr, params),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            bind_expr(left, params)?;
+            bind_expr(right, params)
+        }
         Expr::Cast { expr, .. } => bind_expr(expr, params),
         // Parameters inside subqueries are not bound (uncommon); the IN-test's
         // left operand still is.
@@ -94,12 +137,24 @@ fn bind_expr(expr: &mut Expr, params: &[Value]) -> Result<(), String> {
             }
             Ok(())
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Row(items) | Expr::Array(items) => {
+            for item in items {
+                bind_expr(item, params)?;
+            }
+            Ok(())
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             bind_expr(expr, params)?;
             bind_expr(low, params)?;
             bind_expr(high, params)
         }
-        Expr::Case { operand, whens, else_expr } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
             if let Some(o) = operand {
                 bind_expr(o, params)?;
             }
@@ -112,9 +167,12 @@ fn bind_expr(expr: &mut Expr, params: &[Value]) -> Result<(), String> {
             }
             Ok(())
         }
-        Expr::Function { args, .. } => {
+        Expr::Function { args, filter, .. } => {
             for a in args {
                 bind_expr(a, params)?;
+            }
+            if let Some(filter) = filter {
+                bind_expr(filter, params)?;
             }
             Ok(())
         }

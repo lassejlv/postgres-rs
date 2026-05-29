@@ -6,11 +6,11 @@
 //! finer-grained locking.
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ use crate::bind;
 use crate::executor::{self, ExecResult, FieldDescription};
 use crate::protocol::{FrontendMessage, MessageBuilder, Startup, read_message, read_startup};
 use crate::sql::Parser;
-use crate::sql::ast::Statement;
+use crate::sql::ast::{Copy as CopyStmt, CopyDirection, CopyFormat, Expr, Insert, Statement};
 use crate::sql::serialize;
 use crate::storage::Database;
 use crate::types::{DataType, Value};
@@ -30,9 +30,49 @@ struct Shared {
     db: Mutex<Database>,
     /// `None` when running purely in memory (no `PGRS_DATA` configured).
     wal: Mutex<Option<Wal>>,
+    /// Live backends keyed by their advertised pid, used to route
+    /// cancellation requests and asynchronous notifications.
+    backends: Mutex<HashMap<i32, BackendHandle>>,
+    /// `LISTEN` registrations: channel name → set of listening backend pids.
+    listeners: Mutex<HashMap<String, Vec<i32>>>,
+}
+
+/// Shared handles for one live backend, reachable from other connections.
+struct BackendHandle {
+    /// The cancel secret a client must echo in a CancelRequest.
+    secret: i32,
+    /// Set by a matching CancelRequest; checked at statement boundaries.
+    cancel: Arc<AtomicBool>,
+    /// Pending asynchronous notifications, drained when the session next
+    /// reaches an idle (ReadyForQuery) point.
+    notifications: Arc<Mutex<Vec<Notification>>>,
+}
+
+/// One `NOTIFY` payload destined for a listening backend.
+#[derive(Clone)]
+struct Notification {
+    sender_pid: i32,
+    channel: String,
+    payload: String,
+}
+
+/// A backend severity/code/message destined for a NoticeResponse.
+struct Notice {
+    severity: &'static str,
+    code: &'static str,
+    message: String,
 }
 
 static NEXT_BACKEND_PID: AtomicI32 = AtomicI32::new(1);
+
+/// The reported `server_version`, overridable via `PGRS_SERVER_VERSION` to
+/// emulate a different PostgreSQL major version (compatibility mode).
+fn server_version() -> String {
+    std::env::var("PGRS_SERVER_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "16.0 (postgres-rs 0.1.0)".to_string())
+}
 
 /// Bind to `addr` and serve connections until the process is stopped.
 ///
@@ -51,7 +91,12 @@ pub fn run(addr: &str, data_dir: Option<String>) -> io::Result<()> {
         None => None,
     };
 
-    let shared = Arc::new(Shared { db: Mutex::new(db), wal: Mutex::new(wal) });
+    let shared = Arc::new(Shared {
+        db: Mutex::new(db),
+        wal: Mutex::new(wal),
+        backends: Mutex::new(HashMap::new()),
+        listeners: Mutex::new(HashMap::new()),
+    });
     let listener = TcpListener::bind(addr)?;
     println!("postgres-rs listening on {addr}");
 
@@ -96,9 +141,17 @@ struct Transaction {
     /// Serialized mutations, written to the WAL only when the transaction
     /// commits (so uncommitted work never reaches disk).
     buffered: Vec<String>,
+    /// Named savepoints with a snapshot of the working copy and buffered WAL.
+    savepoints: Vec<Savepoint>,
     /// Set once a statement in the block errors; further statements are
     /// rejected until COMMIT/ROLLBACK (matching PostgreSQL).
     failed: bool,
+}
+
+struct Savepoint {
+    name: String,
+    db: Database,
+    buffered_len: usize,
 }
 
 /// Per-connection session state.
@@ -112,16 +165,28 @@ struct Session {
     /// In the extended protocol, once a message errors we discard input until
     /// the next Sync.
     skip_until_sync: bool,
+    /// This backend's advertised pid (cancellation/notification key).
+    pid: i32,
+    /// Cancellation flag, shared with the backend handle in [`Shared`].
+    cancel: Arc<AtomicBool>,
+    /// Pending asynchronous notifications for this backend.
+    notifications: Arc<Mutex<Vec<Notification>>>,
+    /// Notices accumulated by the current statement, flushed before its result.
+    notices: Vec<Notice>,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(pid: i32, cancel: Arc<AtomicBool>, notifications: Arc<Mutex<Vec<Notification>>>) -> Self {
         Session {
             tx_status: b'I',
             tx: None,
             prepared: HashMap::new(),
             portals: HashMap::new(),
             skip_until_sync: false,
+            pid,
+            cancel,
+            notifications,
+            notices: Vec::new(),
         }
     }
 }
@@ -133,15 +198,21 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     let mut writer = BufWriter::new(stream);
 
     // --- startup / negotiation ---
-    let _params = loop {
+    let params = loop {
         match read_startup(&mut reader)? {
             Startup::SslRequest | Startup::GssEncRequest => {
                 // We don't implement TLS yet: decline, client retries in clear.
                 writer.write_all(b"N")?;
                 writer.flush()?;
             }
-            Startup::CancelRequest { .. } => {
-                // No running queries to cancel in this simple model.
+            Startup::CancelRequest { pid, secret } => {
+                // A cancel request is its own short-lived connection: flag the
+                // target backend (if the secret matches) and disconnect.
+                if let Some(handle) = shared.backends.lock().expect("backends mutex").get(&pid) {
+                    if handle.secret == secret {
+                        handle.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
                 return Ok(());
             }
             Startup::Params(p) => break p,
@@ -149,17 +220,39 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     };
 
     // --- authentication ---
-    // With PGRS_PASSWORD set we require SCRAM-SHA-256; otherwise trust auth.
-    if let Some(password) = std::env::var("PGRS_PASSWORD").ok().filter(|p| !p.is_empty()) {
-        if !scram_authenticate(&mut reader, &mut writer, &password)? {
-            send_error(&mut writer, "28P01", "password authentication failed")?;
-            writer.flush()?;
-            return Ok(());
-        }
+    // The `user` startup parameter is needed for MD5 (which hashes
+    // password+username). Default to "postgres" if the client omitted it.
+    let username = params
+        .iter()
+        .find(|(k, _)| k == "user")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "postgres".to_string());
+
+    if !authenticate(&mut reader, &mut writer, &username)? {
+        send_error(&mut writer, "28P01", "password authentication failed")?;
+        writer.flush()?;
+        return Ok(());
     }
 
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed);
     let secret = weak_secret();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let notifications = Arc::new(Mutex::new(Vec::new()));
+    shared.backends.lock().expect("backends mutex").insert(
+        pid,
+        BackendHandle {
+            secret,
+            cancel: Arc::clone(&cancel),
+            notifications: Arc::clone(&notifications),
+        },
+    );
+    // Ensure the backend is unregistered (and its LISTENs dropped) however this
+    // connection ends.
+    let _guard = ConnGuard {
+        shared: &shared,
+        pid,
+    };
+
     send_authentication_ok(&mut writer)?;
     send_initial_parameters(&mut writer)?;
     send_backend_key_data(&mut writer, pid, secret)?;
@@ -167,7 +260,7 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     writer.flush()?;
 
     // --- main message loop ---
-    let mut session = Session::new();
+    let mut session = Session::new(pid, cancel, notifications);
     loop {
         let Some(msg) = read_message(&mut reader)? else {
             break;
@@ -181,9 +274,13 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
 
         match msg {
             FrontendMessage::Query(sql) => {
-                handle_simple_query(&mut writer, &shared, &mut session, &sql)?;
+                handle_simple_query(&mut reader, &mut writer, &shared, &mut session, &sql)?;
             }
-            FrontendMessage::Parse { name, query, param_types } => {
+            FrontendMessage::Parse {
+                name,
+                query,
+                param_types,
+            } => {
                 handle_parse(&mut writer, &mut session, name, query, param_types)?;
             }
             FrontendMessage::Bind {
@@ -219,11 +316,20 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
             }
             FrontendMessage::Sync => {
                 session.skip_until_sync = false;
+                deliver_notifications(&mut writer, &session)?;
                 send_ready_for_query(&mut writer, session.tx_status)?;
             }
             FrontendMessage::Flush => {}
             FrontendMessage::Password(_) => {
                 // Trust auth never asks for one; ignore stray password messages.
+            }
+            FrontendMessage::CopyData(_) | FrontendMessage::CopyDone => {
+                // COPY data outside an active COPY: ignore, as PostgreSQL does
+                // for late data after a failed COPY.
+            }
+            FrontendMessage::CopyFail(_) => {
+                send_error(&mut writer, "57014", "COPY from stdin failed")?;
+                session.skip_until_sync = true;
             }
             FrontendMessage::Terminate => break,
             FrontendMessage::Unknown { tag, .. } => {
@@ -240,9 +346,73 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes a backend from the shared registries when its connection ends,
+/// regardless of how the session loop exits.
+struct ConnGuard<'a> {
+    shared: &'a Shared,
+    pid: i32,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .backends
+            .lock()
+            .expect("backends mutex")
+            .remove(&self.pid);
+        self.shared
+            .listeners
+            .lock()
+            .expect("listeners mutex")
+            .values_mut()
+            .for_each(|pids| pids.retain(|p| *p != self.pid));
+    }
+}
+
+/// Drain and send any pending asynchronous notifications as NotificationResponse
+/// (`'A'`) messages. Called whenever the session reaches an idle point.
+fn deliver_notifications<W: Write>(w: &mut W, session: &Session) -> io::Result<()> {
+    let pending: Vec<Notification> =
+        std::mem::take(&mut *session.notifications.lock().expect("notifications mutex"));
+    for n in pending {
+        let mut b = MessageBuilder::new(b'A');
+        b.put_i32(n.sender_pid);
+        b.put_cstr(&n.channel);
+        b.put_cstr(&n.payload);
+        w.write_all(&b.finish())?;
+    }
+    Ok(())
+}
+
+/// Flush any notices accumulated by the just-run statement as NoticeResponse
+/// (`'N'`) messages, which clients surface as warnings.
+fn flush_notices<W: Write>(w: &mut W, session: &mut Session) -> io::Result<()> {
+    for notice in session.notices.drain(..) {
+        let mut b = MessageBuilder::new(b'N');
+        b.put_u8(b'S').put_cstr(notice.severity);
+        b.put_u8(b'V').put_cstr(notice.severity);
+        b.put_u8(b'C').put_cstr(notice.code);
+        b.put_u8(b'M').put_cstr(&notice.message);
+        b.put_u8(0);
+        w.write_all(&b.finish())?;
+    }
+    Ok(())
+}
+
+/// If a CancelRequest flagged this backend, consume the flag and return a
+/// query-canceled error to abort the current batch.
+fn check_canceled(session: &Session) -> Result<(), String> {
+    if session.cancel.swap(false, Ordering::SeqCst) {
+        Err("canceling statement due to user request".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 // --- simple query protocol ---------------------------------------------------
 
-fn handle_simple_query<W: Write>(
+fn handle_simple_query<R: Read, W: Write>(
+    reader: &mut R,
     w: &mut W,
     shared: &Shared,
     session: &mut Session,
@@ -260,25 +430,369 @@ fn handle_simple_query<W: Write>(
     // A truly empty query string gets a dedicated response.
     if statements.iter().all(|s| matches!(s, Statement::Empty)) {
         send_simple(w, b'I')?; // EmptyQueryResponse
-        return send_ready_for_query(w, session.tx_status);
+        return ready_for_query(w, session);
     }
 
     for stmt in statements {
         if matches!(stmt, Statement::Empty) {
             continue;
         }
+        // A pending cancellation aborts the batch before the next statement.
+        if let Err(e) = check_canceled(session) {
+            send_error(w, sqlstate_for(&e), &e)?;
+            mark_error(session);
+            return ready_for_query(w, session);
+        }
+        // `COPY ... FROM STDIN`/`TO STDOUT` switch to the COPY sub-protocol,
+        // which needs the connection's reader, so they're driven separately.
+        if let Statement::Copy(copy) = &stmt {
+            if let Err(e) = run_copy(reader, w, shared, session, copy)? {
+                flush_notices(w, session)?;
+                send_error(w, sqlstate_for(&e), &e)?;
+                mark_error(session);
+                return ready_for_query(w, session);
+            }
+            continue;
+        }
         match run_statement(shared, session, &stmt) {
-            Ok(res) => send_result(w, res, &[])?,
+            Ok(res) => {
+                flush_notices(w, session)?;
+                send_result(w, res, &[])?;
+            }
             Err(e) => {
+                flush_notices(w, session)?;
                 send_error(w, sqlstate_for(&e), &e)?;
                 mark_error(session);
                 // Abort the remainder of the simple-query batch.
-                return send_ready_for_query(w, session.tx_status);
+                return ready_for_query(w, session);
             }
         }
     }
 
+    ready_for_query(w, session)
+}
+
+/// Send ReadyForQuery, first delivering any pending asynchronous notifications
+/// (the wire point at which PostgreSQL clients expect them).
+fn ready_for_query<W: Write>(w: &mut W, session: &Session) -> io::Result<()> {
+    deliver_notifications(w, session)?;
     send_ready_for_query(w, session.tx_status)
+}
+
+// --- COPY sub-protocol --------------------------------------------------------
+
+/// Drive a `COPY ... FROM STDIN` / `TO STDOUT` exchange.
+///
+/// The outer `io::Result` covers socket failures (which end the connection);
+/// the inner `Result` carries a SQL-level error for the caller to report as an
+/// ErrorResponse + ReadyForQuery.
+fn run_copy<R: Read, W: Write>(
+    reader: &mut R,
+    w: &mut W,
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+) -> io::Result<Result<(), String>> {
+    let columns = match copy_columns(shared, session, &copy.table, copy.columns.as_ref()) {
+        Ok(c) => c,
+        Err(e) => return Ok(Err(e)),
+    };
+    let delimiter = copy.delimiter.unwrap_or(match copy.format {
+        CopyFormat::Csv => ',',
+        CopyFormat::Text => '\t',
+    });
+    let null_marker = copy.null.clone().unwrap_or_else(|| match copy.format {
+        CopyFormat::Csv => String::new(),
+        CopyFormat::Text => "\\N".to_string(),
+    });
+
+    match copy.direction {
+        CopyDirection::To => copy_to_stdout(w, shared, session, copy, &columns, delimiter, &null_marker),
+        CopyDirection::From => {
+            copy_from_stdin(reader, w, shared, session, copy, &columns, delimiter, &null_marker)
+        }
+    }
+}
+
+/// Resolve the effective column list for a COPY: the explicit list if given,
+/// else every column of the table in declaration order.
+fn copy_columns(
+    shared: &Shared,
+    session: &Session,
+    table: &str,
+    explicit: Option<&Vec<String>>,
+) -> Result<Vec<String>, String> {
+    if let Some(cols) = explicit {
+        return Ok(cols.clone());
+    }
+    let names = |db: &Database| {
+        db.table(table)
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+    };
+    let cols = match &session.tx {
+        Some(tx) => names(&tx.db),
+        None => names(&shared.db.lock().expect("db mutex poisoned")),
+    };
+    cols.ok_or_else(|| format!("relation \"{table}\" does not exist"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_to_stdout<W: Write>(
+    w: &mut W,
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+    columns: &[String],
+    delimiter: char,
+    null_marker: &str,
+) -> io::Result<Result<(), String>> {
+    // Reuse the SELECT path so transaction visibility and projection are exact.
+    let col_list = columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {col_list} FROM {}", copy.table);
+    let stmt = match Parser::parse_sql(&sql) {
+        Ok(mut s) if !s.is_empty() => s.remove(0),
+        Ok(_) => return Ok(Err("COPY TO produced no query".into())),
+        Err(e) => return Ok(Err(e)),
+    };
+    let rows = match run_statement(shared, session, &stmt) {
+        Ok(ExecResult::Rows { rows, .. }) => rows,
+        Ok(_) => return Ok(Err("COPY TO source did not return rows".into())),
+        Err(e) => return Ok(Err(e)),
+    };
+
+    // CopyOutResponse: text format (0), one format code per column.
+    let mut hdr = MessageBuilder::new(b'H');
+    hdr.put_u8(0);
+    hdr.put_i16(columns.len() as i16);
+    for _ in columns {
+        hdr.put_i16(0);
+    }
+    w.write_all(&hdr.finish())?;
+
+    let csv = copy.format == CopyFormat::Csv;
+    if copy.header && csv {
+        let line = columns
+            .iter()
+            .map(|c| encode_copy_field(Some(c), delimiter, null_marker, csv))
+            .collect::<Vec<_>>()
+            .join(&delimiter.to_string());
+        send_copy_data(w, &format!("{line}\n"))?;
+    }
+    for row in &rows {
+        let line = row
+            .iter()
+            .map(|v| {
+                let text = if v.is_null() { None } else { v.to_text() };
+                encode_copy_field(text.as_deref(), delimiter, null_marker, csv)
+            })
+            .collect::<Vec<_>>()
+            .join(&delimiter.to_string());
+        send_copy_data(w, &format!("{line}\n"))?;
+    }
+    send_simple(w, b'c')?; // CopyDone
+    send_command_complete(w, &format!("COPY {}", rows.len()))?;
+    Ok(Ok(()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_from_stdin<R: Read, W: Write>(
+    reader: &mut R,
+    w: &mut W,
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+    columns: &[String],
+    delimiter: char,
+    null_marker: &str,
+) -> io::Result<Result<(), String>> {
+    // CopyInResponse, then flush so the client starts streaming.
+    let mut g = MessageBuilder::new(b'G');
+    g.put_u8(0);
+    g.put_i16(columns.len() as i16);
+    for _ in columns {
+        g.put_i16(0);
+    }
+    w.write_all(&g.finish())?;
+    w.flush()?;
+
+    // Accumulate all CopyData until CopyDone, then apply as inserts.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match read_message(reader)? {
+            Some(FrontendMessage::CopyData(chunk)) => buf.extend_from_slice(&chunk),
+            Some(FrontendMessage::CopyDone) => break,
+            Some(FrontendMessage::CopyFail(msg)) => {
+                return Ok(Err(format!("COPY from stdin failed: {msg}")));
+            }
+            Some(FrontendMessage::Flush) => {}
+            // A clean EOF or Terminate mid-COPY ends the connection.
+            None | Some(FrontendMessage::Terminate) => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "COPY interrupted"));
+            }
+            Some(_) => {
+                return Ok(Err("unexpected message during COPY FROM STDIN".into()));
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let csv = copy.format == CopyFormat::Csv;
+    let mut count: usize = 0;
+    let mut first = true;
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        // Text-format end-of-data marker.
+        if !csv && line == "\\." {
+            break;
+        }
+        // A trailing newline yields one empty final segment; skip it.
+        if line.is_empty() && raw_line.is_empty() {
+            continue;
+        }
+        if first && copy.header {
+            first = false;
+            continue;
+        }
+        first = false;
+
+        let fields = if csv {
+            parse_csv_line(line, delimiter, null_marker)
+        } else {
+            parse_text_line(line, delimiter, null_marker)
+        };
+        let stmt = Statement::Insert(Insert {
+            table: copy.table.clone(),
+            columns: copy.columns.clone(),
+            default_values: false,
+            overriding_system_value: false,
+            rows: vec![
+                fields
+                    .into_iter()
+                    .map(|f| match f {
+                        Some(s) => Expr::Str(s),
+                        None => Expr::Null,
+                    })
+                    .collect(),
+            ],
+            select: None,
+            on_conflict: None,
+            returning: Vec::new(),
+        });
+        if let Err(e) = run_statement(shared, session, &stmt) {
+            return Ok(Err(e));
+        }
+        count += 1;
+    }
+
+    send_command_complete(w, &format!("COPY {count}"))?;
+    Ok(Ok(()))
+}
+
+/// Send one CopyData (`'d'`) message carrying a formatted row.
+fn send_copy_data<W: Write>(w: &mut W, line: &str) -> io::Result<()> {
+    let mut b = MessageBuilder::new(b'd');
+    b.put_bytes(line.as_bytes());
+    w.write_all(&b.finish())
+}
+
+/// Format one output field for COPY (text or CSV).
+fn encode_copy_field(value: Option<&str>, delimiter: char, null_marker: &str, csv: bool) -> String {
+    let Some(s) = value else {
+        return null_marker.to_string();
+    };
+    if csv {
+        // Quote if the field contains the delimiter, a quote, or a newline.
+        if s.contains(delimiter) || s.contains('"') || s.contains('\n') || s.contains('\r') {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    } else {
+        // Text format: escape backslash and control characters.
+        s.replace('\\', "\\\\")
+            .replace('\t', "\\t")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    }
+}
+
+/// Parse a text-format COPY line into per-column fields.
+fn parse_text_line(line: &str, delimiter: char, null_marker: &str) -> Vec<Option<String>> {
+    line.split(delimiter)
+        .map(|tok| {
+            if tok == null_marker {
+                None
+            } else {
+                Some(unescape_text_field(tok))
+            }
+        })
+        .collect()
+}
+
+fn unescape_text_field(tok: &str) -> String {
+    let mut out = String::with_capacity(tok.len());
+    let mut chars = tok.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parse a CSV-format COPY line, honoring double-quoted fields.
+fn parse_csv_line(line: &str, delimiter: char, null_marker: &str) -> Vec<Option<String>> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut was_quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+            was_quoted = true;
+        } else if c == delimiter {
+            fields.push(finish_csv_field(&cur, was_quoted, null_marker));
+            cur.clear();
+            was_quoted = false;
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(finish_csv_field(&cur, was_quoted, null_marker));
+    fields
+}
+
+fn finish_csv_field(value: &str, was_quoted: bool, null_marker: &str) -> Option<String> {
+    if !was_quoted && value == null_marker {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 // --- extended query protocol -------------------------------------------------
@@ -292,7 +806,13 @@ fn handle_parse<W: Write>(
 ) -> io::Result<()> {
     match Parser::parse_sql(&query) {
         Ok(statements) => {
-            session.prepared.insert(name, Prepared { statements, param_oids });
+            session.prepared.insert(
+                name,
+                Prepared {
+                    statements,
+                    param_oids,
+                },
+            );
             send_simple(w, b'1') // ParseComplete
         }
         Err(e) => {
@@ -314,7 +834,11 @@ fn handle_bind<W: Write>(
     result_formats: Vec<i16>,
 ) -> io::Result<()> {
     let Some(prepared) = session.prepared.get(&statement) else {
-        send_error(w, "26000", &format!("prepared statement \"{statement}\" does not exist"))?;
+        send_error(
+            w,
+            "26000",
+            &format!("prepared statement \"{statement}\" does not exist"),
+        )?;
         session.skip_until_sync = true;
         return Ok(());
     };
@@ -344,7 +868,13 @@ fn handle_bind<W: Write>(
         }
     }
 
-    session.portals.insert(portal, Portal { statements, result_formats });
+    session.portals.insert(
+        portal,
+        Portal {
+            statements,
+            result_formats,
+        },
+    );
     send_simple(w, b'2') // BindComplete
 }
 
@@ -358,7 +888,11 @@ fn handle_describe<W: Write>(
     if kind == b'S' {
         // Statement: ParameterDescription, then RowDescription or NoData.
         let Some(prepared) = session.prepared.get(name) else {
-            send_error(w, "26000", &format!("prepared statement \"{name}\" does not exist"))?;
+            send_error(
+                w,
+                "26000",
+                &format!("prepared statement \"{name}\" does not exist"),
+            )?;
             session.skip_until_sync = true;
             return Ok(());
         };
@@ -408,7 +942,11 @@ fn handle_execute<W: Write>(
     _max_rows: i32,
 ) -> io::Result<()> {
     let Some(portal) = session.portals.get(portal_name) else {
-        send_error(w, "34000", &format!("portal \"{portal_name}\" does not exist"))?;
+        send_error(
+            w,
+            "34000",
+            &format!("portal \"{portal_name}\" does not exist"),
+        )?;
         session.skip_until_sync = true;
         return Ok(());
     };
@@ -420,10 +958,20 @@ fn handle_execute<W: Write>(
             send_simple(w, b'I')?; // EmptyQueryResponse
             continue;
         }
+        if let Err(e) = check_canceled(session) {
+            send_error(w, sqlstate_for(&e), &e)?;
+            mark_error(session);
+            session.skip_until_sync = true;
+            return Ok(());
+        }
         let result = run_statement(shared, session, stmt);
         match result {
-            Ok(res) => send_execute_result(w, res, &formats)?,
+            Ok(res) => {
+                flush_notices(w, session)?;
+                send_execute_result(w, res, &formats)?;
+            }
             Err(e) => {
+                flush_notices(w, session)?;
                 send_error(w, sqlstate_for(&e), &e)?;
                 mark_error(session);
                 session.skip_until_sync = true;
@@ -453,11 +1001,65 @@ fn run_statement(
         Statement::Begin => {
             if session.tx.is_none() {
                 let snapshot = shared.db.lock().expect("db mutex poisoned").clone();
-                session.tx = Some(Transaction { db: snapshot, buffered: Vec::new(), failed: false });
+                session.tx = Some(Transaction {
+                    db: snapshot,
+                    buffered: Vec::new(),
+                    savepoints: Vec::new(),
+                    failed: false,
+                });
                 session.tx_status = b'T';
+            } else {
+                // A nested BEGIN is a no-op; PostgreSQL emits a warning.
+                session.notices.push(Notice {
+                    severity: "WARNING",
+                    code: "25001",
+                    message: "there is already a transaction in progress".into(),
+                });
             }
-            // A nested BEGIN is a no-op warning in PostgreSQL; we stay in-tx.
             Ok(ExecResult::Command("BEGIN".into()))
+        }
+        Statement::Listen { channel } => {
+            let mut listeners = shared.listeners.lock().expect("listeners mutex");
+            let pids = listeners.entry(channel.clone()).or_default();
+            if !pids.contains(&session.pid) {
+                pids.push(session.pid);
+            }
+            Ok(ExecResult::Command("LISTEN".into()))
+        }
+        Statement::Unlisten { channel } => {
+            let mut listeners = shared.listeners.lock().expect("listeners mutex");
+            match channel {
+                Some(channel) => {
+                    if let Some(pids) = listeners.get_mut(channel) {
+                        pids.retain(|p| *p != session.pid);
+                    }
+                }
+                None => listeners
+                    .values_mut()
+                    .for_each(|pids| pids.retain(|p| *p != session.pid)),
+            }
+            Ok(ExecResult::Command("UNLISTEN".into()))
+        }
+        Statement::Notify { channel, payload } => {
+            let note = Notification {
+                sender_pid: session.pid,
+                channel: channel.clone(),
+                payload: payload.clone().unwrap_or_default(),
+            };
+            let listeners = shared.listeners.lock().expect("listeners mutex");
+            let backends = shared.backends.lock().expect("backends mutex");
+            if let Some(pids) = listeners.get(channel) {
+                for pid in pids {
+                    if let Some(handle) = backends.get(pid) {
+                        handle
+                            .notifications
+                            .lock()
+                            .expect("notifications mutex")
+                            .push(note.clone());
+                    }
+                }
+            }
+            Ok(ExecResult::Command("NOTIFY".into()))
         }
         Statement::Commit => match session.tx.take() {
             Some(tx) if tx.failed => {
@@ -478,11 +1080,66 @@ fn run_statement(
                 session.tx_status = b'I';
                 Ok(ExecResult::Command("COMMIT".into()))
             }
-            None => Ok(ExecResult::Command("COMMIT".into())),
+            None => {
+                session.notices.push(Notice {
+                    severity: "WARNING",
+                    code: "25P01",
+                    message: "there is no transaction in progress".into(),
+                });
+                Ok(ExecResult::Command("COMMIT".into()))
+            }
         },
         Statement::Rollback => {
-            session.tx = None;
+            if session.tx.take().is_none() {
+                session.notices.push(Notice {
+                    severity: "WARNING",
+                    code: "25P01",
+                    message: "there is no transaction in progress".into(),
+                });
+            }
             session.tx_status = b'I';
+            Ok(ExecResult::Command("ROLLBACK".into()))
+        }
+        Statement::Savepoint { name } => {
+            let tx = session
+                .tx
+                .as_mut()
+                .ok_or_else(|| "SAVEPOINT can only be used in transaction blocks".to_string())?;
+            tx.savepoints.retain(|sp| sp.name != *name);
+            tx.savepoints.push(Savepoint {
+                name: name.clone(),
+                db: tx.db.clone(),
+                buffered_len: tx.buffered.len(),
+            });
+            Ok(ExecResult::Command("SAVEPOINT".into()))
+        }
+        Statement::ReleaseSavepoint { name } => {
+            let tx = session.tx.as_mut().ok_or_else(|| {
+                "RELEASE SAVEPOINT can only be used in transaction blocks".to_string()
+            })?;
+            let pos = tx
+                .savepoints
+                .iter()
+                .rposition(|sp| sp.name == *name)
+                .ok_or_else(|| format!("savepoint \"{name}\" does not exist"))?;
+            tx.savepoints.truncate(pos);
+            Ok(ExecResult::Command("RELEASE".into()))
+        }
+        Statement::RollbackToSavepoint { name } => {
+            let tx = session.tx.as_mut().ok_or_else(|| {
+                "ROLLBACK TO SAVEPOINT can only be used in transaction blocks".to_string()
+            })?;
+            let pos = tx
+                .savepoints
+                .iter()
+                .rposition(|sp| sp.name == *name)
+                .ok_or_else(|| format!("savepoint \"{name}\" does not exist"))?;
+            let sp = &tx.savepoints[pos];
+            tx.db = sp.db.clone();
+            tx.buffered.truncate(sp.buffered_len);
+            tx.savepoints.truncate(pos + 1);
+            tx.failed = false;
+            session.tx_status = b'T';
             Ok(ExecResult::Command("ROLLBACK".into()))
         }
         _ if session.tx.is_some() => {
@@ -568,17 +1225,59 @@ fn replay(db: &mut Database, contents: &str) -> usize {
 
 /// Whether a statement changes persistent state and must be logged.
 fn is_mutation(stmt: &Statement) -> bool {
-    matches!(
-        stmt,
+    match stmt {
         Statement::CreateTable(_)
-            | Statement::DropTable(_)
-            | Statement::AlterTable(_)
-            | Statement::CreateIndex(_)
-            | Statement::DropIndex(_)
-            | Statement::Insert(_)
-            | Statement::Update(_)
-            | Statement::Delete(_)
-    )
+        | Statement::CreateExtension(_)
+        | Statement::CreateRole(_)
+        | Statement::CreateSequence(_)
+        | Statement::CreateSchema(_)
+        | Statement::CreateDatabase(_)
+        | Statement::CreateTablespace(_)
+        | Statement::CreateCollation(_)
+        | Statement::CreateType(_)
+        | Statement::CreateDomain(_)
+        | Statement::CreateView(_)
+        | Statement::CreateMaterializedView(_)
+        | Statement::CreateFunction(_)
+        | Statement::CreateTrigger(_)
+        | Statement::CreateRule(_)
+        | Statement::CreateAggregate(_)
+        | Statement::DropFunction(_)
+        | Statement::DropTrigger(_)
+        | Statement::DropRule(_)
+        | Statement::DropAggregate(_)
+        | Statement::DropTable(_)
+        | Statement::DropExtension(_)
+        | Statement::DropRole(_)
+        | Statement::DropSequence(_)
+        | Statement::DropSchema(_)
+        | Statement::DropDatabase(_)
+        | Statement::DropTablespace(_)
+        | Statement::DropCollation(_)
+        | Statement::DropType(_)
+        | Statement::DropDomain(_)
+        | Statement::DropView(_)
+        | Statement::DropMaterializedView(_)
+        | Statement::RefreshMaterializedView(_)
+        | Statement::AlterTable(_)
+        | Statement::AlterRole(_)
+        | Statement::AlterSequence(_)
+        | Statement::SecurityLabel(_)
+        | Statement::AlterSystem(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::Comment(_)
+        | Statement::Grant(_)
+        | Statement::Revoke(_)
+        | Statement::Insert(_)
+        | Statement::Truncate(_)
+        | Statement::AlterDatabase(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Merge(_) => true,
+        Statement::Explain(e) if e.analyze => is_mutation(&e.statement),
+        _ => false,
+    }
 }
 
 // --- result serialization ----------------------------------------------------
@@ -705,6 +1404,95 @@ fn send_authentication_ok<W: Write>(w: &mut W) -> io::Result<()> {
     w.write_all(&b.finish())
 }
 
+/// Dispatch to the configured authentication method and return whether the
+/// client successfully authenticated. `Ok(false)` means the caller should send
+/// an ErrorResponse (28P01) and close the connection.
+///
+/// Method selection (`PGRS_AUTH_METHOD`):
+/// - unset: legacy behavior — SCRAM if `PGRS_PASSWORD` is set and non-empty,
+///   otherwise trust (no challenge).
+/// - `trust`:    accept immediately, no challenge.
+/// - `password`: AuthenticationCleartextPassword, compare to `PGRS_PASSWORD`.
+/// - `md5`:      AuthenticationMD5Password, compare the salted MD5 digest.
+/// - `scram`:    SCRAM-SHA-256 against `PGRS_PASSWORD`.
+fn authenticate<R: io::Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    username: &str,
+) -> io::Result<bool> {
+    let method = std::env::var("PGRS_AUTH_METHOD")
+        .ok()
+        .filter(|m| !m.is_empty());
+    let password = std::env::var("PGRS_PASSWORD").ok().unwrap_or_default();
+
+    match method.as_deref() {
+        // Legacy default: SCRAM when a password is configured, else trust.
+        None => {
+            if !password.is_empty() {
+                scram_authenticate(reader, writer, &password)
+            } else {
+                Ok(true)
+            }
+        }
+        Some("trust") => Ok(true),
+        Some("password") => cleartext_authenticate(reader, writer, &password),
+        Some("md5") => md5_authenticate(reader, writer, &password, username),
+        Some("scram") => scram_authenticate(reader, writer, &password),
+        // An unrecognized value is treated as trust rather than locking out.
+        Some(_) => Ok(true),
+    }
+}
+
+/// Run a cleartext password exchange (AuthenticationCleartextPassword, code 3).
+/// The client replies with a 'p' message carrying a NUL-terminated password.
+fn cleartext_authenticate<R: io::Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    expected: &str,
+) -> io::Result<bool> {
+    let mut b = MessageBuilder::new(b'R');
+    b.put_i32(3);
+    writer.write_all(&b.finish())?;
+    writer.flush()?;
+
+    let Some(FrontendMessage::Password(body)) = read_message(reader)? else {
+        return Ok(false);
+    };
+    Ok(strip_nul(&body) == expected.as_bytes())
+}
+
+/// Run an MD5 password exchange (AuthenticationMD5Password, code 5). The 4-byte
+/// salt is derived from the existing non-RNG `weak_secret()`/clock source.
+fn md5_authenticate<R: io::Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    password: &str,
+    username: &str,
+) -> io::Result<bool> {
+    let salt = weak_secret().to_be_bytes(); // 4 bytes
+
+    let mut b = MessageBuilder::new(b'R');
+    b.put_i32(5);
+    b.put_bytes(&salt);
+    writer.write_all(&b.finish())?;
+    writer.flush()?;
+
+    // The client replies with a NUL-terminated "md5<hex>" string.
+    let Some(FrontendMessage::Password(body)) = read_message(reader)? else {
+        return Ok(false);
+    };
+    let expected = crate::auth::md5_password_digest(password, username, &salt);
+    Ok(strip_nul(&body) == expected.as_bytes())
+}
+
+/// Strip a single trailing NUL terminator from a password message body.
+fn strip_nul(body: &[u8]) -> &[u8] {
+    match body.strip_suffix(&[0]) {
+        Some(s) => s,
+        None => body,
+    }
+}
+
 /// Run a SCRAM-SHA-256 exchange. Returns `Ok(true)` if the client proved the
 /// password, `Ok(false)` if authentication failed (caller reports the error).
 fn scram_authenticate<R: io::Read, W: Write>(
@@ -775,8 +1563,9 @@ fn parse_sasl_initial(body: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn send_initial_parameters<W: Write>(w: &mut W) -> io::Result<()> {
+    let version = server_version();
     let params = [
-        ("server_version", "16.0 (postgres-rs 0.1.0)"),
+        ("server_version", version.as_str()),
         ("server_encoding", "UTF8"),
         ("client_encoding", "UTF8"),
         ("DateStyle", "ISO, MDY"),
@@ -864,6 +1653,8 @@ fn sqlstate_for(msg: &str) -> &'static str {
         "42601"
     } else if msg.contains("invalid input syntax") || msg.contains("cannot coerce") {
         "22P02"
+    } else if msg.contains("canceling statement") {
+        "57014" // query_canceled
     } else {
         "XX000" // internal_error
     }
@@ -884,7 +1675,17 @@ mod tests {
 
     /// A `Shared` with no WAL (in-memory), for exercising `run_statement`.
     fn shared() -> Shared {
-        Shared { db: Mutex::new(Database::new()), wal: Mutex::new(None) }
+        Shared {
+            db: Mutex::new(Database::new()),
+            wal: Mutex::new(None),
+            backends: Mutex::new(HashMap::new()),
+            listeners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A bare session with dummy cancellation/notification handles.
+    fn new_session() -> Session {
+        Session::new(1, Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())))
     }
 
     fn run(shared: &Shared, session: &mut Session, sql: &str) -> Result<(), String> {
@@ -899,13 +1700,19 @@ mod tests {
 
     /// Number of rows in `t` in the shared (committed) database.
     fn committed_rows(shared: &Shared) -> usize {
-        shared.db.lock().unwrap().table("t").map(|t| t.rows.len()).unwrap_or(0)
+        shared
+            .db
+            .lock()
+            .unwrap()
+            .table("t")
+            .map(|t| t.rows.len())
+            .unwrap_or(0)
     }
 
     #[test]
     fn rollback_undoes_changes() {
         let s = shared();
-        let mut sess = Session::new();
+        let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
         run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
         run(&s, &mut sess, "BEGIN").unwrap();
@@ -921,7 +1728,7 @@ mod tests {
     #[test]
     fn commit_publishes_changes() {
         let s = shared();
-        let mut sess = Session::new();
+        let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
         run(&s, &mut sess, "BEGIN").unwrap();
         run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
@@ -933,26 +1740,253 @@ mod tests {
     }
 
     #[test]
+    fn savepoint_rolls_back_to_named_snapshot() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
+        run(&s, &mut sess, "SAVEPOINT a").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (2)").unwrap();
+        run(&s, &mut sess, "SAVEPOINT b").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (3)").unwrap();
+        run(&s, &mut sess, "ROLLBACK TO SAVEPOINT a").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (4)").unwrap();
+        run(&s, &mut sess, "COMMIT").unwrap();
+
+        let rows = {
+            let mut db = s.db.lock().unwrap();
+            match executor::execute(
+                &mut db,
+                Parser::parse_sql("SELECT id FROM t ORDER BY id")
+                    .unwrap()
+                    .remove(0),
+            )
+            .unwrap()
+            {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => panic!("expected rows"),
+            }
+        };
+        assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
+    fn release_savepoint_removes_it() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        run(&s, &mut sess, "SAVEPOINT a").unwrap();
+        run(&s, &mut sess, "RELEASE SAVEPOINT a").unwrap();
+        let stmt = Parser::parse_sql("ROLLBACK TO SAVEPOINT a")
+            .unwrap()
+            .remove(0);
+        assert!(run_statement(&s, &mut sess, &stmt).is_err());
+        run(&s, &mut sess, "ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn error_aborts_transaction() {
         let s = shared();
-        let mut sess = Session::new();
+        let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
         run(&s, &mut sess, "BEGIN").unwrap();
         run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
 
         // A failing statement aborts the transaction.
-        let stmt = Parser::parse_sql("SELECT * FROM missing").unwrap().remove(0);
+        let stmt = Parser::parse_sql("SELECT * FROM missing")
+            .unwrap()
+            .remove(0);
         assert!(run_statement(&s, &mut sess, &stmt).is_err());
         mark_error(&mut sess);
         assert_eq!(sess.tx_status, b'E');
 
         // Subsequent statements are rejected until the block ends.
-        let stmt = Parser::parse_sql("INSERT INTO t VALUES (2)").unwrap().remove(0);
+        let stmt = Parser::parse_sql("INSERT INTO t VALUES (2)")
+            .unwrap()
+            .remove(0);
         assert!(run_statement(&s, &mut sess, &stmt).is_err());
 
         // COMMIT of an aborted transaction discards all of its work.
         run(&s, &mut sess, "COMMIT").unwrap();
         assert_eq!(committed_rows(&s), 0);
         assert_eq!(sess.tx_status, b'I');
+    }
+
+    /// Frame one frontend message (`[tag][len][body]`) for a fake client stream.
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend(((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn parse_copy(sql: &str) -> CopyStmt {
+        match Parser::parse_sql(sql).unwrap().remove(0) {
+            Statement::Copy(c) => c,
+            other => panic!("expected COPY, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_from_stdin_inserts_rows() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+
+        let mut input = Vec::new();
+        input.extend(frame(b'd', b"1\tAlice\n2\tBob\n"));
+        input.extend(frame(b'c', b"")); // CopyDone
+        let mut reader = std::io::Cursor::new(input);
+        let mut out = Vec::new();
+
+        let copy = parse_copy("COPY t FROM STDIN");
+        let res = run_copy(&mut reader, &mut out, &s, &mut sess, &copy).unwrap();
+        assert!(res.is_ok(), "copy failed: {res:?}");
+        assert_eq!(committed_rows(&s), 2);
+        // Server announced CopyInResponse and finished with a COPY tag.
+        assert_eq!(out[0], b'G');
+        assert!(window_contains(&out, b"COPY 2"));
+    }
+
+    #[test]
+    fn copy_from_stdin_csv_skips_header_and_handles_nulls() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+
+        let mut input = Vec::new();
+        input.extend(frame(b'd', b"id,name\n1,\"Alice, A\"\n2,\n"));
+        input.extend(frame(b'c', b""));
+        let mut reader = std::io::Cursor::new(input);
+        let mut out = Vec::new();
+
+        let copy = parse_copy("COPY t FROM STDIN WITH (FORMAT csv, HEADER)");
+        run_copy(&mut reader, &mut out, &s, &mut sess, &copy)
+            .unwrap()
+            .unwrap();
+
+        let rows = {
+            let mut db = s.db.lock().unwrap();
+            match executor::execute(
+                &mut db,
+                Parser::parse_sql("SELECT id, name FROM t ORDER BY id")
+                    .unwrap()
+                    .remove(0),
+            )
+            .unwrap()
+            {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => panic!("expected rows"),
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("Alice, A".into())],
+                vec![Value::Int(2), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_to_stdout_streams_rows() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        let copy = parse_copy("COPY t TO STDOUT");
+        run_copy(&mut reader, &mut out, &s, &mut sess, &copy)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(out[0], b'H'); // CopyOutResponse
+        assert!(window_contains(&out, b"1\tAlice"));
+        assert!(window_contains(&out, b"2\tBob"));
+        assert!(window_contains(&out, b"COPY 2"));
+    }
+
+    #[test]
+    fn notify_reaches_a_listening_backend() {
+        let s = shared();
+        // Register a listener backend (pid 1) with its own notification queue.
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        s.backends.lock().unwrap().insert(
+            1,
+            BackendHandle {
+                secret: 0,
+                cancel: Arc::new(AtomicBool::new(false)),
+                notifications: Arc::clone(&queue),
+            },
+        );
+        let mut listener = Session::new(1, Arc::new(AtomicBool::new(false)), Arc::clone(&queue));
+        run(&s, &mut listener, "LISTEN chan").unwrap();
+
+        // A different backend (pid 2) fires the notification.
+        let mut notifier = Session::new(
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        run(&s, &mut notifier, "NOTIFY chan, 'hello'").unwrap();
+
+        let delivered = queue.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].channel, "chan");
+        assert_eq!(delivered[0].payload, "hello");
+        assert_eq!(delivered[0].sender_pid, 2);
+    }
+
+    #[test]
+    fn unlisten_stops_delivery() {
+        let s = shared();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        s.backends.lock().unwrap().insert(
+            1,
+            BackendHandle {
+                secret: 0,
+                cancel: Arc::new(AtomicBool::new(false)),
+                notifications: Arc::clone(&queue),
+            },
+        );
+        let mut sess = Session::new(1, Arc::new(AtomicBool::new(false)), Arc::clone(&queue));
+        run(&s, &mut sess, "LISTEN chan").unwrap();
+        run(&s, &mut sess, "UNLISTEN chan").unwrap();
+        run(&s, &mut sess, "NOTIFY chan").unwrap();
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_begin_and_stray_commit_emit_warnings() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        let stmt = Parser::parse_sql("BEGIN").unwrap().remove(0);
+        run_statement(&s, &mut sess, &stmt).unwrap();
+        assert!(sess.notices.iter().any(|n| n.code == "25001"));
+
+        sess.notices.clear();
+        run(&s, &mut sess, "COMMIT").unwrap();
+        let stmt = Parser::parse_sql("COMMIT").unwrap().remove(0);
+        run_statement(&s, &mut sess, &stmt).unwrap();
+        assert!(sess.notices.iter().any(|n| n.code == "25P01"));
+    }
+
+    #[test]
+    fn cancel_flag_is_consumed_and_reports_error() {
+        let sess = new_session();
+        sess.cancel.store(true, Ordering::SeqCst);
+        assert!(check_canceled(&sess).is_err());
+        // The flag is cleared so a later statement is not spuriously canceled.
+        assert!(!sess.cancel.load(Ordering::SeqCst));
+        assert!(check_canceled(&sess).is_ok());
+    }
+
+    fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

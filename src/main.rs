@@ -21,7 +21,9 @@ use std::process::ExitCode;
 use postgres_rs::server;
 
 fn main() -> ExitCode {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:5432".to_string());
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:5432".to_string());
     let data_dir = std::env::var("PGRS_DATA").ok();
 
     match server::run(&addr, data_dir) {

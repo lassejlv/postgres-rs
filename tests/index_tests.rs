@@ -31,14 +31,22 @@ fn rows(res: ExecResult) -> Vec<Vec<Value>> {
 /// Populate a fresh products table with `n` rows: id (1..=n), category cycling
 /// through a few values, and price = id * 3 % 1000.
 fn seed_products(db: &mut Database, n: i64) {
-    run(db, "CREATE TABLE products (id integer PRIMARY KEY, category text, price integer)");
+    run(
+        db,
+        "CREATE TABLE products (id integer PRIMARY KEY, category text, price integer)",
+    );
     let cats = ["a", "b", "c", "d"];
     let mut sql = String::from("INSERT INTO products VALUES ");
     for i in 1..=n {
         if i > 1 {
             sql.push(',');
         }
-        sql.push_str(&format!("({}, '{}', {})", i, cats[(i as usize) % cats.len()], (i * 3) % 1000));
+        sql.push_str(&format!(
+            "({}, '{}', {})",
+            i,
+            cats[(i as usize) % cats.len()],
+            (i * 3) % 1000
+        ));
     }
     run(db, &sql);
 }
@@ -65,30 +73,74 @@ fn assert_same(unindexed: &mut Database, indexed: &mut Database, query: &str) {
 #[test]
 fn point_lookup_matches_scan() {
     let (mut u, mut i) = paired(500, Some("CREATE INDEX idx_price ON products (price)"));
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 300 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 300 ORDER BY id",
+    );
     // Reversed operand order must use the index too.
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE 300 = price ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE 300 = price ORDER BY id",
+    );
     // A value with no match returns nothing on both paths.
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 999999");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 999999",
+    );
 }
 
 #[test]
 fn primary_key_autoindex_matches_scan() {
     // No explicit index: the PRIMARY KEY index is auto-created on `id`.
     let (mut u, mut i) = paired(500, None);
-    assert_same(&mut u, &mut i, "SELECT id, category FROM products WHERE id = 250");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id IN (1, 100, 250, 9999) ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id BETWEEN 10 AND 20 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id, category FROM products WHERE id = 250",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE id IN (1, 100, 250, 9999) ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE id BETWEEN 10 AND 20 ORDER BY id",
+    );
 }
 
 #[test]
 fn range_and_between_match_scan() {
     let (mut u, mut i) = paired(500, Some("CREATE INDEX idx_price ON products (price)"));
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price < 50 ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price <= 50 ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price > 950 ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price >= 950 ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price BETWEEN 100 AND 200 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price < 50 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price <= 50 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price > 950 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price >= 950 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price BETWEEN 100 AND 200 ORDER BY id",
+    );
     // Combined with an extra predicate the index can't cover: still correct.
     assert_same(
         &mut u,
@@ -100,20 +152,46 @@ fn range_and_between_match_scan() {
 #[test]
 fn in_list_matches_scan() {
     let (mut u, mut i) = paired(300, Some("CREATE INDEX idx_cat ON products (category)"));
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE category IN ('a', 'c') ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT count(*) FROM products WHERE category = 'b'");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category IN ('a', 'c') ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT count(*) FROM products WHERE category = 'b'",
+    );
 }
 
 #[test]
 fn update_keeps_index_consistent() {
     let (mut u, mut i) = paired(200, Some("CREATE INDEX idx_price ON products (price)"));
     // Change indexed values; the index must follow.
-    run(&mut u, "UPDATE products SET price = price + 1000 WHERE id <= 50");
-    run(&mut i, "UPDATE products SET price = price + 1000 WHERE id <= 50");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price >= 1000 ORDER BY id");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 1003 ORDER BY id");
+    run(
+        &mut u,
+        "UPDATE products SET price = price + 1000 WHERE id <= 50",
+    );
+    run(
+        &mut i,
+        "UPDATE products SET price = price + 1000 WHERE id <= 50",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price >= 1000 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 1003 ORDER BY id",
+    );
     // The old key must no longer resolve to the moved rows.
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price = 3 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 3 ORDER BY id",
+    );
 }
 
 #[test]
@@ -121,7 +199,11 @@ fn delete_keeps_index_consistent() {
     let (mut u, mut i) = paired(200, Some("CREATE INDEX idx_price ON products (price)"));
     run(&mut u, "DELETE FROM products WHERE price < 100");
     run(&mut i, "DELETE FROM products WHERE price < 100");
-    assert_same(&mut u, &mut i, "SELECT id FROM products WHERE price < 200 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price < 200 ORDER BY id",
+    );
     assert_same(&mut u, &mut i, "SELECT count(*) FROM products");
     // Deleted rows are gone from point lookups too.
     assert_same(&mut u, &mut i, "SELECT id FROM products WHERE id = 1");
@@ -133,15 +215,25 @@ fn indexed_join_matches_scan() {
     let mut i = Database::new();
     for db in [&mut u, &mut i] {
         run(db, "CREATE TABLE users (id integer PRIMARY KEY, name text)");
-        run(db, "CREATE TABLE orders (id integer, user_id integer, amount integer)");
-        run(db, "INSERT INTO users VALUES (1,'Alice'),(2,'Bob'),(3,'Carol')");
-        run(db, "INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,200),(13,3,75)");
+        run(
+            db,
+            "CREATE TABLE orders (id integer, user_id integer, amount integer)",
+        );
+        run(
+            db,
+            "INSERT INTO users VALUES (1,'Alice'),(2,'Bob'),(3,'Carol')",
+        );
+        run(
+            db,
+            "INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,200),(13,3,75)",
+        );
     }
     // users.id is the PK index; the join probes it per order row.
     let q = "SELECT u.name, o.amount FROM orders o INNER JOIN users u ON u.id = o.user_id ORDER BY o.amount";
     assert_same(&mut u, &mut i, q);
     // LEFT join with the indexed side as the inner table.
-    let q2 = "SELECT o.amount, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id ORDER BY o.id";
+    let q2 =
+        "SELECT o.amount, u.name FROM orders o LEFT JOIN users u ON u.id = o.user_id ORDER BY o.id";
     assert_same(&mut u, &mut i, q2);
 }
 
@@ -150,9 +242,15 @@ fn drop_index_falls_back_to_scan() {
     let mut db = Database::new();
     seed_products(&mut db, 100);
     run(&mut db, "CREATE INDEX idx_price ON products (price)");
-    let before = rows(run(&mut db, "SELECT id FROM products WHERE price = 30 ORDER BY id"));
+    let before = rows(run(
+        &mut db,
+        "SELECT id FROM products WHERE price = 30 ORDER BY id",
+    ));
     run(&mut db, "DROP INDEX idx_price");
-    let after = rows(run(&mut db, "SELECT id FROM products WHERE price = 30 ORDER BY id"));
+    let after = rows(run(
+        &mut db,
+        "SELECT id FROM products WHERE price = 30 ORDER BY id",
+    ));
     assert_eq!(before, after, "dropping the index must not change results");
 }
 
@@ -173,9 +271,15 @@ fn index_survives_wal_replay() {
             }
         }
     };
-    apply(&mut original, "CREATE TABLE t (id integer PRIMARY KEY, v integer)");
+    apply(
+        &mut original,
+        "CREATE TABLE t (id integer PRIMARY KEY, v integer)",
+    );
     apply(&mut original, "CREATE INDEX idx_v ON t (v)");
-    apply(&mut original, "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,20)");
+    apply(
+        &mut original,
+        "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,20)",
+    );
     apply(&mut original, "UPDATE t SET v = 99 WHERE id = 1");
     apply(&mut original, "DELETE FROM t WHERE id = 3");
 
@@ -204,10 +308,270 @@ fn create_index_round_trips_through_serialize() {
     let reparsed = Parser::parse_sql(&sql).unwrap().into_iter().next().unwrap();
     assert_eq!(stmt, reparsed, "CREATE INDEX did not round-trip: {sql}");
 
-    let stmt = Parser::parse_sql("DROP INDEX IF EXISTS my_idx").unwrap().into_iter().next().unwrap();
+    let stmt = Parser::parse_sql("DROP INDEX IF EXISTS my_idx")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     let sql = statement_to_sql(&stmt);
     let reparsed = Parser::parse_sql(&sql).unwrap().into_iter().next().unwrap();
     assert_eq!(stmt, reparsed, "DROP INDEX did not round-trip: {sql}");
+}
+
+#[test]
+fn multi_column_index_full_key_matches_scan() {
+    // products has (id, category, price); index on (category, price).
+    let (mut u, mut i) = paired(
+        400,
+        Some("CREATE INDEX idx_cat_price ON products (category, price)"),
+    );
+    // Full-key equality must use the multi-column index and match the scan.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'a' AND price = 12 ORDER BY id",
+    );
+    // Operand order and conjunct order shouldn't matter.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 12 AND 'a' = category ORDER BY id",
+    );
+    // Leading-prefix equality (only the first key column).
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'b' ORDER BY id",
+    );
+    // Extra non-indexable conjunct is re-checked correctly.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'c' AND price > 100 ORDER BY id",
+    );
+    // A non-matching full key returns nothing.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'a' AND price = 999999",
+    );
+}
+
+#[test]
+fn multi_column_index_consistent_after_mutations() {
+    let (mut u, mut i) = paired(
+        200,
+        Some("CREATE INDEX idx_cat_price ON products (category, price)"),
+    );
+    run(&mut u, "UPDATE products SET category = 'z' WHERE id <= 40");
+    run(&mut i, "UPDATE products SET category = 'z' WHERE id <= 40");
+    run(&mut u, "DELETE FROM products WHERE price < 50");
+    run(&mut i, "DELETE FROM products WHERE price < 50");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'z' ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE category = 'a' AND price = 600 ORDER BY id",
+    );
+}
+
+#[test]
+fn hash_index_equality_matches_scan() {
+    let (mut u, mut i) = paired(
+        400,
+        Some("CREATE INDEX idx_price_h ON products USING hash (price)"),
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 300 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE 300 = price ORDER BY id",
+    );
+    // No match.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 999999",
+    );
+    // Range query on a hash index must fall back to a scan and stay correct.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price > 950 ORDER BY id",
+    );
+    // Mutations keep the hash index consistent.
+    run(&mut u, "UPDATE products SET price = 7 WHERE id = 5");
+    run(&mut i, "UPDATE products SET price = 7 WHERE id = 5");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 7 ORDER BY id",
+    );
+}
+
+#[test]
+fn expression_index_matches_scan() {
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(db, "CREATE TABLE people (id integer PRIMARY KEY, name text)");
+        run(
+            db,
+            "INSERT INTO people VALUES (1,'Alice'),(2,'BOB'),(3,'alice'),(4,'Carol'),(5,'bob')",
+        );
+    }
+    run(
+        &mut i,
+        "CREATE INDEX idx_lower_name ON people ((lower(name)))",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM people WHERE lower(name) = 'alice' ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM people WHERE lower(name) = 'bob' ORDER BY id",
+    );
+    // Update changes the expression key; index must follow.
+    run(&mut u, "UPDATE people SET name = 'ALICE' WHERE id = 4");
+    run(&mut i, "UPDATE people SET name = 'ALICE' WHERE id = 4");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM people WHERE lower(name) = 'alice' ORDER BY id",
+    );
+}
+
+#[test]
+fn partial_index_matches_scan() {
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(
+            db,
+            "CREATE TABLE tasks (id integer PRIMARY KEY, active boolean, owner integer)",
+        );
+        run(
+            db,
+            "INSERT INTO tasks VALUES (1,true,10),(2,false,10),(3,true,20),(4,true,10),(5,false,20)",
+        );
+    }
+    run(
+        &mut i,
+        "CREATE INDEX idx_active_owner ON tasks (owner) WHERE active",
+    );
+    // Query whose WHERE contains the partial predicate verbatim uses the index.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM tasks WHERE active AND owner = 10 ORDER BY id",
+    );
+    // Just the predicate: scans the whole partial index.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM tasks WHERE active ORDER BY id",
+    );
+    // A row leaving the predicate must drop out of the index.
+    run(&mut u, "UPDATE tasks SET active = false WHERE id = 1");
+    run(&mut i, "UPDATE tasks SET active = false WHERE id = 1");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM tasks WHERE active AND owner = 10 ORDER BY id",
+    );
+    // A row entering the predicate must appear.
+    run(&mut u, "UPDATE tasks SET active = true WHERE id = 2");
+    run(&mut i, "UPDATE tasks SET active = true WHERE id = 2");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM tasks WHERE active AND owner = 10 ORDER BY id",
+    );
+    // A query NOT implying the predicate must still be correct (falls back).
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM tasks WHERE owner = 20 ORDER BY id",
+    );
+}
+
+#[test]
+fn include_and_method_round_trip_through_serialize() {
+    for sql in [
+        "CREATE INDEX m_idx ON t (a, b)",
+        "CREATE INDEX e_idx ON t ((lower(name)))",
+        "CREATE INDEX p_idx ON t (a) WHERE active",
+        "CREATE INDEX c_idx ON t (a) INCLUDE (b, c)",
+        "CREATE INDEX h_idx ON t USING hash (a)",
+        "CREATE UNIQUE INDEX u_idx ON t (a, b) INCLUDE (c) WHERE active",
+    ] {
+        let stmt = Parser::parse_sql(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let out = statement_to_sql(&stmt);
+        let reparsed = Parser::parse_sql(&out).unwrap().into_iter().next().unwrap();
+        assert_eq!(stmt, reparsed, "did not round-trip: {sql} -> {out}");
+    }
+}
+
+#[test]
+fn advanced_indexes_survive_wal_replay() {
+    let mut original = Database::new();
+    let mut log = String::new();
+    let mut apply = |db: &mut Database, sql: &str| {
+        for stmt in Parser::parse_sql(sql).expect("parse") {
+            let serialized = statement_to_sql(&stmt);
+            let res = executor::execute(db, stmt).expect("execute");
+            if !serialized.is_empty() && !matches!(res, ExecResult::Rows { .. }) {
+                log.push_str(&serialized);
+                log.push_str(";\n");
+            }
+        }
+    };
+    apply(
+        &mut original,
+        "CREATE TABLE t (id integer PRIMARY KEY, c text, p integer, active boolean)",
+    );
+    apply(&mut original, "CREATE INDEX idx_cp ON t (c, p)");
+    apply(&mut original, "CREATE INDEX idx_lc ON t ((lower(c)))");
+    apply(&mut original, "CREATE INDEX idx_pa ON t (p) WHERE active");
+    apply(&mut original, "CREATE INDEX idx_ph ON t USING hash (p)");
+    apply(
+        &mut original,
+        "INSERT INTO t VALUES (1,'A',10,true),(2,'b',20,false),(3,'A',10,true),(4,'C',30,true)",
+    );
+    apply(&mut original, "UPDATE t SET c = 'X' WHERE id = 4");
+
+    let mut recovered = Database::new();
+    for stmt in Parser::parse_sql(&log).expect("reparse WAL") {
+        executor::execute(&mut recovered, stmt).expect("replay");
+    }
+
+    for q in [
+        "SELECT id FROM t WHERE c = 'A' AND p = 10 ORDER BY id",
+        "SELECT id FROM t WHERE lower(c) = 'a' ORDER BY id",
+        "SELECT id FROM t WHERE active AND p = 10 ORDER BY id",
+        "SELECT id FROM t WHERE p = 20 ORDER BY id",
+    ] {
+        assert_eq!(
+            rows(run(&mut original, q)),
+            rows(run(&mut recovered, q)),
+            "replay diverged for: {q}"
+        );
+    }
 }
 
 #[test]
@@ -218,10 +582,17 @@ fn null_values_excluded_from_index_scans() {
     let mut i = Database::new();
     for db in [&mut u, &mut i] {
         run(db, "CREATE TABLE t (id integer, v integer)");
-        run(db, "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)");
+        run(
+            db,
+            "INSERT INTO t (id, v) VALUES (1, 10), (2, NULL), (3, 30), (4, NULL)",
+        );
     }
     run(&mut i, "CREATE INDEX idx_v ON t (v)");
     assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v > 0 ORDER BY id");
     assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v = 10");
-    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v IS NULL ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM t WHERE v IS NULL ORDER BY id",
+    );
 }

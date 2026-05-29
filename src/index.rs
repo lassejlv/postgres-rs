@@ -1,21 +1,28 @@
-//! B-tree secondary indexes built on the standard library's [`BTreeMap`].
+//! Secondary indexes built on the standard library's [`BTreeMap`] (B-tree
+//! indexes) or [`HashMap`] (hash indexes).
 //!
-//! An index maps the value(s) of one column to the *stable row ids* of the
-//! rows that hold that value (see [`crate::storage::Table`] for the row-id
-//! scheme). Because a `BTreeMap` keeps its keys in sorted order, a single
-//! structure answers both equality lookups (`col = const`, `col IN (...)`) and
-//! range scans (`col < c`, `BETWEEN`, ...) in `O(log n + k)` instead of the
-//! `O(n)` full scan the executor would otherwise do.
+//! An index maps the value(s) of one or more columns — or the result of an
+//! indexed *expression* — to the *stable row ids* of the rows that hold that
+//! key (see [`crate::storage::Table`] for the row-id scheme). A `BTreeMap`
+//! keeps its keys in sorted order, so a single structure answers both equality
+//! lookups (`col = const`, `col IN (...)`) and range scans (`col < c`,
+//! `BETWEEN`, ...) in `O(log n + k)` instead of the `O(n)` full scan. A hash
+//! index supports equality only.
 //!
 //! Indexes are maintained incrementally: every INSERT/UPDATE/DELETE that the
 //! executor performs also patches the indexes of the affected table, so the
 //! index never drifts from the heap. They are part of [`crate::storage::Table`]
-//! and therefore clone with it (used for transaction snapshots) — a `BTreeMap`
-//! clone is a cheap structural copy, no rebuild required.
+//! and therefore clone with it (used for transaction snapshots).
+//!
+//! Index *keys* are computed by [`crate::storage::Table`] (which can read the
+//! row columns and, for expression indexes, evaluate the stored expression).
+//! The index structure itself is value-based and knows nothing about SQL
+//! expressions — it just stores `Vec<Value>` keys.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use crate::sql::ast::Expr;
 use crate::types::Value;
 
 /// A stable identifier for a row within one table.
@@ -23,6 +30,15 @@ use crate::types::Value;
 /// Unlike a positional index into the `rows` `Vec`, a `RowId` does not change
 /// when other rows are deleted, so it is safe to store inside an index.
 pub type RowId = u64;
+
+/// The access method used to physically organise an index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    /// Sorted B-tree: supports equality, `IN`, and range scans.
+    Btree,
+    /// Hash table: supports equality lookups only (no range scans).
+    Hash,
+}
 
 /// A `Value` wrapped so it can serve as a totally-ordered `BTreeMap` key.
 ///
@@ -101,82 +117,277 @@ impl Ord for IndexKey {
     }
 }
 
-/// A secondary B-tree index over a single column of a table.
+/// A multi-column key: the wrapped values of the indexed columns/expression in
+/// index order, compared lexicographically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyVec(pub Vec<IndexKey>);
+
+impl PartialOrd for KeyVec {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for KeyVec {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+/// A canonical, hashable encoding of a key vector for use as a `HashMap` key.
+///
+/// Built from each value's text representation prefixed by a type tag so that
+/// distinct types never alias. NULL keys are never inserted into a hash index
+/// (equality never matches NULL), so they need no encoding here.
+fn hash_key(values: &[Value]) -> String {
+    let mut s = String::new();
+    for v in values {
+        match v {
+            Value::Null => s.push_str("N|"),
+            Value::Int(i) => {
+                s.push('i');
+                s.push_str(&i.to_string());
+            }
+            // Normalise integral floats so 1 and 1.0 collide the same way the
+            // B-tree's numeric comparison treats them as equal.
+            Value::Float(f) => {
+                s.push('i');
+                s.push_str(&(*f as i64).to_string());
+                if f.fract() != 0.0 {
+                    s.push('f');
+                    s.push_str(&format!("{f}"));
+                }
+            }
+            Value::Text(t) => {
+                s.push('s');
+                s.push_str(t);
+            }
+            Value::Bool(b) => {
+                s.push('b');
+                s.push(if *b { '1' } else { '0' });
+            }
+        }
+        s.push('|');
+    }
+    s
+}
+
+/// Whether any value in a key is NULL (such keys are excluded from hash/range
+/// equality matching, matching SQL semantics).
+fn key_has_null(values: &[Value]) -> bool {
+    values.iter().any(|v| v.is_null())
+}
+
+/// The backing store of an index: either a sorted B-tree or a hash table.
+#[derive(Debug, Clone)]
+enum Store {
+    Btree(BTreeMap<KeyVec, Vec<RowId>>),
+    Hash(HashMap<String, Vec<RowId>>),
+}
+
+/// A secondary index over one or more columns (or an expression) of a table.
 #[derive(Debug, Clone)]
 pub struct Index {
     /// Index name (used by `DROP INDEX`). Auto-generated for primary keys.
     pub name: String,
-    /// The 0-based column position this index covers within the table.
-    pub column: usize,
+    /// The 0-based column positions this index covers, in index order. Empty
+    /// for a pure expression index.
+    pub columns: Vec<usize>,
+    /// For an expression index, the expression whose value is the key. The
+    /// table evaluates it per row; `columns` is then empty.
+    pub expr: Option<Expr>,
+    /// For a partial index, the predicate a row must satisfy to be indexed.
+    pub predicate: Option<Expr>,
+    /// Covering / `INCLUDE` columns. Stored for introspection; not used for
+    /// index-only scans.
+    pub include: Vec<usize>,
     /// Whether this index enforces uniqueness (true for PRIMARY KEY indexes).
-    /// Uniqueness is not yet *enforced* on insert, matching the engine's
-    /// current constraint behavior, but the flag is tracked for introspection
-    /// and future enforcement.
     pub unique: bool,
-    /// Sorted map from key value to the row ids that currently hold it.
-    /// Multiple row ids per key supports non-unique indexes and duplicates.
-    tree: BTreeMap<IndexKey, Vec<RowId>>,
+    /// The access method.
+    pub method: IndexMethod,
+    /// Backing store keyed by the index key.
+    store: Store,
 }
 
 impl Index {
-    /// Create an empty index over `column`.
+    /// Create an empty B-tree index over a single `column` (the legacy shape
+    /// used by primary keys and single-column `CREATE INDEX`).
     pub fn new(name: String, column: usize, unique: bool) -> Self {
-        Index { name, column, unique, tree: BTreeMap::new() }
+        Index::new_multi(name, vec![column], unique, IndexMethod::Btree)
     }
 
-    /// Record that `row_id` now holds `value` in the indexed column.
-    pub fn insert(&mut self, value: &Value, row_id: RowId) {
-        self.tree.entry(IndexKey(value.clone())).or_default().push(row_id);
+    /// Create an empty index over `columns` with the given method.
+    pub fn new_multi(
+        name: String,
+        columns: Vec<usize>,
+        unique: bool,
+        method: IndexMethod,
+    ) -> Self {
+        Index {
+            name,
+            columns,
+            expr: None,
+            predicate: None,
+            include: Vec::new(),
+            unique,
+            method,
+            store: empty_store(method),
+        }
     }
 
-    /// Remove the `(value, row_id)` association (used on UPDATE/DELETE).
-    pub fn remove(&mut self, value: &Value, row_id: RowId) {
-        if let Some(ids) = self.tree.get_mut(&IndexKey(value.clone())) {
-            if let Some(pos) = ids.iter().position(|&r| r == row_id) {
-                ids.swap_remove(pos);
+    /// The single leading column of this index (used by older single-column
+    /// call sites and by uniqueness checks). For a pure expression index there
+    /// is no such column, so this returns `None`.
+    pub fn leading_column(&self) -> Option<usize> {
+        self.columns.first().copied()
+    }
+
+    /// Record that `row_id` now holds `key` (already-evaluated key values).
+    pub fn insert(&mut self, key: Vec<Value>, row_id: RowId) {
+        match &mut self.store {
+            Store::Btree(tree) => {
+                tree.entry(KeyVec(key.into_iter().map(IndexKey).collect()))
+                    .or_default()
+                    .push(row_id);
             }
-            if ids.is_empty() {
-                self.tree.remove(&IndexKey(value.clone()));
+            Store::Hash(map) => {
+                // NULL keys never equality-match, so don't store them.
+                if key_has_null(&key) {
+                    return;
+                }
+                map.entry(hash_key(&key)).or_default().push(row_id);
             }
         }
     }
 
-    /// Row ids whose indexed value equals `value` (point lookup).
-    pub fn lookup_eq(&self, value: &Value) -> &[RowId] {
-        match self.tree.get(&IndexKey(value.clone())) {
-            Some(ids) => ids,
-            None => &[],
+    /// Remove the `(key, row_id)` association (used on UPDATE/DELETE).
+    pub fn remove(&mut self, key: Vec<Value>, row_id: RowId) {
+        match &mut self.store {
+            Store::Btree(tree) => {
+                let k = KeyVec(key.into_iter().map(IndexKey).collect());
+                if let Some(ids) = tree.get_mut(&k) {
+                    if let Some(pos) = ids.iter().position(|&r| r == row_id) {
+                        ids.swap_remove(pos);
+                    }
+                    if ids.is_empty() {
+                        tree.remove(&k);
+                    }
+                }
+            }
+            Store::Hash(map) => {
+                if key_has_null(&key) {
+                    return;
+                }
+                let k = hash_key(&key);
+                if let Some(ids) = map.get_mut(&k) {
+                    if let Some(pos) = ids.iter().position(|&r| r == row_id) {
+                        ids.swap_remove(pos);
+                    }
+                    if ids.is_empty() {
+                        map.remove(&k);
+                    }
+                }
+            }
         }
     }
 
-    /// Row ids whose indexed value falls in the (optionally bounded) range.
-    /// `lo`/`hi` carry the bound value and whether it is inclusive. Returns row
-    /// ids in ascending key order. NULLs (which sort last) are never returned
-    /// from a range scan, matching SQL semantics where comparisons with NULL
-    /// are never true.
+    pub fn clear(&mut self) {
+        self.store = empty_store(self.method);
+    }
+
+    /// Row ids whose full key equals `key` (point lookup). Works for both
+    /// B-tree and hash indexes.
+    pub fn lookup_eq(&self, key: &[Value]) -> Vec<RowId> {
+        match &self.store {
+            Store::Btree(tree) => {
+                let k = KeyVec(key.iter().cloned().map(IndexKey).collect());
+                tree.get(&k).cloned().unwrap_or_default()
+            }
+            Store::Hash(map) => {
+                if key_has_null(key) {
+                    return Vec::new();
+                }
+                map.get(&hash_key(key)).cloned().unwrap_or_default()
+            }
+        }
+    }
+
+    /// All row ids currently held by this index (used to scan a partial index
+    /// whose predicate fully covers the query).
+    pub fn all_row_ids(&self) -> Vec<RowId> {
+        let mut out = Vec::new();
+        match &self.store {
+            Store::Btree(tree) => {
+                for ids in tree.values() {
+                    out.extend_from_slice(ids);
+                }
+            }
+            Store::Hash(map) => {
+                for ids in map.values() {
+                    out.extend_from_slice(ids);
+                }
+            }
+        }
+        out
+    }
+
+    /// Row ids whose key has the given leading prefix. Only valid for B-tree
+    /// indexes; a hash index returns an empty result (the planner never asks).
+    pub fn lookup_prefix(&self, prefix: &[Value]) -> Vec<RowId> {
+        let Store::Btree(tree) = &self.store else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (key, ids) in tree.iter() {
+            if key.0.len() < prefix.len() {
+                continue;
+            }
+            let matches = prefix
+                .iter()
+                .zip(&key.0)
+                .all(|(p, k)| IndexKey(p.clone()) == *k);
+            if matches {
+                out.extend_from_slice(ids);
+            }
+        }
+        out
+    }
+
+    /// Row ids whose (single-column) key falls in the (optionally bounded)
+    /// range. Only meaningful for single-column B-tree indexes; NULLs are never
+    /// returned. Returns ids in ascending key order.
     pub fn lookup_range(&self, lo: Option<Bound>, hi: Option<Bound>) -> Vec<RowId> {
         use std::ops::Bound as B;
+        let Store::Btree(tree) = &self.store else {
+            return Vec::new();
+        };
         let start = match &lo {
-            Some(b) if b.inclusive => B::Included(IndexKey(b.value.clone())),
-            Some(b) => B::Excluded(IndexKey(b.value.clone())),
+            Some(b) if b.inclusive => B::Included(KeyVec(vec![IndexKey(b.value.clone())])),
+            Some(b) => B::Excluded(KeyVec(vec![IndexKey(b.value.clone())])),
             None => B::Unbounded,
         };
         // Cap the high end *below* NULL so NULL keys (which sort last) are
         // excluded even on an unbounded-high range scan.
         let end = match &hi {
-            Some(b) if b.inclusive => B::Included(IndexKey(b.value.clone())),
-            Some(b) => B::Excluded(IndexKey(b.value.clone())),
-            None => B::Excluded(IndexKey(Value::Null)),
+            Some(b) if b.inclusive => B::Included(KeyVec(vec![IndexKey(b.value.clone())])),
+            Some(b) => B::Excluded(KeyVec(vec![IndexKey(b.value.clone())])),
+            None => B::Excluded(KeyVec(vec![IndexKey(Value::Null)])),
         };
         let mut out = Vec::new();
-        for (key, ids) in self.tree.range((start, end)) {
+        for (key, ids) in tree.range((start, end)) {
             // Defensive: skip NULL even if a bound somehow included it.
-            if key.0.is_null() {
+            if key.0.first().map(|k| k.0.is_null()).unwrap_or(true) {
                 continue;
             }
             out.extend_from_slice(ids);
         }
         out
+    }
+}
+
+fn empty_store(method: IndexMethod) -> Store {
+    match method {
+        IndexMethod::Btree => Store::Btree(BTreeMap::new()),
+        IndexMethod::Hash => Store::Hash(HashMap::new()),
     }
 }
 

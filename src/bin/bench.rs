@@ -39,7 +39,10 @@ fn row_count(res: &ExecResult) -> usize {
 /// `with_secondary` additionally creates a B-tree index on `price`.
 fn build(n: i64, with_secondary: bool) -> Database {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE t (id integer PRIMARY KEY, category integer, price integer)");
+    run(
+        &mut db,
+        "CREATE TABLE t (id integer PRIMARY KEY, category integer, price integer)",
+    );
 
     // Batch the inserts so we don't pay parser overhead per row, but cap each
     // statement's size to keep memory reasonable.
@@ -80,11 +83,26 @@ fn time(db: &mut Database, query: &str, iters: u32) -> (Duration, usize) {
 }
 
 /// Print one labeled comparison line.
-fn report(label: &str, scan: Duration, index: Duration, iters: u32, scan_rows: usize, idx_rows: usize) {
+fn report(
+    label: &str,
+    scan: Duration,
+    index: Duration,
+    iters: u32,
+    scan_rows: usize,
+    idx_rows: usize,
+) {
     let scan_us = scan.as_secs_f64() * 1e6 / iters as f64;
     let idx_us = index.as_secs_f64() * 1e6 / iters as f64;
-    let speedup = if idx_us > 0.0 { scan_us / idx_us } else { f64::INFINITY };
-    let agree = if scan_rows == idx_rows { "ok" } else { "MISMATCH" };
+    let speedup = if idx_us > 0.0 {
+        scan_us / idx_us
+    } else {
+        f64::INFINITY
+    };
+    let agree = if scan_rows == idx_rows {
+        "ok"
+    } else {
+        "MISMATCH"
+    };
     println!(
         "{label:<28} scan {scan_us:>10.2} us   index {idx_us:>8.2} us   speedup {speedup:>8.1}x   rows {scan_rows} ({agree})"
     );
@@ -138,5 +156,8 @@ fn main() {
     let q_pk = format!("SELECT category FROM t WHERE id = {}", n / 2);
     let (x, xr) = time(&mut index_db, &q_pk, 50);
     let pk_us = x.as_secs_f64() * 1e6 / 50.0;
-    println!("{:<28} index {pk_us:>8.2} us   rows {xr} (PK auto-index)", "PK lookup (id=)");
+    println!(
+        "{:<28} index {pk_us:>8.2} us   rows {xr} (PK auto-index)",
+        "PK lookup (id=)"
+    );
 }

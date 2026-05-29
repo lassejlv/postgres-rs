@@ -38,7 +38,10 @@ pub enum Startup {
 pub fn read_startup<R: Read>(r: &mut R) -> io::Result<Startup> {
     let len = read_i32(r)?;
     if !(8..=10_000_000).contains(&len) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad startup length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad startup length",
+        ));
     }
     let mut body = vec![0u8; (len - 4) as usize];
     r.read_exact(&mut body)?;
@@ -81,7 +84,11 @@ pub enum FrontendMessage {
     /// Simple query protocol: a SQL string to execute.
     Query(String),
     /// Extended protocol: prepare a statement.
-    Parse { name: String, query: String, param_types: Vec<i32> },
+    Parse {
+        name: String,
+        query: String,
+        param_types: Vec<i32>,
+    },
     /// Extended protocol: bind parameters to a prepared statement.
     Bind {
         portal: String,
@@ -104,6 +111,12 @@ pub enum FrontendMessage {
     /// A password (cleartext or SASL) response — payload bytes.
     /// (Retained for when authentication beyond trust is implemented.)
     Password(#[allow(dead_code)] Vec<u8>),
+    /// `COPY ... FROM STDIN` data chunk (may hold several rows).
+    CopyData(Vec<u8>),
+    /// Client signals the end of `COPY` data.
+    CopyDone,
+    /// Client aborts an in-progress `COPY`, with an error message.
+    CopyFail(String),
     /// Client is disconnecting.
     Terminate,
     /// An unrecognized message; payload preserved for diagnostics.
@@ -124,7 +137,10 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Option<FrontendMessage>> {
     let tag = tag[0];
     let len = read_i32(r)?;
     if len < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "message length < 4"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message length < 4",
+        ));
     }
     let mut body = vec![0u8; (len - 4) as usize];
     r.read_exact(&mut body)?;
@@ -155,6 +171,12 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Option<FrontendMessage>> {
         b'S' => FrontendMessage::Sync,
         b'H' => FrontendMessage::Flush,
         b'p' => FrontendMessage::Password(body),
+        b'd' => FrontendMessage::CopyData(body),
+        b'c' => FrontendMessage::CopyDone,
+        b'f' => {
+            let (msg, _) = read_cstr_slice(&body)?;
+            FrontendMessage::CopyFail(msg)
+        }
         other => FrontendMessage::Unknown { tag: other, body },
     };
     Ok(Some(msg))
@@ -170,7 +192,11 @@ fn parse_parse(body: &[u8]) -> io::Result<FrontendMessage> {
         param_types.push(i32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]));
         cur = &cur[4..];
     }
-    Ok(FrontendMessage::Parse { name, query, param_types })
+    Ok(FrontendMessage::Parse {
+        name,
+        query,
+        param_types,
+    })
 }
 
 fn parse_bind(body: &[u8]) -> io::Result<FrontendMessage> {
@@ -228,7 +254,10 @@ pub struct MessageBuilder {
 
 impl MessageBuilder {
     pub fn new(tag: u8) -> Self {
-        MessageBuilder { tag, body: Vec::with_capacity(32) }
+        MessageBuilder {
+            tag,
+            body: Vec::with_capacity(32),
+        }
     }
 
     pub fn put_u8(&mut self, v: u8) -> &mut Self {

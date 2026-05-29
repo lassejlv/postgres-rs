@@ -21,9 +21,31 @@ pub enum Token {
     Semicolon,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     Star,
     Plus,
     Minus,
+    /// JSON extraction `->`.
+    Arrow,
+    /// JSON text extraction `->>`.
+    ArrowText,
+    /// Array contains `@>`.
+    ArrayContains,
+    /// Full text match `@@`.
+    TextSearchMatch,
+    /// Array is contained by `<@`.
+    ArrayContainedBy,
+    /// Array overlap `&&`.
+    ArrayOverlap,
+    /// Network is strictly contained by `<<`.
+    NetworkContainedBy,
+    /// Network is contained by or equals `<<=`.
+    NetworkContainedByEq,
+    /// Network strictly contains `>>`.
+    NetworkContains,
+    /// Network contains or equals `>>=`.
+    NetworkContainsEq,
     Slash,
     Percent,
     Eq,
@@ -54,7 +76,10 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        Lexer { input: input.as_bytes(), pos: 0 }
+        Lexer {
+            input: input.as_bytes(),
+            pos: 0,
+        }
     }
 
     /// Tokenize the whole input, returning an error on malformed literals.
@@ -93,7 +118,8 @@ impl<'a> Lexer<'a> {
             return Ok(Some(self.read_word()));
         }
         // Numbers (optionally starting with a leading dot, e.g. `.5`).
-        if c.is_ascii_digit() || (c == b'.' && self.peek_at(1).is_some_and(|d| d.is_ascii_digit())) {
+        if c.is_ascii_digit() || (c == b'.' && self.peek_at(1).is_some_and(|d| d.is_ascii_digit()))
+        {
             return Ok(Some(self.read_number()));
         }
         // Quoted identifier.
@@ -103,6 +129,10 @@ impl<'a> Lexer<'a> {
         // String literal.
         if c == b'\'' {
             return Ok(Some(self.read_string()?));
+        }
+        // Dollar-quoted string literal: $$...$$ or $tag$...$tag$.
+        if c == b'$' && self.starts_dollar_quote() {
+            return Ok(Some(self.read_dollar_string()?));
         }
         // Positional parameter `$N`.
         if c == b'$' && self.peek_at(1).is_some_and(|d| d.is_ascii_digit()) {
@@ -116,9 +146,22 @@ impl<'a> Lexer<'a> {
             b';' => Token::Semicolon,
             b'(' => Token::LParen,
             b')' => Token::RParen,
+            b'[' => Token::LBracket,
+            b']' => Token::RBracket,
             b'*' => Token::Star,
             b'+' => Token::Plus,
-            b'-' => Token::Minus,
+            b'-' => match self.peek() {
+                Some(b'>') => {
+                    self.bump();
+                    if self.peek() == Some(b'>') {
+                        self.bump();
+                        Token::ArrowText
+                    } else {
+                        Token::Arrow
+                    }
+                }
+                _ => Token::Minus,
+            },
             b'/' => Token::Slash,
             b'%' => Token::Percent,
             b'.' => Token::Dot,
@@ -131,9 +174,22 @@ impl<'a> Lexer<'a> {
             },
             b'=' => Token::Eq,
             b'<' => match self.peek() {
+                Some(b'<') => {
+                    self.bump();
+                    if self.peek() == Some(b'=') {
+                        self.bump();
+                        Token::NetworkContainedByEq
+                    } else {
+                        Token::NetworkContainedBy
+                    }
+                }
                 Some(b'>') => {
                     self.bump();
                     Token::NotEq
+                }
+                Some(b'@') => {
+                    self.bump();
+                    Token::ArrayContainedBy
                 }
                 Some(b'=') => {
                     self.bump();
@@ -142,6 +198,15 @@ impl<'a> Lexer<'a> {
                 _ => Token::Lt,
             },
             b'>' => match self.peek() {
+                Some(b'>') => {
+                    self.bump();
+                    if self.peek() == Some(b'=') {
+                        self.bump();
+                        Token::NetworkContainsEq
+                    } else {
+                        Token::NetworkContains
+                    }
+                }
                 Some(b'=') => {
                     self.bump();
                     Token::GtEq
@@ -172,6 +237,24 @@ impl<'a> Lexer<'a> {
                     Token::Match
                 }
             }
+            b'@' => match self.peek() {
+                Some(b'@') => {
+                    self.bump();
+                    Token::TextSearchMatch
+                }
+                Some(b'>') => {
+                    self.bump();
+                    Token::ArrayContains
+                }
+                _ => return Err("unexpected character '@'".to_string()),
+            },
+            b'&' => match self.peek() {
+                Some(b'&') => {
+                    self.bump();
+                    Token::ArrayOverlap
+                }
+                _ => return Err("unexpected character '&'".to_string()),
+            },
             b'|' => match self.peek() {
                 Some(b'|') => {
                     self.bump();
@@ -277,6 +360,49 @@ impl<'a> Lexer<'a> {
         }
         let digits = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0");
         Token::Param(digits.parse::<u32>().unwrap_or(0))
+    }
+
+    fn starts_dollar_quote(&self) -> bool {
+        if self.peek() != Some(b'$') {
+            return false;
+        }
+        let mut i = 1;
+        while let Some(c) = self.peek_at(i) {
+            if c == b'$' {
+                return true;
+            }
+            if i == 1 {
+                if !(c == b'_' || c.is_ascii_alphabetic()) {
+                    return false;
+                }
+            } else if !(c == b'_' || c.is_ascii_alphanumeric()) {
+                return false;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn read_dollar_string(&mut self) -> Result<Token, String> {
+        let tag_start = self.pos;
+        self.bump(); // opening $
+        while self.peek() != Some(b'$') {
+            self.bump();
+        }
+        self.bump(); // closing $ of opening delimiter
+        let delimiter = self.input[tag_start..self.pos].to_vec();
+        let content_start = self.pos;
+        while self.pos + delimiter.len() <= self.input.len() {
+            if self.input[self.pos..].starts_with(&delimiter) {
+                let bytes = self.input[content_start..self.pos].to_vec();
+                self.pos += delimiter.len();
+                let s = String::from_utf8(bytes)
+                    .map_err(|_| "invalid UTF-8 in dollar-quoted string literal".to_string())?;
+                return Ok(Token::StringLit(s));
+            }
+            self.bump();
+        }
+        Err("unterminated dollar-quoted string literal".to_string())
     }
 
     fn read_quoted_ident(&mut self) -> Result<Token, String> {
