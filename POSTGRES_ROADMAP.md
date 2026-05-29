@@ -463,21 +463,35 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
   - [x] Loader validation for `PG_MODULE_MAGIC` and `PG_FUNCTION_INFO_V1`
   - [x] Optional `_PG_init` module hook execution on first library load
   - [x] PostgreSQL-style `PG_FUNCTION_ARGS`/`Datum` scalar call ABI subset
+  - [x] Common scalar `Datum` conversion helpers (`CString`, `char`, unsigned integer getters/returns)
   - [x] `FmgrInfo` call metadata for C functions (`flinfo`, `fn_oid`, `fn_nargs`, `fn_extra`)
+  - [x] Fmgr invocation helpers (`LOCAL_FCINFO`, `InitFunctionCallInfoData`, `FunctionCallInvoke`, `FunctionCall*`, `DirectFunctionCall*`)
   - [x] `STRICT` / `RETURNS NULL ON NULL INPUT` behavior and `fn_strict` metadata
   - [x] Per-call native allocation callbacks for `palloc`/`palloc0`/`repalloc`/`pfree`
   - [x] Minimal `MemoryContext` allocation API for `fn_mcxt` cached state
+  - [x] Extended memory allocation shims (`MemoryContextAllocExtended`, `palloc_extended`, `repalloc0`)
   - [x] `CurrentMemoryContext` / `MemoryContextSwitchTo` for cached extension allocations
+  - [x] Common PostgreSQL string utility shims (`StringInfo`, `pstrdup`, `pnstrdup`, `psprintf`)
+  - [x] Common PostgreSQL name utility shims (`NameData`, `NameStr`, `namestr*`)
+  - [x] Common `bytea` varlena helper shims (`PG_GETARG_BYTEA_*`, `DatumGetByteaP`, `PG_RETURN_BYTEA_P`)
+  - [x] Generic varlena/detoast and text-backed type helper shims (`PG_GETARG_VARLENA_*`, `PG_DETOAST_DATUM_COPY`, JSONB/UUID helpers)
   - [x] PostgreSQL-style extension helper header (`PG_MODULE_MAGIC`, function metadata, `palloc`, text helpers)
   - [x] `elog(ERROR, ...)` / `ereport(ERROR, (errmsg(...)))` propagation from C functions
   - [x] `GetConfigOptionByName` GUC reads from C functions
   - [x] Custom-GUC registration shims (`DefineCustom*Variable`) for `_PG_init` defaults
   - [x] Minimal type syscache support (`SearchSysCache1`/`SearchSysCache2` for `TYPEOID`/`TYPENAMENSP`, `Form_pg_type`)
   - [x] Minimal current-function syscache support (`SearchSysCache1(PROCOID)`, `Form_pg_proc`)
-  - [x] Common type/function catalog helper shims (`get_typlenbyvalalign`, `format_type_be`, `get_func_*`)
-  - [x] SPI `SELECT` support for C functions, including table-backed reads
+  - [x] Minimal namespace syscache support (`SearchSysCache1` for `NAMESPACEOID`/`NAMESPACENAME`, `Form_pg_namespace`)
+  - [x] Common syscache convenience shims (`SearchSysCacheExists*`, `GetSysCacheOid*`, `HeapTupleGetOid`)
+  - [x] Common type/function/namespace catalog helper shims (`get_typlenbyvalalign`, `format_type_be`, `get_func_*`, `get_namespace_*`)
+  - [x] SPI `SELECT` support for C functions, including table-backed text and binary `Datum` reads
+  - [x] SPI tuple descriptor metadata for C functions (`TupleDescAttr`, `SPI_gettypeid`, `SPI_gettype`)
+  - [x] Heap tuple access shims for SPI result tuples (`heap_getattr`, `heap_attisnull`)
+  - [x] Tuple descriptor construction shims (`CreateTemplateTupleDesc`, `TupleDescInitEntry`, `BlessTupleDesc`)
+  - [x] Heap tuple form/deform shims for C-created tuples (`heap_form_tuple`, `heap_deform_tuple`)
   - [x] SPI command execution for C functions (`INSERT`/`UPDATE`/`DELETE`) with PostgreSQL-style result codes
-  - [x] Minimal prepared SPI plan shims (`SPI_prepare`, `SPI_execute_plan`)
+  - [x] Parameterized SPI execution for C functions (`SPI_execute_with_args`)
+  - [x] Prepared SPI plan shims with bound arguments (`SPI_prepare`, `SPI_execute_plan`)
   - [x] Extension control files and versioned install/update scripts
   - [x] Extension-owned function dependency tracking in `pg_depend`
   - [x] Dropping extensions removes owned C/SQL functions

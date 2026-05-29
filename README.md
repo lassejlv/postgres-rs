@@ -33,17 +33,28 @@ NULL, integer, float, boolean, and varlena text values.
 The call frame includes `FmgrInfo` metadata (`fcinfo->flinfo`, `fn_oid`,
 `fn_nargs`, `fn_extra`) and per-call `palloc`/`palloc0`/`repalloc`/`pfree`
 callbacks for transient allocations.
+The helper header also exposes fmgr invocation shims such as
+`LOCAL_FCINFO`, `InitFunctionCallInfoData`, `FunctionCallInvoke`, and
+`FunctionCall0`/`FunctionCall0Coll` through `FunctionCall5`/`FunctionCall5Coll`,
+plus `DirectFunctionCall0`/`DirectFunctionCall0Coll` through
+`DirectFunctionCall5`/`DirectFunctionCall5Coll`.
 It also exposes a minimal `MemoryContext` API, including
-`MemoryContextAlloc`, `MemoryContextAllocZero`, and `MemoryContextStrdup`, so
-cached `fn_mcxt` allocations can survive across calls.
+`MemoryContextAlloc`, `MemoryContextAllocZero`, `MemoryContextAllocExtended`,
+`MemoryContextStrdup`, `palloc_extended`, and `repalloc0`, so cached `fn_mcxt`
+allocations can survive across calls.
 `CurrentMemoryContext` and `MemoryContextSwitchTo` are available for extensions
 that follow PostgreSQL's usual switch-allocate-switch-back pattern.
 `STRICT` / `RETURNS NULL ON NULL INPUT` functions short-circuit NULL arguments
 without entering C and expose `fn_strict` in `FmgrInfo`.
 The bundled `include/postgres_rs_fmgr.h` compatibility header also provides
 common extension conveniences such as `PG_MODULE_MAGIC`,
-`PG_FUNCTION_INFO_V1`, `palloc`/`pfree`, and `cstring_to_text` /
-`text_to_cstring`.
+`PG_FUNCTION_INFO_V1`, `palloc`/`pfree`, `pstrdup`/`psprintf`, `StringInfo`,
+`NameData`/`NameStr`, common scalar OID constants, scalar `Datum` helpers
+including `PG_GETARG_CSTRING`, `PG_RETURN_CSTRING`, `CharGetDatum`, and
+`UInt32GetDatum`, and varlena helpers such as
+`cstring_to_text`, `cstring_to_text_with_len`, `text_to_cstring`,
+`PG_GETARG_BYTEA_P`, `PG_GETARG_JSONB_P`, `PG_DETOAST_DATUM_COPY`, and
+`PG_RETURN_BYTEA_P`.
 It supports `elog(ERROR, ...)` and `ereport(ERROR, (errmsg(...)))` style
 extension failures, which are propagated as SQL execution errors. Lower severity
 messages such as `NOTICE` are accepted without aborting the call.
@@ -56,16 +67,27 @@ It also exposes a small syscache/catalog slice for type metadata:
 `HeapTupleIsValid`, `ReleaseSysCache`, and `Form_pg_type`.
 `SearchSysCache1(PROCOID, ObjectIdGetDatum(fcinfo->flinfo->fn_oid))` can also
 return `Form_pg_proc` metadata for the currently executing C function.
+`SearchSysCache1(NAMESPACEOID, ...)` and `SearchSysCache1(NAMESPACENAME, ...)`
+return `Form_pg_namespace` metadata for `pg_catalog`.
+Syscache convenience shims such as `SearchSysCacheExists1`,
+`SearchSysCacheExists2`, `GetSysCacheOid1`, `GetSysCacheOid2`, and
+`HeapTupleGetOid` are available on top of the same catalog slice.
 Common catalog helper shims such as `get_typlenbyvalalign`, `get_typlen`,
 `get_typbyval`, `get_typalign`, `format_type_be`, `get_func_name`,
-`get_func_rettype`, and `get_func_nargs` are layered on top of that syscache
-surface.
+`get_func_rettype`, `get_func_nargs`, `get_namespace_name`, and
+`get_namespace_oid` are layered on top of that syscache surface.
 Loaded libraries are checked for `PG_MODULE_MAGIC`, each loaded C symbol must
 expose `PG_FUNCTION_INFO_V1`, and `_PG_init` is called once when present.
 It also includes a minimal SPI surface (`SPI_connect`, `SPI_execute`,
-`SPI_exec`, `SPI_prepare`, `SPI_execute_plan`, `SPI_getvalue`, `SPI_tuptable`,
-`SPI_getbinval`, `SPI_processed`, `SPI_result`) for engine-backed `SELECT`,
-`INSERT`, `UPDATE`, and `DELETE` statements.
+`SPI_exec`, `SPI_execute_with_args`, `SPI_prepare`, `SPI_execute_plan`,
+`SPI_getvalue`, `SPI_tuptable`, `SPI_getbinval`, `SPI_gettypeid`,
+`SPI_gettype`, `TupleDescAttr`, `heap_getattr`, `heap_attisnull`,
+`CreateTemplateTupleDesc`, `TupleDescInitEntry`, `BlessTupleDesc`,
+`TupleDescCopy`, `FreeTupleDesc`, `heap_form_tuple`, `heap_deform_tuple`,
+`heap_freetuple`, `SPI_processed`, and `SPI_result`) for engine-backed
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE` statements. Prepared SPI plans
+retain declared argument types and can be executed with bound `Datum` values
+and PostgreSQL-style null arrays.
 
 Extensions can also be installed from `PGRS_EXTENSION_DIR` using PostgreSQL-like
 control and SQL files:

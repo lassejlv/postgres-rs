@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::index::Bound;
-use crate::native::{self, NativeSpiResult, NativeUdf};
+use crate::native::{self, NativeSpiField, NativeSpiResult, NativeUdf};
 use crate::numeric::BigDecimal;
 use crate::sql::ast::*;
 use crate::sql::serialize::{expr_to_sql, select_to_sql};
@@ -650,11 +650,20 @@ fn execute_native_spi_statement(
     }
     let result = execute_dispatch(db, stmt)?;
     match result {
-        ExecResult::Rows { mut rows, .. } => {
+        ExecResult::Rows {
+            fields, mut rows, ..
+        } => {
             if count > 0 {
                 rows.truncate(count as usize);
             }
-            Ok(NativeSpiResult::returning(returning_code, rows))
+            let fields = fields
+                .into_iter()
+                .map(|field| NativeSpiField {
+                    name: field.name,
+                    data_type: field.data_type,
+                })
+                .collect();
+            Ok(NativeSpiResult::returning(returning_code, fields, rows))
         }
         ExecResult::Command(tag) => Ok(NativeSpiResult::command(
             command_code,

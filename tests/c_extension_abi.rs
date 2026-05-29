@@ -119,8 +119,92 @@ fn language_c_scalar_functions_load_and_execute() {
     run(
         &mut db,
         &format!(
+            "CREATE FUNCTION c_spi_with_args() RETURNS text \
+             AS {lib}, 'pgrs_c_spi_with_args' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_spi_plan_args() RETURNS text \
+             AS {lib}, 'pgrs_c_spi_plan_args' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_spi_tupledesc() RETURNS text \
+             AS {lib}, 'pgrs_c_spi_tupledesc' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_heap_getattr() RETURNS text \
+             AS {lib}, 'pgrs_c_heap_getattr' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_heap_form_tuple() RETURNS text \
+             AS {lib}, 'pgrs_c_heap_form_tuple' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_tupledesc_build() RETURNS text \
+             AS {lib}, 'pgrs_c_tupledesc_build' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_stringinfo_utils() RETURNS text \
+             AS {lib}, 'pgrs_c_stringinfo_utils' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_name_utils() RETURNS text \
+             AS {lib}, 'pgrs_c_name_utils' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_bytea_echo(v bytea) RETURNS bytea \
+             AS {lib}, 'pgrs_c_bytea_echo' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_varlena_aliases(v jsonb, u uuid) RETURNS text \
+             AS {lib}, 'pgrs_c_varlena_aliases' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
             "CREATE FUNCTION c_fmgr_cache(step integer) RETURNS integer \
              AS {lib}, 'pgrs_c_fmgr_cache' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_extended_alloc() RETURNS text \
+             AS {lib}, 'pgrs_c_extended_alloc' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_fmgr_invocation() RETURNS integer \
+             AS {lib}, 'pgrs_c_fmgr_invocation' LANGUAGE c"
         ),
     );
     run(
@@ -216,6 +300,20 @@ fn language_c_scalar_functions_load_and_execute() {
     );
     run(
         &mut db,
+        &format!(
+            "CREATE FUNCTION c_namespace_helpers() RETURNS text \
+             AS {lib}, 'pgrs_c_namespace_helpers' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
+        &format!(
+            "CREATE FUNCTION c_syscache_helpers() RETURNS text \
+             AS {lib}, 'pgrs_c_syscache_helpers' LANGUAGE c"
+        ),
+    );
+    run(
+        &mut db,
         "CREATE TABLE spi_numbers(n integer); \
          INSERT INTO spi_numbers VALUES (10), (20), (12); \
          CREATE TABLE spi_log(n integer);",
@@ -245,12 +343,67 @@ fn language_c_scalar_functions_load_and_execute() {
         vec![vec![Value::Int(11)]]
     );
     assert_eq!(
+        rows(run(&mut db, "SELECT c_spi_with_args()")),
+        vec![vec![Value::Text("12:arg:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_spi_plan_args()")),
+        vec![vec![Value::Text("13:plan:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_spi_tupledesc()")),
+        vec![vec![Value::Text("1:n:23:int4:4:1:i:10".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_heap_getattr()")),
+        vec![vec![Value::Text("32:heap:1:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_heap_form_tuple()")),
+        vec![vec![Value::Text("44:formed:1:44:formed:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_tupledesc_build()")),
+        vec![vec![Value::Text("3:num:23:label:25:77:templated:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_stringinfo_utils()")),
+        vec![vec![Value::Text(
+            "hello rust!  42:done:segment:made".into()
+        )]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_name_utils()")),
+        vec![vec![Value::Text("alpha:beta:0:1:63".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_bytea_echo('\\x616263'::bytea)")),
+        vec![vec![Value::Text("\\x616263:ok".into())]]
+    );
+    assert_eq!(
+        rows(run(
+            &mut db,
+            "SELECT c_varlena_aliases('{\"k\":1}'::jsonb, '11111111-2222-3333-4444-555555555555'::uuid)"
+        )),
+        vec![vec![Value::Text(
+            "3802:2950:{\"k\": 1}:11111111-2222-3333-4444-555555555555:{\"k\": 1".into()
+        )]]
+    );
+    assert_eq!(
         rows(run(&mut db, "SELECT c_fmgr_cache(1)")),
         vec![vec![Value::Int(101)]]
     );
     assert_eq!(
         rows(run(&mut db, "SELECT c_fmgr_cache(2)")),
         vec![vec![Value::Int(103)]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_extended_alloc()")),
+        vec![vec![Value::Text("abc:ctx:1:1:1".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_fmgr_invocation()")),
+        vec![vec![Value::Int(3056)]]
     );
     assert_eq!(
         rows(run(&mut db, "SELECT c_context_switch(5)")),
@@ -319,6 +472,14 @@ fn language_c_scalar_functions_load_and_execute() {
         vec![vec![Value::Text(
             "text:-1:1:i:c_catalog_helpers:25:0".into()
         )]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_namespace_helpers()")),
+        vec![vec![Value::Text("pg_catalog:11:10:1:0".into())]]
+    );
+    assert_eq!(
+        rows(run(&mut db, "SELECT c_syscache_helpers()")),
+        vec![vec![Value::Text("1:0:25:23:11:11".into())]]
     );
     assert_eq!(
         rows(run(
@@ -514,7 +675,19 @@ PG_FUNCTION_INFO_V1(pgrs_c_spi_sum);
 PG_FUNCTION_INFO_V1(pgrs_c_spi_mutate);
 PG_FUNCTION_INFO_V1(pgrs_c_spi_plan_answer);
 PG_FUNCTION_INFO_V1(pgrs_c_spi_binval);
+PG_FUNCTION_INFO_V1(pgrs_c_spi_with_args);
+PG_FUNCTION_INFO_V1(pgrs_c_spi_plan_args);
+PG_FUNCTION_INFO_V1(pgrs_c_spi_tupledesc);
+PG_FUNCTION_INFO_V1(pgrs_c_heap_getattr);
+PG_FUNCTION_INFO_V1(pgrs_c_heap_form_tuple);
+PG_FUNCTION_INFO_V1(pgrs_c_tupledesc_build);
+PG_FUNCTION_INFO_V1(pgrs_c_stringinfo_utils);
+PG_FUNCTION_INFO_V1(pgrs_c_name_utils);
+PG_FUNCTION_INFO_V1(pgrs_c_bytea_echo);
+PG_FUNCTION_INFO_V1(pgrs_c_varlena_aliases);
 PG_FUNCTION_INFO_V1(pgrs_c_fmgr_cache);
+PG_FUNCTION_INFO_V1(pgrs_c_extended_alloc);
+PG_FUNCTION_INFO_V1(pgrs_c_fmgr_invocation);
 PG_FUNCTION_INFO_V1(pgrs_c_context_switch);
 PG_FUNCTION_INFO_V1(pgrs_c_pg_init_seen);
 PG_FUNCTION_INFO_V1(pgrs_c_strict_probe);
@@ -528,6 +701,8 @@ PG_FUNCTION_INFO_V1(pgrs_c_type_by_name);
 PG_FUNCTION_INFO_V1(pgrs_c_type_by_name_wrong_ns);
 PG_FUNCTION_INFO_V1(pgrs_c_proc_metadata);
 PG_FUNCTION_INFO_V1(pgrs_c_catalog_helpers);
+PG_FUNCTION_INFO_V1(pgrs_c_namespace_helpers);
+PG_FUNCTION_INFO_V1(pgrs_c_syscache_helpers);
 PG_FUNCTION_INFO_V1(pgrs_ext_answer_v1);
 PG_FUNCTION_INFO_V1(pgrs_ext_answer_v2);
 
@@ -583,6 +758,93 @@ Datum pgrs_c_add(PG_FUNCTION_ARGS) {
         PG_RETURN_NULL();
     }
     PG_RETURN_INT32(PG_GETARG_INT32(0) + PG_GETARG_INT32(1));
+}
+
+static Datum pgrs_c_collation_probe(PG_FUNCTION_ARGS) {
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    PG_RETURN_INT32((int32_t)PG_GET_COLLATION() + PG_GETARG_INT32(0));
+}
+
+static Datum pgrs_c_scalar_helper_probe(PG_FUNCTION_ARGS) {
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2)) {
+        PG_RETURN_NULL();
+    }
+    CString label = PG_GETARG_CSTRING(0);
+    char marker = PG_GETARG_CHAR(1);
+    uint32_t count = PG_GETARG_UINT32(2);
+    uint64_t doubled = DatumGetUInt64(UInt64GetDatum((uint64_t)count * 2));
+    char *out = psprintf("%s:%c:%u:%llu", label, marker, count, (unsigned long long)doubled);
+    PG_RETURN_CSTRING(out);
+}
+
+Datum pgrs_c_fmgr_invocation(PG_FUNCTION_ARGS) {
+    (void)fcinfo;
+    int direct = DatumGetInt32(DirectFunctionCall2(
+        pgrs_c_add,
+        Int32GetDatum(4),
+        Int32GetDatum(6)
+    ));
+
+    FmgrInfo add_info;
+    add_info.fn_addr = pgrs_c_add;
+    add_info.fn_oid = InvalidOid;
+    add_info.fn_nargs = 2;
+    add_info.fn_strict = false;
+    add_info.fn_retset = false;
+    add_info.fn_stats = 0;
+    add_info.fn_extra = NULL;
+    add_info.fn_mcxt = NULL;
+    add_info.fn_expr = NULL;
+
+    LOCAL_FCINFO(manual_fcinfo, 2);
+    InitFunctionCallInfoData(
+        *manual_fcinfo,
+        &add_info,
+        2,
+        InvalidOid,
+        NULL,
+        NULL
+    );
+    manual_fcinfo->args[0].value = Int32GetDatum(3);
+    manual_fcinfo->args[0].isnull = false;
+    manual_fcinfo->args[1].value = Int32GetDatum(5);
+    manual_fcinfo->args[1].isnull = false;
+
+    int invoked = DatumGetInt32(FunctionCallInvoke(manual_fcinfo));
+    if (manual_fcinfo->isnull) {
+        PG_RETURN_NULL();
+    }
+
+    int flinfo_call = DatumGetInt32(FunctionCall2(
+        &add_info,
+        Int32GetDatum(6),
+        Int32GetDatum(8)
+    ));
+
+    FmgrInfo collation_info = add_info;
+    collation_info.fn_addr = pgrs_c_collation_probe;
+    collation_info.fn_nargs = 1;
+    int flinfo_collation = DatumGetInt32(FunctionCall1Coll(
+        &collation_info,
+        (Oid)1000,
+        Int32GetDatum(11)
+    ));
+    int direct_collation = DatumGetInt32(DirectFunctionCall1Coll(
+        pgrs_c_collation_probe,
+        (Oid)2000,
+        Int32GetDatum(12)
+    ));
+    CString scalar_helpers = DatumGetCString(DirectFunctionCall3(
+        pgrs_c_scalar_helper_probe,
+        CStringGetDatum("fmgr"),
+        CharGetDatum('Z'),
+        UInt32GetDatum(17)
+    ));
+    int scalar_ok = scalar_helpers != NULL && strcmp(scalar_helpers, "fmgr:Z:17:34") == 0 ? 1 : 0;
+
+    PG_RETURN_INT32(direct + invoked + flinfo_call + flinfo_collation + direct_collation + scalar_ok);
 }
 
 Datum pgrs_c_hello(PG_FUNCTION_ARGS) {
@@ -734,6 +996,381 @@ Datum pgrs_c_spi_binval(PG_FUNCTION_ARGS) {
     PG_RETURN_INT32(1);
 }
 
+Datum pgrs_c_spi_with_args(PG_FUNCTION_ARGS) {
+    if (SPI_connect() != SPI_OK_CONNECT) {
+        PG_RETURN_NULL();
+    }
+    Oid argtypes[3] = {INT4OID, TEXTOID, BOOLOID};
+    Datum values[3] = {
+        Int32GetDatum(7),
+        PointerGetDatum(cstring_to_text("arg")),
+        BoolGetDatum(false)
+    };
+    const char nulls[3] = {' ', ' ', 'n'};
+    int rc = SPI_execute_with_args(
+        "SELECT $1 + 5, $2, $3",
+        3,
+        argtypes,
+        values,
+        nulls,
+        true,
+        1
+    );
+    if (rc != SPI_OK_SELECT || SPI_processed != 1 || SPI_tuptable == NULL) {
+        PG_RETURN_NULL();
+    }
+    bool isnull = false;
+    Datum int_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+    if (isnull) {
+        PG_RETURN_NULL();
+    }
+    char *value = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+    if (value == NULL || strcmp(value, "arg") != 0) {
+        PG_RETURN_NULL();
+    }
+    (void)SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+    if (!isnull) {
+        PG_RETURN_NULL();
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d:%s:%d", DatumGetInt32(int_datum), value, isnull ? 1 : 0);
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_spi_plan_args(PG_FUNCTION_ARGS) {
+    if (SPI_connect() != SPI_OK_CONNECT) {
+        PG_RETURN_NULL();
+    }
+    Oid argtypes[3] = {INT4OID, TEXTOID, BOOLOID};
+    SPIPlanPtr plan = SPI_prepare("SELECT $1 + 6, $2, $3", 3, argtypes);
+    if (plan == NULL) {
+        PG_RETURN_NULL();
+    }
+    Datum values[3] = {
+        Int32GetDatum(7),
+        PointerGetDatum(cstring_to_text("plan")),
+        BoolGetDatum(false)
+    };
+    const char nulls[3] = {' ', ' ', 'n'};
+    int rc = SPI_execute_plan(plan, values, nulls, true, 1);
+    SPI_freeplan(plan);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1 || SPI_tuptable == NULL) {
+        PG_RETURN_NULL();
+    }
+    bool isnull = false;
+    Datum int_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+    if (isnull) {
+        PG_RETURN_NULL();
+    }
+    char *value = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+    if (value == NULL || strcmp(value, "plan") != 0) {
+        PG_RETURN_NULL();
+    }
+    (void)SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
+    if (!isnull) {
+        PG_RETURN_NULL();
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d:%s:%d", DatumGetInt32(int_datum), value, isnull ? 1 : 0);
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_spi_tupledesc(PG_FUNCTION_ARGS) {
+    if (SPI_connect() != SPI_OK_CONNECT) {
+        PG_RETURN_NULL();
+    }
+    int rc = SPI_execute("SELECT n FROM spi_numbers ORDER BY n", true, 1);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1 || SPI_tuptable == NULL || SPI_tuptable->tupdesc == NULL) {
+        PG_RETURN_NULL();
+    }
+    TupleDesc tupdesc = SPI_tuptable->tupdesc;
+    Form_pg_attribute attr = TupleDescAttr(tupdesc, 0);
+    if (tupdesc->natts != 1 || attr == NULL) {
+        PG_RETURN_NULL();
+    }
+    Oid typid = SPI_gettypeid(tupdesc, 1);
+    char *type_name = SPI_gettype(tupdesc, 1);
+    char *value = SPI_getvalue(SPI_tuptable->vals[0], tupdesc, 1);
+    if (typid == InvalidOid || type_name == NULL || value == NULL) {
+        PG_RETURN_NULL();
+    }
+    char buf[160];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%d:%s:%u:%s:%d:%d:%c:%s",
+        tupdesc->natts,
+        attr->attname,
+        (unsigned)typid,
+        type_name,
+        (int)attr->attlen,
+        attr->attbyval ? 1 : 0,
+        attr->attalign,
+        value
+    );
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_heap_getattr(PG_FUNCTION_ARGS) {
+    if (SPI_connect() != SPI_OK_CONNECT) {
+        PG_RETURN_NULL();
+    }
+    int rc = SPI_execute("SELECT 32, 'heap', NULL", true, 1);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1 || SPI_tuptable == NULL) {
+        PG_RETURN_NULL();
+    }
+    TupleDesc tupdesc = SPI_tuptable->tupdesc;
+    HeapTuple tuple = SPI_tuptable->vals[0];
+    bool isnull = false;
+    Datum int_datum = heap_getattr(tuple, 1, tupdesc, &isnull);
+    if (isnull || DatumGetInt32(int_datum) != 32) {
+        PG_RETURN_NULL();
+    }
+    Datum text_datum = heap_getattr(tuple, 2, tupdesc, &isnull);
+    if (isnull) {
+        PG_RETURN_NULL();
+    }
+    char *value = text_to_cstring((text *)DatumGetPointer(text_datum));
+    bool null_attr = heap_attisnull(tuple, 3, tupdesc);
+    bool missing_attr = heap_attisnull(tuple, 99, tupdesc);
+    char buf[96];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%d:%s:%d:%d",
+        DatumGetInt32(int_datum),
+        value,
+        null_attr ? 1 : 0,
+        missing_attr ? 1 : 0
+    );
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_heap_form_tuple(PG_FUNCTION_ARGS) {
+    if (SPI_connect() != SPI_OK_CONNECT) {
+        PG_RETURN_NULL();
+    }
+    int rc = SPI_execute("SELECT 0 AS a, '' AS b, NULL AS c", true, 1);
+    if (rc != SPI_OK_SELECT || SPI_processed != 1 || SPI_tuptable == NULL || SPI_tuptable->tupdesc == NULL) {
+        PG_RETURN_NULL();
+    }
+    TupleDesc tupdesc = SPI_tuptable->tupdesc;
+    Datum values[3] = {
+        Int32GetDatum(44),
+        PointerGetDatum(cstring_to_text("formed")),
+        (Datum)0
+    };
+    bool nulls[3] = {false, false, true};
+    HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+    if (!HeapTupleIsValid(tuple)) {
+        PG_RETURN_NULL();
+    }
+    bool isnull = false;
+    Datum int_datum = heap_getattr(tuple, 1, tupdesc, &isnull);
+    if (isnull || DatumGetInt32(int_datum) != 44) {
+        PG_RETURN_NULL();
+    }
+    Datum text_datum = heap_getattr(tuple, 2, tupdesc, &isnull);
+    if (isnull) {
+        PG_RETURN_NULL();
+    }
+    char *value = text_to_cstring((text *)DatumGetPointer(text_datum));
+    bool null_attr = heap_attisnull(tuple, 3, tupdesc);
+    Datum out_values[3] = {0, 0, 0};
+    bool out_nulls[3] = {false, false, false};
+    heap_deform_tuple(tuple, tupdesc, out_values, out_nulls);
+    char *deformed = text_to_cstring((text *)DatumGetPointer(out_values[1]));
+    char buf[160];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%d:%s:%d:%d:%s:%d",
+        DatumGetInt32(int_datum),
+        value,
+        null_attr ? 1 : 0,
+        DatumGetInt32(out_values[0]),
+        deformed,
+        out_nulls[2] ? 1 : 0
+    );
+    heap_freetuple(tuple);
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_tupledesc_build(PG_FUNCTION_ARGS) {
+    TupleDesc tupdesc = CreateTemplateTupleDesc(3);
+    if (tupdesc == NULL) {
+        PG_RETURN_NULL();
+    }
+    TupleDescInitEntry(tupdesc, 1, "num", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, 2, "label", TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, 3, "flag", BOOLOID, -1, 0);
+    TupleDesc blessed = BlessTupleDesc(tupdesc);
+    TupleDesc copy = TupleDescCopy(blessed);
+    if (copy == NULL || copy->natts != 3) {
+        PG_RETURN_NULL();
+    }
+    Form_pg_attribute first = TupleDescAttr(copy, 0);
+    Form_pg_attribute second = TupleDescAttr(copy, 1);
+    if (first == NULL || second == NULL || strcmp(first->attname, "num") != 0 || strcmp(second->attname, "label") != 0) {
+        PG_RETURN_NULL();
+    }
+    Datum values[3] = {
+        Int32GetDatum(77),
+        PointerGetDatum(cstring_to_text("templated")),
+        (Datum)0
+    };
+    bool nulls[3] = {false, false, true};
+    HeapTuple tuple = heap_form_tuple(copy, values, nulls);
+    if (!HeapTupleIsValid(tuple)) {
+        PG_RETURN_NULL();
+    }
+    Datum out_values[3] = {0, 0, 0};
+    bool out_nulls[3] = {false, false, false};
+    heap_deform_tuple(tuple, copy, out_values, out_nulls);
+    char *label = text_to_cstring((text *)DatumGetPointer(out_values[1]));
+    char buf[192];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%d:%s:%u:%s:%u:%d:%s:%d",
+        copy->natts,
+        first->attname,
+        (unsigned)first->atttypid,
+        second->attname,
+        (unsigned)second->atttypid,
+        DatumGetInt32(out_values[0]),
+        label,
+        out_nulls[2] ? 1 : 0
+    );
+    heap_freetuple(tuple);
+    FreeTupleDesc(copy);
+    FreeTupleDesc(tupdesc);
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_stringinfo_utils(PG_FUNCTION_ARGS) {
+    StringInfoData buf;
+    initStringInfo(&buf);
+    appendStringInfoString(&buf, "hello");
+    appendStringInfoChar(&buf, ' ');
+    char *copy = pstrdup("rust");
+    appendStringInfo(&buf, "%s!", copy);
+    appendStringInfoSpaces(&buf, 2);
+    appendStringInfo(&buf, "%d", 42);
+    char *formatted = psprintf(":%s", "done");
+    appendStringInfoString(&buf, formatted);
+    char *segment = pnstrdup("segment-tail", 7);
+    appendStringInfoChar(&buf, ':');
+    appendBinaryStringInfo(&buf, segment, (int)strlen(segment));
+
+    StringInfo made = makeStringInfo();
+    if (made == NULL) {
+        PG_RETURN_NULL();
+    }
+    appendStringInfoString(made, "reset");
+    resetStringInfo(made);
+    appendStringInfoString(made, "made");
+    appendStringInfoChar(&buf, ':');
+    appendStringInfoString(&buf, made->data);
+
+    if (buf.len != (int)strlen(buf.data) || made->len != 4) {
+        PG_RETURN_NULL();
+    }
+    PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum pgrs_c_name_utils(PG_FUNCTION_ARGS) {
+    NameData first;
+    NameData second;
+    NameData longname;
+    namestrcpy(&first, "alpha");
+    namestrncpy(&second, "beta-tail", 4);
+    namestrcpy(
+        &longname,
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"
+    );
+    int equal = namestrcmp(&first, "alpha");
+    int less = namestrcmp(&first, NameStr(second)) < 0 ? 1 : 0;
+    char buf[160];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%s:%s:%d:%d:%zu",
+        NameStr(first),
+        NameStr(second),
+        equal,
+        less,
+        strlen(NameStr(longname))
+    );
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_bytea_echo(PG_FUNCTION_ARGS) {
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    bytea *input = PG_GETARG_BYTEA_P(0);
+    size_t input_len = VARSIZE_ANY_EXHDR(input);
+    size_t suffix_len = 3;
+    bytea *out = (bytea *)palloc(VARHDRSZ + input_len + suffix_len);
+    if (out == NULL) {
+        PG_RETURN_NULL();
+    }
+    SET_VARSIZE(out, VARHDRSZ + input_len + suffix_len);
+    memcpy(VARDATA(out), VARDATA_ANY(input), input_len);
+    memcpy(VARDATA(out) + input_len, ":ok", suffix_len);
+
+    Datum datum = ByteaPGetDatum(out);
+    bytea *roundtrip = DatumGetByteaP(datum);
+    if (VARSIZE_ANY_EXHDR(roundtrip) != input_len + suffix_len) {
+        PG_RETURN_NULL();
+    }
+    PG_RETURN_BYTEA_P(roundtrip);
+}
+
+Datum pgrs_c_varlena_aliases(PG_FUNCTION_ARGS) {
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) {
+        PG_RETURN_NULL();
+    }
+    Jsonb *json = PG_GETARG_JSONB_P(0);
+    pg_uuid_t *uuid = PG_GETARG_UUID_P(1);
+    varlena *copy = PG_DETOAST_DATUM_COPY(PG_GETARG_DATUM(0));
+    if (json == NULL || uuid == NULL || copy == NULL) {
+        PG_RETURN_NULL();
+    }
+
+    varlena *roundtrip = DatumGetVarLenaP(VarLenaPGetDatum(copy));
+    if (VARSIZE_ANY(roundtrip) != VARSIZE_ANY(json)) {
+        PG_RETURN_NULL();
+    }
+
+    char json_buf[64];
+    char uuid_buf[64];
+    text_to_cstring_buffer((text *)json, json_buf, sizeof(json_buf));
+    text_to_cstring_buffer((text *)uuid, uuid_buf, sizeof(uuid_buf));
+    text *prefix = cstring_to_text_with_len(json_buf, 7);
+    char *prefix_cstr = text_to_cstring(prefix);
+
+    char buf[220];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%u:%u:%s:%s:%s",
+        (unsigned)JSONBOID,
+        (unsigned)UUIDOID,
+        json_buf,
+        uuid_buf,
+        prefix_cstr
+    );
+    PG_FREE_IF_COPY(copy, 0);
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
 Datum pgrs_c_fmgr_cache(PG_FUNCTION_ARGS) {
     if (fcinfo->flinfo == NULL || fcinfo->flinfo->fn_nargs != 1 || fcinfo->flinfo->fn_oid == 0) {
         PG_RETURN_NULL();
@@ -746,6 +1383,50 @@ Datum pgrs_c_fmgr_cache(PG_FUNCTION_ARGS) {
     }
     *cached += PG_GETARG_INT32(0);
     PG_RETURN_INT32(*cached);
+}
+
+Datum pgrs_c_extended_alloc(PG_FUNCTION_ARGS) {
+    char *buf = (char *)palloc_extended(5, MCXT_ALLOC_ZERO | MCXT_ALLOC_NO_OOM);
+    if (buf == NULL || buf[0] != '\0' || buf[4] != '\0') {
+        PG_RETURN_NULL();
+    }
+    memcpy(buf, "abc", 4);
+    buf = (char *)repalloc0(buf, 5, 9);
+    if (buf == NULL || strcmp(buf, "abc") != 0 || buf[5] != '\0' || buf[8] != '\0') {
+        PG_RETURN_NULL();
+    }
+
+    char *ctx = (char *)MemoryContextAllocExtended(CurrentMemoryContext, 4, MCXT_ALLOC_ZERO);
+    if (ctx == NULL || ctx[0] != '\0' || ctx[3] != '\0') {
+        PG_RETURN_NULL();
+    }
+    memcpy(ctx, "ctx", 4);
+
+    char *huge = (char *)MemoryContextAllocExtended(CurrentMemoryContext, 2, MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+    if (huge == NULL || huge[0] != '\0' || huge[1] != '\0') {
+        PG_RETURN_NULL();
+    }
+    huge[0] = 'x';
+
+    char *zero_aligned = (char *)MemoryContextAllocZeroAligned(CurrentMemoryContext, 2);
+    int aligned_zeroed = zero_aligned != NULL && zero_aligned[0] == '\0' && zero_aligned[1] == '\0';
+
+    char *dup = MemoryContextStrdup(CurrentMemoryContext, "dup");
+    int dup_ok = dup != NULL && strcmp(dup, "dup") == 0;
+
+    char out[80];
+    snprintf(
+        out,
+        sizeof(out),
+        "%s:%s:%d:%d:%d",
+        buf,
+        ctx,
+        huge[0] == 'x' ? 1 : 0,
+        aligned_zeroed,
+        dup_ok
+    );
+    pfree(buf);
+    PG_RETURN_TEXT_P(cstring_to_text(out));
 }
 
 Datum pgrs_c_context_switch(PG_FUNCTION_ARGS) {
@@ -932,6 +1613,71 @@ Datum pgrs_c_catalog_helpers(PG_FUNCTION_ARGS) {
         func_name,
         (unsigned)rettype,
         nargs
+    );
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_namespace_helpers(PG_FUNCTION_ARGS) {
+    char *name = get_namespace_name(PG_CATALOG_NAMESPACE_OID);
+    Oid nspid = get_namespace_oid("pg_catalog", false);
+    Oid missing = get_namespace_oid("missing_schema", true);
+    HeapTuple tuple = SearchSysCache1(NAMESPACENAME, CStringGetDatum("pg_catalog"));
+    if (name == NULL || nspid == InvalidOid || !HeapTupleIsValid(tuple)) {
+        PG_RETURN_NULL();
+    }
+    Form_pg_namespace form = (Form_pg_namespace)GETSTRUCT(tuple);
+    int owner = (int)form->nspowner;
+    ReleaseSysCache(tuple);
+    HeapTuple by_oid = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(PG_CATALOG_NAMESPACE_OID));
+    int oid_lookup = HeapTupleIsValid(by_oid) ? 1 : 0;
+    if (HeapTupleIsValid(by_oid)) {
+        ReleaseSysCache(by_oid);
+    }
+    char buf[160];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%s:%u:%d:%d:%u",
+        name,
+        (unsigned)nspid,
+        owner,
+        oid_lookup,
+        (unsigned)missing
+    );
+    PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+Datum pgrs_c_syscache_helpers(PG_FUNCTION_ARGS) {
+    bool has_text = SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(TEXTOID));
+    bool has_missing = SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum((Oid)999999));
+    Oid text_oid = GetSysCacheOid2(
+        TYPENAMENSP,
+        Anum_pg_type_oid,
+        CStringGetDatum("text"),
+        ObjectIdGetDatum(PG_CATALOG_NAMESPACE_OID)
+    );
+    Oid int_oid = GetSysCacheOid1(TYPEOID, Anum_pg_type_oid, ObjectIdGetDatum(INT4OID));
+    Oid namespace_oid = GetSysCacheOid1(
+        NAMESPACENAME,
+        Anum_pg_namespace_oid,
+        CStringGetDatum("pg_catalog")
+    );
+    HeapTuple tuple = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(PG_CATALOG_NAMESPACE_OID));
+    Oid tuple_oid = HeapTupleGetOid(tuple);
+    if (HeapTupleIsValid(tuple)) {
+        ReleaseSysCache(tuple);
+    }
+    char buf[128];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%d:%d:%u:%u:%u:%u",
+        has_text ? 1 : 0,
+        has_missing ? 1 : 0,
+        (unsigned)text_oid,
+        (unsigned)int_oid,
+        (unsigned)namespace_oid,
+        (unsigned)tuple_oid
     );
     PG_RETURN_TEXT_P(cstring_to_text(buf));
 }

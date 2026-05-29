@@ -17,7 +17,8 @@ use std::ptr::NonNull;
 
 use crate::executor::eval_expr;
 use crate::sql::Parser;
-use crate::sql::ast::{SelectItem, Statement};
+use crate::sql::ast::{Expr, Select, SelectItem, Statement, TableRef};
+use crate::sql::serialize::statement_to_sql;
 use crate::types::{DataType, Value};
 
 pub type PgDatum = usize;
@@ -46,9 +47,12 @@ const SPI_ERROR_UNSUPPORTED: c_int = -100;
 const SYSCACHE_TYPEOID: c_int = 1;
 const SYSCACHE_TYPENAMENSP: c_int = 2;
 const SYSCACHE_PROCOID: c_int = 3;
+const SYSCACHE_NAMESPACEOID: c_int = 4;
+const SYSCACHE_NAMESPACENAME: c_int = 5;
 const HEAP_TUPLE_KIND_SPI: c_int = 0;
 const HEAP_TUPLE_KIND_PG_TYPE: c_int = 1;
 const HEAP_TUPLE_KIND_PG_PROC: c_int = 2;
+const HEAP_TUPLE_KIND_PG_NAMESPACE: c_int = 3;
 const PG_CATALOG_NAMESPACE_OID: u32 = 11;
 const DEFAULT_COLLATION_OID: u32 = 100;
 const C_LANGUAGE_OID: u32 = 13;
@@ -105,11 +109,15 @@ pub struct PgHeapTupleData {
     row_index: usize,
     data: *mut c_void,
     kind: c_int,
+    natts: c_int,
+    values: *mut PgDatum,
+    isnull: *mut bool,
 }
 
 #[repr(C)]
 pub struct PgTupleDescData {
     natts: c_int,
+    attrs: *const PgAttributeFormData,
 }
 
 #[repr(C)]
@@ -149,9 +157,40 @@ struct PgProcFormData {
     pronargs: i16,
 }
 
+#[repr(C)]
+struct PgNamespaceFormData {
+    oid: u32,
+    nspname: [c_char; 64],
+    nspowner: u32,
+    nspacl: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+struct PgAttributeFormData {
+    attrelid: u32,
+    attname: [c_char; 64],
+    atttypid: u32,
+    attlen: i16,
+    attnum: i16,
+    attbyval: bool,
+    attalign: c_char,
+    attnotnull: bool,
+}
+
 type PgSpiExecuteFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     query: *const c_char,
+    read_only: bool,
+    count: i64,
+) -> c_int;
+type PgSpiExecuteWithArgsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    query: *const c_char,
+    nargs: c_int,
+    argtypes: *const u32,
+    values: *const PgDatum,
+    nulls: *const c_char,
     read_only: bool,
     count: i64,
 ) -> c_int;
@@ -204,6 +243,7 @@ pub struct PgExtensionContext {
     memory_state: *mut c_void,
     current_memory_context: *mut PgMemoryContextData,
     spi_execute: Option<PgSpiExecuteFn>,
+    spi_execute_with_args: Option<PgSpiExecuteWithArgsFn>,
     spi_getvalue: Option<PgSpiGetValueFn>,
     spi_getbinval: Option<PgSpiGetBinValFn>,
     memory_alloc: Option<PgAllocFn>,
@@ -233,8 +273,14 @@ pub struct NativeUdf {
 pub struct NativeSpiResult {
     pub code: c_int,
     pub processed: usize,
+    pub fields: Vec<NativeSpiField>,
     pub rows: Vec<Vec<Value>>,
     pub has_tuptable: bool,
+}
+
+pub struct NativeSpiField {
+    pub name: String,
+    pub data_type: DataType,
 }
 
 impl NativeSpiResult {
@@ -242,6 +288,7 @@ impl NativeSpiResult {
         Self {
             code: SPI_OK_SELECT,
             processed: rows.len(),
+            fields: Vec::new(),
             rows,
             has_tuptable: true,
         }
@@ -251,15 +298,17 @@ impl NativeSpiResult {
         Self {
             code,
             processed,
+            fields: Vec::new(),
             rows: Vec::new(),
             has_tuptable: false,
         }
     }
 
-    pub fn returning(code: c_int, rows: Vec<Vec<Value>>) -> Self {
+    pub fn returning(code: c_int, fields: Vec<NativeSpiField>, rows: Vec<Vec<Value>>) -> Self {
         Self {
             code,
             processed: rows.len(),
+            fields,
             rows,
             has_tuptable: true,
         }
@@ -279,6 +328,7 @@ struct NativeSpiState {
     datum_storage: Vec<Vec<u8>>,
     heap_rows: Vec<Box<PgHeapTupleData>>,
     row_ptrs: Vec<*const PgHeapTupleData>,
+    tuple_attrs: Vec<PgAttributeFormData>,
     tuple_desc: Option<Box<PgTupleDescData>>,
     tuple_table: Option<Box<PgSpiTupleTable>>,
     config_values: Vec<CString>,
@@ -371,6 +421,7 @@ pub fn eval_native_udf(udf: &NativeUdf, vals: &[Value]) -> Result<Value, String>
         memory_state: &mut memory_state as *mut NativeMemoryState as *mut c_void,
         current_memory_context: &mut current_memory_context as *mut PgMemoryContextData,
         spi_execute: Some(spi_execute_callback),
+        spi_execute_with_args: Some(spi_execute_with_args_callback),
         spi_getvalue: Some(spi_getvalue_callback),
         spi_getbinval: Some(spi_getbinval_callback),
         memory_alloc: Some(memory_alloc_callback),
@@ -469,27 +520,69 @@ unsafe extern "C" fn spi_execute_callback(
         .to_string_lossy()
         .into_owned();
     match execute_spi_query(&query, _read_only, count) {
-        Ok(result) => {
-            context.spi_result = result.code;
-            context.spi_processed = result.processed;
-            if result.has_tuptable {
-                state.set_rows(result.rows);
-                context.spi_tuptable = state
-                    .tuple_table
-                    .as_deref_mut()
-                    .map(|table| table as *mut PgSpiTupleTable)
-                    .unwrap_or(std::ptr::null_mut());
-            } else {
-                state.clear_rows();
-                context.spi_tuptable = std::ptr::null_mut();
-            }
-            result.code
-        }
+        Ok(result) => apply_spi_result(context, state, result),
         Err(e) => {
             state.error = Some(e);
             SPI_ERROR_UNSUPPORTED
         }
     }
+}
+
+unsafe extern "C" fn spi_execute_with_args_callback(
+    ctx: *mut c_void,
+    query: *const c_char,
+    nargs: c_int,
+    argtypes: *const u32,
+    values: *const PgDatum,
+    nulls: *const c_char,
+    read_only: bool,
+    count: i64,
+) -> c_int {
+    let Some((context, state)) = spi_context_and_state(ctx) else {
+        return SPI_ERROR_UNSUPPORTED;
+    };
+    if query.is_null() {
+        state.error = Some("SPI_execute_with_args received a null query".into());
+        return SPI_ERROR_UNSUPPORTED;
+    }
+    let query = unsafe { CStr::from_ptr(query) }
+        .to_string_lossy()
+        .into_owned();
+    let params = match unsafe { spi_params_from_datums(nargs, argtypes, values, nulls) } {
+        Ok(params) => params,
+        Err(e) => {
+            state.error = Some(e);
+            return SPI_ERROR_UNSUPPORTED;
+        }
+    };
+    match execute_spi_query_with_params(&query, &params, read_only, count) {
+        Ok(result) => apply_spi_result(context, state, result),
+        Err(e) => {
+            state.error = Some(e);
+            SPI_ERROR_UNSUPPORTED
+        }
+    }
+}
+
+fn apply_spi_result(
+    context: &mut PgExtensionContext,
+    state: &mut NativeSpiState,
+    result: NativeSpiResult,
+) -> c_int {
+    context.spi_result = result.code;
+    context.spi_processed = result.processed;
+    if result.has_tuptable {
+        state.set_rows(result.rows, result.fields);
+        context.spi_tuptable = state
+            .tuple_table
+            .as_deref_mut()
+            .map(|table| table as *mut PgSpiTupleTable)
+            .unwrap_or(std::ptr::null_mut());
+    } else {
+        state.clear_rows();
+        context.spi_tuptable = std::ptr::null_mut();
+    }
+    result.code
 }
 
 unsafe extern "C" fn memory_alloc_callback(
@@ -641,6 +734,9 @@ fn syscache_tuple_from_form(
         row_index: 0,
         data,
         kind,
+        natts: 0,
+        values: std::ptr::null_mut(),
+        isnull: std::ptr::null_mut(),
     }));
     let Some(non_null) = NonNull::new(tuple) else {
         unsafe {
@@ -798,6 +894,26 @@ fn execute_spi_query(query: &str, read_only: bool, count: i64) -> Result<NativeS
     spi_execute_select(query, count).map(NativeSpiResult::select)
 }
 
+fn execute_spi_query_with_params(
+    query: &str,
+    params: &[Value],
+    read_only: bool,
+    count: i64,
+) -> Result<NativeSpiResult, String> {
+    let mut stmts: Vec<Statement> = Parser::parse_sql(query)?
+        .into_iter()
+        .filter(|stmt| !matches!(stmt, Statement::Empty))
+        .collect();
+    if stmts.len() != 1 {
+        return Err("SPI_execute_with_args supports one statement".into());
+    }
+    let Some(mut stmt) = stmts.pop() else {
+        return Err("SPI_execute_with_args requires a statement".into());
+    };
+    bind_spi_statement(&mut stmt, params)?;
+    execute_spi_query(&statement_to_sql(&stmt), read_only, count)
+}
+
 fn spi_execute_select(query: &str, count: i64) -> Result<Vec<Vec<Value>>, String> {
     let mut stmts: Vec<Statement> = Parser::parse_sql(query)?
         .into_iter()
@@ -849,6 +965,238 @@ fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+unsafe fn spi_params_from_datums(
+    nargs: c_int,
+    argtypes: *const u32,
+    values: *const PgDatum,
+    nulls: *const c_char,
+) -> Result<Vec<Value>, String> {
+    if nargs < 0 {
+        return Err("SPI_execute_with_args received a negative nargs".into());
+    }
+    if nargs > 0 && values.is_null() {
+        return Err("SPI_execute_with_args received null values for nonzero nargs".into());
+    }
+    let mut params = Vec::with_capacity(nargs as usize);
+    for idx in 0..nargs as usize {
+        let isnull = if nulls.is_null() {
+            false
+        } else {
+            unsafe { *nulls.add(idx) == b'n' as c_char }
+        };
+        if isnull {
+            params.push(Value::Null);
+            continue;
+        }
+        let oid = if argtypes.is_null() {
+            0
+        } else {
+            unsafe { *argtypes.add(idx) as i32 }
+        };
+        let datum = unsafe { *values.add(idx) };
+        params.push(spi_datum_to_value(datum, oid)?);
+    }
+    Ok(params)
+}
+
+fn spi_datum_to_value(datum: PgDatum, oid: i32) -> Result<Value, String> {
+    match oid {
+        0 | 25 => datum_text(datum).map(Value::Text),
+        16 => Ok(Value::Bool(datum != 0)),
+        20 => Ok(Value::Int(datum as i64)),
+        21 => Ok(Value::Int((datum as i16) as i64)),
+        23 => Ok(Value::Int((datum as i32) as i64)),
+        700 => Ok(Value::Float(f32::from_bits(datum as u32) as f64)),
+        701 => Ok(Value::Float(f64::from_bits(datum as u64))),
+        _ => {
+            let Some(dt) = data_type_for_oid(oid) else {
+                return datum_text(datum).map(Value::Text);
+            };
+            datum_to_value(datum, Some(dt))
+        }
+    }
+}
+
+fn data_type_for_oid(oid: i32) -> Option<DataType> {
+    DataType::ALL.iter().copied().find(|dt| dt.oid() == oid)
+}
+
+fn bind_spi_statement(stmt: &mut Statement, params: &[Value]) -> Result<(), String> {
+    match stmt {
+        Statement::Insert(i) => {
+            for tuple in &mut i.rows {
+                for expr in tuple {
+                    bind_spi_expr(expr, params)?;
+                }
+            }
+            if let Some(select) = &mut i.select {
+                bind_spi_select(select, params)?;
+            }
+        }
+        Statement::Select(select) => bind_spi_select(select, params)?,
+        Statement::Update(update) => {
+            for (_, expr) in &mut update.assignments {
+                bind_spi_expr(expr, params)?;
+            }
+            if let Some(filter) = &mut update.filter {
+                bind_spi_expr(filter, params)?;
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(filter) = &mut delete.filter {
+                bind_spi_expr(filter, params)?;
+            }
+        }
+        Statement::Explain(explain) => bind_spi_statement(&mut explain.statement, params)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bind_spi_select(select: &mut Select, params: &[Value]) -> Result<(), String> {
+    for item in &mut select.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            bind_spi_expr(expr, params)?;
+        }
+    }
+    if let Some(filter) = &mut select.filter {
+        bind_spi_expr(filter, params)?;
+    }
+    if let Some(from) = &mut select.from {
+        bind_spi_table_ref(&mut from.base, params)?;
+        for join in &mut from.joins {
+            bind_spi_table_ref(&mut join.table, params)?;
+            if let Some(on) = &mut join.on {
+                bind_spi_expr(on, params)?;
+            }
+        }
+    }
+    for group in &mut select.group_by {
+        bind_spi_expr(group, params)?;
+    }
+    if let Some(having) = &mut select.having {
+        bind_spi_expr(having, params)?;
+    }
+    for order in &mut select.order_by {
+        bind_spi_expr(&mut order.expr, params)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        bind_spi_expr(limit, params)?;
+    }
+    if let Some(offset) = &mut select.offset {
+        bind_spi_expr(offset, params)?;
+    }
+    for set_op in &mut select.set_ops {
+        bind_spi_select(&mut set_op.select, params)?;
+    }
+    Ok(())
+}
+
+fn bind_spi_table_ref(table: &mut TableRef, params: &[Value]) -> Result<(), String> {
+    for arg in &mut table.args {
+        bind_spi_expr(arg, params)?;
+    }
+    if let Some(subquery) = &mut table.subquery {
+        bind_spi_select(subquery, params)?;
+    }
+    Ok(())
+}
+
+fn bind_spi_expr(expr: &mut Expr, params: &[Value]) -> Result<(), String> {
+    match expr {
+        Expr::Param(n) => {
+            let idx = (*n as usize)
+                .checked_sub(1)
+                .ok_or_else(|| "parameter $0 is invalid".to_string())?;
+            let value = params.get(idx).ok_or_else(|| {
+                format!("SPI_execute_with_args supplies too few parameters for ${n}")
+            })?;
+            *expr = value_to_expr(value);
+        }
+        Expr::Unary { expr, .. } => bind_spi_expr(expr, params)?,
+        Expr::Binary { left, right, .. } => {
+            bind_spi_expr(left, params)?;
+            bind_spi_expr(right, params)?;
+        }
+        Expr::QuantifiedCompare { left, list, .. } => {
+            bind_spi_expr(left, params)?;
+            for item in list {
+                bind_spi_expr(item, params)?;
+            }
+        }
+        Expr::Row(items) | Expr::Array(items) => {
+            for item in items {
+                bind_spi_expr(item, params)?;
+            }
+        }
+        Expr::IsNull { expr, .. } => bind_spi_expr(expr, params)?,
+        Expr::IsDistinctFrom { left, right, .. } => {
+            bind_spi_expr(left, params)?;
+            bind_spi_expr(right, params)?;
+        }
+        Expr::Like { expr, pattern, .. } => {
+            bind_spi_expr(expr, params)?;
+            bind_spi_expr(pattern, params)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            bind_spi_expr(expr, params)?;
+            for item in list {
+                bind_spi_expr(item, params)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            bind_spi_expr(expr, params)?;
+            bind_spi_expr(low, params)?;
+            bind_spi_expr(high, params)?;
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                bind_spi_expr(operand, params)?;
+            }
+            for (condition, result) in whens {
+                bind_spi_expr(condition, params)?;
+                bind_spi_expr(result, params)?;
+            }
+            if let Some(else_expr) = else_expr {
+                bind_spi_expr(else_expr, params)?;
+            }
+        }
+        Expr::Cast { expr, .. } => bind_spi_expr(expr, params)?,
+        Expr::InSubquery { expr, .. } => bind_spi_expr(expr, params)?,
+        Expr::Function { args, filter, .. } => {
+            for arg in args {
+                bind_spi_expr(arg, params)?;
+            }
+            if let Some(filter) = filter {
+                bind_spi_expr(filter, params)?;
+            }
+        }
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn value_to_expr(value: &Value) -> Expr {
+    match value {
+        Value::Null => Expr::Null,
+        Value::Int(i) => Expr::Int(*i),
+        Value::Float(f) => Expr::Float(*f),
+        Value::Numeric(n) => Expr::Cast {
+            expr: Box::new(Expr::Str(n.to_canonical_string())),
+            target: DataType::Numeric,
+        },
+        Value::Text(s) => Expr::Str(s.clone()),
+        Value::Bool(b) => Expr::Bool(*b),
+    }
+}
+
 fn lookup_syscache_form(
     state: &NativeSpiState,
     cache_id: c_int,
@@ -864,6 +1212,12 @@ fn lookup_syscache_form(
         return Some((
             Box::into_raw(Box::new(form)) as *mut c_void,
             HEAP_TUPLE_KIND_PG_PROC,
+        ));
+    }
+    if let Some(form) = lookup_namespace_form(cache_id, key) {
+        return Some((
+            Box::into_raw(Box::new(form)) as *mut c_void,
+            HEAP_TUPLE_KIND_PG_NAMESPACE,
         ));
     }
     None
@@ -948,6 +1302,32 @@ fn lookup_proc_form(
     }
 }
 
+fn lookup_namespace_form(cache_id: c_int, key: PgDatum) -> Option<PgNamespaceFormData> {
+    match cache_id {
+        SYSCACHE_NAMESPACEOID => {
+            if key as u32 == PG_CATALOG_NAMESPACE_OID {
+                Some(pg_catalog_namespace_form())
+            } else {
+                None
+            }
+        }
+        SYSCACHE_NAMESPACENAME => {
+            if key == 0 {
+                return None;
+            }
+            let name = unsafe { CStr::from_ptr(key as *const c_char) }
+                .to_string_lossy()
+                .into_owned();
+            if name == "pg_catalog" {
+                Some(pg_catalog_namespace_form())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn pg_type_form(dt: DataType) -> PgTypeFormData {
     let mut typname = [0 as c_char; 64];
     copy_c_name(&mut typname, dt.pg_type_name());
@@ -985,6 +1365,40 @@ fn pg_proc_form_for_udf(udf: &NativeUdf) -> PgProcFormData {
         prorettype: udf.return_type.map_or(0, |dt| dt.oid() as u32),
         pronargs: udf.arg_types.len() as i16,
     }
+}
+
+fn pg_catalog_namespace_form() -> PgNamespaceFormData {
+    let mut nspname = [0 as c_char; 64];
+    copy_c_name(&mut nspname, "pg_catalog");
+    PgNamespaceFormData {
+        oid: PG_CATALOG_NAMESPACE_OID,
+        nspname,
+        nspowner: 10,
+        nspacl: std::ptr::null_mut(),
+    }
+}
+
+fn pg_attribute_form(attnum: i16, name: &str, data_type: DataType) -> PgAttributeFormData {
+    let mut attname = [0 as c_char; 64];
+    copy_c_name(&mut attname, name);
+    PgAttributeFormData {
+        attrelid: 0,
+        attname,
+        atttypid: data_type.oid() as u32,
+        attlen: data_type.type_size(),
+        attnum,
+        attbyval: data_type.type_size() > 0 && data_type.type_size() <= 8,
+        attalign: b'i' as c_char,
+        attnotnull: false,
+    }
+}
+
+fn infer_spi_column_type(rows: &[Vec<Value>], column_index: usize) -> DataType {
+    rows.iter()
+        .filter_map(|row| row.get(column_index))
+        .find(|value| !value.is_null())
+        .map(Value::inferred_type)
+        .unwrap_or(DataType::Text)
 }
 
 fn copy_c_name(out: &mut [c_char], value: &str) {
@@ -1059,15 +1473,33 @@ unsafe fn free_syscache_form(data: *mut c_void, kind: c_int) {
         HEAP_TUPLE_KIND_PG_PROC => unsafe {
             drop(Box::from_raw(data as *mut PgProcFormData));
         },
+        HEAP_TUPLE_KIND_PG_NAMESPACE => unsafe {
+            drop(Box::from_raw(data as *mut PgNamespaceFormData));
+        },
         _ => {}
     }
 }
 
 impl NativeSpiState {
-    fn set_rows(&mut self, rows: Vec<Vec<Value>>) {
+    fn set_rows(&mut self, rows: Vec<Vec<Value>>, fields: Vec<NativeSpiField>) {
         self.rows.clear();
         self.datum_rows.clear();
         self.datum_storage.clear();
+        self.tuple_attrs.clear();
+        let attr_count = fields.len().max(rows.first().map_or(0, Vec::len));
+        for idx in 0..attr_count {
+            let data_type = fields
+                .get(idx)
+                .map(|field| field.data_type)
+                .unwrap_or_else(|| infer_spi_column_type(&rows, idx));
+            let name = fields
+                .get(idx)
+                .map(|field| field.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("?column?");
+            self.tuple_attrs
+                .push(pg_attribute_form(idx as i16 + 1, name, data_type));
+        }
         for row in rows {
             let mut text_row = Vec::with_capacity(row.len());
             let mut datum_row = Vec::with_capacity(row.len());
@@ -1084,6 +1516,9 @@ impl NativeSpiState {
                     row_index: idx,
                     data: std::ptr::null_mut(),
                     kind: HEAP_TUPLE_KIND_SPI,
+                    natts: 0,
+                    values: std::ptr::null_mut(),
+                    isnull: std::ptr::null_mut(),
                 })
             })
             .collect();
@@ -1092,8 +1527,11 @@ impl NativeSpiState {
             .iter()
             .map(|row| row.as_ref() as *const PgHeapTupleData)
             .collect();
-        let natts = self.rows.first().map_or(0, Vec::len) as c_int;
-        self.tuple_desc = Some(Box::new(PgTupleDescData { natts }));
+        let natts = attr_count as c_int;
+        self.tuple_desc = Some(Box::new(PgTupleDescData {
+            natts,
+            attrs: self.tuple_attrs.as_ptr(),
+        }));
         self.tuple_table = Some(Box::new(PgSpiTupleTable {
             tupdesc: self
                 .tuple_desc
@@ -1111,6 +1549,7 @@ impl NativeSpiState {
         self.datum_storage.clear();
         self.heap_rows.clear();
         self.row_ptrs.clear();
+        self.tuple_attrs.clear();
         self.tuple_desc = None;
         self.tuple_table = None;
     }
