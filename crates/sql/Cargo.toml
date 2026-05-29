@@ -1,0 +1,9 @@
+[package]
+name = "postgres-sql"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Internal SQL lexer, parser, AST, and serializer for postgres-rs"
+
+[dependencies]
+postgres-types = { path = "../types" }

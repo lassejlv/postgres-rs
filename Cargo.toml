@@ -4,7 +4,24 @@ version = "0.1.0"
 edition = "2024"
 description = "A fast, lightweight, PostgreSQL wire-compatible database written in Rust"
 
+[workspace]
+members = [
+    "crates/types",
+    "crates/sql",
+    "crates/auth",
+    "crates/protocol",
+    "crates/engine",
+    "crates/server",
+]
+resolver = "3"
+
 [dependencies]
+postgres-auth = { path = "crates/auth" }
+postgres-engine = { path = "crates/engine" }
+postgres-protocol = { path = "crates/protocol" }
+postgres-server = { path = "crates/server" }
+postgres-sql = { path = "crates/sql" }
+postgres-types = { path = "crates/types" }
 
 # Micro-benchmark proving the index speedup. Run with:
 #   cargo run --release --bin bench

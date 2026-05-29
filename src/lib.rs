@@ -1,27 +1,13 @@
 //! postgres-rs: a fast, lightweight, PostgreSQL wire-compatible database.
 //!
-//! The crate is split into:
-//! - [`protocol`]: the PostgreSQL v3 frontend/backend wire format.
-//! - [`sql`]: lexer, AST, and parser for the supported SQL subset.
-//! - [`storage`]: the (currently in-memory) storage engine.
-//! - [`index`]: B-tree secondary indexes for fast lookups and range scans.
-//! - [`executor`]: turns parsed statements into results.
-//! - [`bind`]: extended-protocol parameter decoding/substitution.
-//! - [`server`]: TCP server and per-connection session handling.
+//! This root crate is a compatibility facade over private workspace crates.
+//! Existing callers can continue to use paths such as [`executor`], [`sql`],
+//! [`storage`], and [`server`] while the implementation lives under `crates/`.
 
-pub mod auth;
-pub mod bind;
-pub mod crypto;
-pub mod disk;
-pub mod executor;
-pub mod hba;
-pub mod index;
-pub mod lock;
-pub mod numeric;
-pub mod plpgsql;
-pub mod protocol;
-pub mod server;
-pub mod sql;
-pub mod storage;
-pub mod types;
-pub mod wal;
+pub use postgres_auth::{auth, crypto, hba};
+pub use postgres_engine::{disk, executor, index, lock, plpgsql, storage, wal};
+pub use postgres_protocol as protocol;
+pub use postgres_server::{bind, server};
+pub use postgres_sql as sql;
+pub use postgres_types::{numeric, types};
+pub use postgres_types::{BigDecimal, DataType, Value};

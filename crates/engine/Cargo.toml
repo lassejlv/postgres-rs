@@ -1,0 +1,10 @@
+[package]
+name = "postgres-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Internal execution, storage, indexing, locking, and persistence engine for postgres-rs"
+
+[dependencies]
+postgres-sql = { path = "../sql" }
+postgres-types = { path = "../types" }

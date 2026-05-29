@@ -1,0 +1,13 @@
+[package]
+name = "postgres-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Internal TCP server, session, transaction, and bind handling for postgres-rs"
+
+[dependencies]
+postgres-auth = { path = "../auth" }
+postgres-engine = { path = "../engine" }
+postgres-protocol = { path = "../protocol" }
+postgres-sql = { path = "../sql" }
+postgres-types = { path = "../types" }
