@@ -596,6 +596,9 @@ fn handle_simple_query<R: Read, W: Write>(
     session: &mut Session,
     sql: &str,
 ) -> io::Result<()> {
+    if std::env::var("PGRS_TRACE_QUERY").is_ok() {
+        eprintln!("QUERY: {sql}");
+    }
     let statements = match Parser::parse_sql(sql) {
         Ok(s) => s,
         Err(e) => {

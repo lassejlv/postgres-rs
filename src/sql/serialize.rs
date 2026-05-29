@@ -1011,6 +1011,21 @@ fn alter_table_sql(a: &AlterTable) -> String {
             };
             format!("ALTER TABLE {t} {verb} ROW LEVEL SECURITY")
         }
+        AlterAction::SetColumnDefault { column, default } => format!(
+            "ALTER TABLE {t} ALTER COLUMN {} SET DEFAULT {}",
+            ident(column),
+            expr_to_sql(default)
+        ),
+        AlterAction::DropColumnDefault { column } => format!(
+            "ALTER TABLE {t} ALTER COLUMN {} DROP DEFAULT",
+            ident(column)
+        ),
+        AlterAction::SetColumnNotNull { column, not_null } => format!(
+            "ALTER TABLE {t} ALTER COLUMN {} {} NOT NULL",
+            ident(column),
+            if *not_null { "SET" } else { "DROP" }
+        ),
+        AlterAction::AlterColumnNoop | AlterAction::Noop => format!("ALTER TABLE {t}"),
     }
 }
 

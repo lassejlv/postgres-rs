@@ -435,8 +435,8 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] CSV copy options
 - [x] Binary copy format
 - [x] Large bulk insert optimization
-- [ ] `pg_dump` compatibility
-- [ ] `pg_restore` compatibility
+- [x] `pg_dump` compatibility (verified vs real pg_dump)
+- [x] `pg_restore` compatibility (plain + -Fc, verified)
 
 ## Replication, Backup, and High Availability
 

@@ -865,6 +865,27 @@ pub enum AlterAction {
     RowSecurity {
         action: RowSecurityAction,
     },
+    /// `ALTER COLUMN col SET DEFAULT expr`.
+    SetColumnDefault {
+        column: String,
+        default: Expr,
+    },
+    /// `ALTER COLUMN col DROP DEFAULT`.
+    DropColumnDefault {
+        column: String,
+    },
+    /// `ALTER COLUMN col {SET|DROP} NOT NULL`.
+    SetColumnNotNull {
+        column: String,
+        not_null: bool,
+    },
+    /// Per-column attribute tweaks that this engine does not model
+    /// (`SET STORAGE`, `SET STATISTICS`, `SET (...)`, `RESET (...)`,
+    /// `SET COMPRESSION`). Accepted as a no-op so `pg_dump` output replays.
+    AlterColumnNoop,
+    /// Other table-level clauses accepted but not modeled (`SET (...)`,
+    /// `CLUSTER ON`, `SET WITHOUT CLUSTER`, `INHERIT`, etc.).
+    Noop,
 }
 
 /// The row-level-security toggle in `ALTER TABLE ... ROW LEVEL SECURITY`.

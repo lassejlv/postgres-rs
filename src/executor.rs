@@ -1737,6 +1737,23 @@ fn resolve_source_table(
         }
         return Ok((names, types, view.rows.clone()));
     }
+    // A sequence read as a relation: `SELECT last_value, is_called FROM seq`
+    // (pg_dump captures sequence state this way).
+    if let Some(seq) = db.sequences().into_iter().find(|s| s.name == tref.name) {
+        let q = tref.qualifier();
+        let names = vec![
+            format!("{q}.last_value"),
+            format!("{q}.log_cnt"),
+            format!("{q}.is_called"),
+        ];
+        let types = vec![DataType::Int8, DataType::Int8, DataType::Bool];
+        let rows = vec![vec![
+            Value::Int(seq.last_value),
+            Value::Int(0),
+            Value::Bool(seq.called),
+        ]];
+        return Ok((names, types, rows));
+    }
     let table = db
         .table(&tref.name)
         .ok_or_else(|| format!("relation \"{}\" does not exist", tref.name))?;
@@ -3291,6 +3308,12 @@ fn is_pg_catalog_table(name: &str) -> bool {
             | "pg_user_mapping"
             | "pg_transform"
             | "pg_subscription"
+            | "pg_range"
+            | "pg_amop"
+            | "pg_amproc"
+            | "pg_seclabels"
+            | "pg_shseclabel"
+            | "pg_db_role_setting"
     )
 }
 
@@ -3822,12 +3845,53 @@ fn virtual_pg_catalog_inner(
                 ("typacl", DataType::Text),
                 ("typisdefined", DataType::Bool),
                 ("typarray", DataType::Int8),
+                ("typstorage", DataType::Text),
+                ("typinput", DataType::Int8),
+                ("typoutput", DataType::Int8),
+                ("typreceive", DataType::Int8),
+                ("typsend", DataType::Int8),
+                ("typanalyze", DataType::Int8),
+                ("typmodin", DataType::Int8),
+                ("typmodout", DataType::Int8),
+                ("typsubscript", DataType::Int8),
+                ("typdelim", DataType::Text),
+                ("typalign", DataType::Text),
+                ("typispreferred", DataType::Bool),
+                ("typdefault", DataType::Text),
+                ("typdefaultbin", DataType::Text),
+                ("typbasetype", DataType::Int8),
+                ("typtypmod", DataType::Int4),
+                ("typnotnull", DataType::Bool),
+                ("typndims", DataType::Int4),
             ];
+            // Trailing default fields shared by every type row (no real type
+            // I/O functions are modeled; OID 0 = "none").
+            let type_tail = || -> Vec<Value> {
+                vec![
+                    Value::Int(0),          // typinput
+                    Value::Int(0),          // typoutput
+                    Value::Int(0),          // typreceive
+                    Value::Int(0),          // typsend
+                    Value::Int(0),          // typanalyze
+                    Value::Int(0),          // typmodin
+                    Value::Int(0),          // typmodout
+                    Value::Int(0),          // typsubscript
+                    Value::Text(",".into()), // typdelim
+                    Value::Text("i".into()), // typalign
+                    Value::Bool(false),     // typispreferred
+                    Value::Null,            // typdefault
+                    Value::Null,            // typdefaultbin
+                    Value::Int(0),          // typbasetype
+                    Value::Int(-1),         // typtypmod
+                    Value::Bool(false),     // typnotnull
+                    Value::Int(0),          // typndims
+                ]
+            };
             let mut rows: Vec<Vec<Value>> = DataType::ALL
                 .iter()
                 .map(|dt| {
                     let collation = if *dt == DataType::Text { 100 } else { 0 };
-                    vec![
+                    let mut base = vec![
                         Value::Int(dt.oid() as i64),
                         Value::Text(dt.pg_type_name().into()),
                         Value::Int(11),
@@ -3842,14 +3906,19 @@ fn virtual_pg_catalog_inner(
                         Value::Null,     // typacl
                         Value::Bool(true), // typisdefined
                         Value::Int(0),   // typarray
-                    ]
+                        // 'x' (extended) for varlena text-ish types, 'p' (plain)
+                        // for fixed-width by-value types.
+                        Value::Text(if dt.type_size() < 0 { "x" } else { "p" }.into()),
+                    ];
+                    base.extend(type_tail());
+                    base
                 })
                 .collect();
             // Geometric and range/multirange types are text-backed in this
             // engine but registered here (with their stable PostgreSQL OIDs and
             // typcategory) so drivers and `\dT` can see them.
             for &(oid, name, category) in EXTRA_PG_TYPES {
-                rows.push(vec![
+                let mut base = vec![
                     Value::Int(oid),
                     Value::Text(name.into()),
                     Value::Int(11),
@@ -3864,7 +3933,10 @@ fn virtual_pg_catalog_inner(
                     Value::Null,     // typacl
                     Value::Bool(true), // typisdefined
                     Value::Int(0),   // typarray
-                ]);
+                    Value::Text("x".into()), // typstorage (extended)
+                ];
+                base.extend(type_tail());
+                rows.push(base);
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
@@ -3886,6 +3958,13 @@ fn virtual_pg_catalog_inner(
                 ("attstattarget", DataType::Int4),
                 ("attoptions", DataType::Text),
                 ("attfdwoptions", DataType::Text),
+                ("attstorage", DataType::Text),
+                ("attalign", DataType::Text),
+                ("attislocal", DataType::Bool),
+                ("attinhcount", DataType::Int4),
+                ("attcompression", DataType::Text),
+                ("atthasmissing", DataType::Bool),
+                ("attmissingval", DataType::Text),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
@@ -3901,6 +3980,10 @@ fn virtual_pg_catalog_inner(
                         } else {
                             0
                         };
+                        // Match the type's natural storage so pg_dump never
+                        // emits a redundant `SET STORAGE` line: 'x' (extended)
+                        // for varlena types, 'p' (plain) for fixed-width ones.
+                        let storage = if column.data_type.type_size() < 0 { "x" } else { "p" };
                         rows.push(vec![
                             Value::Int(user_table_oid(table_idx)),
                             Value::Text(column.name.clone()),
@@ -3925,6 +4008,13 @@ fn virtual_pg_catalog_inner(
                             Value::Int(-1), // attstattarget (default)
                             Value::Null,    // attoptions
                             Value::Null,    // attfdwoptions
+                            Value::Text(storage.into()), // attstorage
+                            Value::Text("i".into()), // attalign (int)
+                            Value::Bool(true),       // attislocal
+                            Value::Int(0),           // attinhcount
+                            Value::Text("".into()),  // attcompression (none)
+                            Value::Bool(false),      // atthasmissing
+                            Value::Null,             // attmissingval
                         ]);
                     }
                 }
@@ -3945,6 +4035,8 @@ fn virtual_pg_catalog_inner(
                 ("indisreplident", DataType::Bool),
                 ("indisexclusion", DataType::Bool),
                 ("indimmediate", DataType::Bool),
+                ("indisready", DataType::Bool),
+                ("indislive", DataType::Bool),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
@@ -3974,6 +4066,8 @@ fn virtual_pg_catalog_inner(
                             Value::Bool(false), // indisreplident
                             Value::Bool(false), // indisexclusion
                             Value::Bool(true),  // indimmediate
+                            Value::Bool(true),  // indisready
+                            Value::Bool(true),  // indislive
                         ]);
                     }
                     let unique_base = table.indexes().len();
@@ -3999,6 +4093,8 @@ fn virtual_pg_catalog_inner(
                             Value::Bool(false), // indisreplident
                             Value::Bool(false), // indisexclusion
                             Value::Bool(true),  // indimmediate
+                            Value::Bool(true),  // indisready
+                            Value::Bool(true),  // indislive
                         ]);
                     }
                 }
@@ -4360,6 +4456,10 @@ fn virtual_pg_catalog_inner(
                 ("datconnlimit", DataType::Int4),
                 ("datcollate", DataType::Text),
                 ("datctype", DataType::Text),
+                ("datfrozenxid", DataType::Int8),
+                ("datminmxid", DataType::Int8),
+                ("dattablespace", DataType::Int8),
+                ("datacl", DataType::Text),
             ];
             let rows = db
                 .databases()
@@ -4375,6 +4475,10 @@ fn virtual_pg_catalog_inner(
                         Value::Int(database.connection_limit),
                         Value::Text(database.collate),
                         Value::Text(database.ctype),
+                        Value::Int(0),    // datfrozenxid
+                        Value::Int(0),    // datminmxid
+                        Value::Int(1663), // dattablespace (pg_default)
+                        Value::Null,      // datacl
                     ]
                 })
                 .collect();
@@ -4455,6 +4559,22 @@ fn virtual_pg_catalog_inner(
                 ("proisagg", DataType::Bool),
                 ("pronargs", DataType::Int2),
                 ("proacl", DataType::Text),
+                ("provolatile", DataType::Text),
+                ("proparallel", DataType::Text),
+                ("proleakproof", DataType::Bool),
+                ("procost", DataType::Float4),
+                ("prorows", DataType::Float4),
+                ("prosrc", DataType::Text),
+                ("probin", DataType::Text),
+                ("prosqlbody", DataType::Text),
+                ("proconfig", DataType::Text),
+                ("proargnames", DataType::Text),
+                ("proallargtypes", DataType::Text),
+                ("proargmodes", DataType::Text),
+                ("proargdefaults", DataType::Text),
+                ("protrftypes", DataType::Text),
+                ("prosupport", DataType::Int8),
+                ("provariadic", DataType::Int8),
             ];
             let rows = vec![
                 pg_proc_row(2000, "count", "a", DataType::Int8, ""),
@@ -4767,6 +4887,7 @@ fn virtual_pg_catalog_inner(
                 ("stxnamespace", DataType::Int8),
                 ("stxkind", DataType::Text),
                 ("stxstattarget", DataType::Int4),
+                ("stxowner", DataType::Int8),
             ];
             Ok(qualify_virtual(qualifier, &cols, Vec::new()))
         }
@@ -4775,6 +4896,12 @@ fn virtual_pg_catalog_inner(
                 ("oid", DataType::Int8),
                 ("pubname", DataType::Text),
                 ("puballtables", DataType::Bool),
+                ("pubowner", DataType::Int8),
+                ("pubinsert", DataType::Bool),
+                ("pubupdate", DataType::Bool),
+                ("pubdelete", DataType::Bool),
+                ("pubtruncate", DataType::Bool),
+                ("pubviaroot", DataType::Bool),
             ];
             Ok(qualify_virtual(qualifier, &cols, Vec::new()))
         }
@@ -5024,6 +5151,78 @@ fn virtual_pg_catalog_inner(
             ];
             Ok(qualify_virtual(qualifier, &cols, Vec::new()))
         }
+        // Access-method operator/procedure mappings. We register no custom
+        // operator classes, so these are empty; pg_dump joins them against
+        // (empty) pg_depend during dependency sorting.
+        "pg_amop" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("amopfamily", DataType::Int8),
+                ("amoplefttype", DataType::Int8),
+                ("amoprighttype", DataType::Int8),
+                ("amopstrategy", DataType::Int2),
+                ("amopopr", DataType::Int8),
+                ("amopmethod", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_amproc" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("amprocfamily", DataType::Int8),
+                ("amproclefttype", DataType::Int8),
+                ("amprocrighttype", DataType::Int8),
+                ("amprocnum", DataType::Int2),
+                ("amproc", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        // Per-database/role GUC settings (ALTER DATABASE/ROLE ... SET). None
+        // are tracked here, so this is empty.
+        "pg_db_role_setting" => {
+            let cols = [
+                ("setdatabase", DataType::Int8),
+                ("setrole", DataType::Int8),
+                ("setconfig", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        // Shared security labels (on databases/roles/tablespaces). Empty here.
+        "pg_shseclabel" => {
+            let cols = [
+                ("objoid", DataType::Int8),
+                ("classoid", DataType::Int8),
+                ("provider", DataType::Text),
+                ("label", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        // The pg_seclabels system view (security labels). No labels exist in
+        // this engine, so it is empty.
+        "pg_seclabels" => {
+            let cols = [
+                ("label", DataType::Text),
+                ("provider", DataType::Text),
+                ("classoid", DataType::Int8),
+                ("objoid", DataType::Int8),
+                ("objsubid", DataType::Int4),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        // Range types are not implemented; pg_dump probes pg_range only to
+        // exclude range/multirange casts. An empty relation is correct here.
+        "pg_range" => {
+            let cols = [
+                ("rngtypid", DataType::Int8),
+                ("rngsubtype", DataType::Int8),
+                ("rngmultitypid", DataType::Int8),
+                ("rngcollation", DataType::Int8),
+                ("rngsubopc", DataType::Int8),
+                ("rngcanonical", DataType::Int8),
+                ("rngsubdiff", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
         other => Err(format!("pg_catalog.{other} is not supported")),
     }
 }
@@ -5071,6 +5270,22 @@ fn pg_proc_row_full(
             argtypes.split_whitespace().count() as i64
         }), // pronargs
         Value::Null, // proacl
+        Value::Text("i".into()), // provolatile (immutable)
+        Value::Text("s".into()), // proparallel (safe)
+        Value::Bool(false),      // proleakproof
+        Value::Float(if kind == "a" { 1.0 } else { 100.0 }), // procost
+        Value::Float(if retset { 1000.0 } else { 0.0 }),     // prorows
+        Value::Text(name.into()), // prosrc (internal name)
+        Value::Null,             // probin
+        Value::Null,             // prosqlbody
+        Value::Null,             // proconfig
+        Value::Null,             // proargnames
+        Value::Null,             // proallargtypes
+        Value::Null,             // proargmodes
+        Value::Null,             // proargdefaults
+        Value::Null,             // protrftypes
+        Value::Int(0),           // prosupport
+        Value::Int(0),           // provariadic
     ]
 }
 
@@ -6071,7 +6286,7 @@ fn exec_alter_table(db: &mut Database, alter: AlterTable) -> Result<ExecResult, 
             }
             if column.serial || column.identity {
                 // Pre-compute one sequence value per existing row, then fill.
-                let key = format!("{}.{}", alter.table, column.name);
+                let key = Database::serial_sequence_name(&alter.table, &column.name);
                 let n = db.table(&alter.table).map(|t| t.rows.len()).unwrap_or(0);
                 let fills: Vec<Value> =
                     (0..n).map(|_| Value::Int(db.next_sequence(&key))).collect();
@@ -6296,6 +6511,49 @@ fn exec_alter_table(db: &mut Database, alter: AlterTable) -> Result<ExecResult, 
                 RowSecurityAction::Force => table.set_force_row_security(true),
                 RowSecurityAction::NoForce => table.set_force_row_security(false),
             }
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        AlterAction::SetColumnDefault { column, default } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            let col = table
+                .columns
+                .iter_mut()
+                .find(|c| c.name == column)
+                .ok_or_else(|| {
+                    format!(
+                        "column \"{column}\" of relation \"{}\" does not exist",
+                        alter.table
+                    )
+                })?;
+            col.default = Some(default);
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        AlterAction::DropColumnDefault { column } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            if let Some(col) = table.columns.iter_mut().find(|c| c.name == column) {
+                col.default = None;
+            }
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        AlterAction::SetColumnNotNull { column, not_null } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            if let Some(col) = table.columns.iter_mut().find(|c| c.name == column) {
+                col.not_null = not_null;
+            }
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        // Unmodeled per-column / table attributes: accepted as a no-op so
+        // pg_dump output replays cleanly.
+        AlterAction::AlterColumnNoop | AlterAction::Noop => {
+            // Validate the table exists, matching PostgreSQL's behaviour.
+            db.table(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
             Ok(ExecResult::Command("ALTER TABLE".into()))
         }
     }
@@ -7184,7 +7442,7 @@ fn finish_insert_row(
         if !col.serial && !col.identity {
             continue;
         }
-        let key = format!("{}.{}", table_name, col.name);
+        let key = Database::serial_sequence_name(table_name, &col.name);
         match row[i] {
             Value::Int(v) => db.observe_sequence(&key, v),
             Value::Null => row[i] = Value::Int(db.next_sequence(&key)),
@@ -9037,6 +9295,20 @@ fn advisory_lock_key(args: &[Expr]) -> Result<(i64, i64), String> {
     }
 }
 
+/// Normalize a `regclass`-style sequence name as passed to
+/// `nextval`/`currval`/`setval`: strip a `public.` (or any single) schema
+/// qualifier and surrounding double quotes, leaving the bare sequence name
+/// this engine keys on. `pg_dump` emits `setval('public.<name>', ...)`.
+fn normalize_sequence_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Split on the last unquoted dot so quoted names containing dots survive.
+    let bare = match trimmed.rsplit_once('.') {
+        Some((_, name)) => name,
+        None => trimmed,
+    };
+    bare.trim_matches('"').to_string()
+}
+
 fn select_sequence_function(db: &mut Database, sel: &Select) -> Result<ExecResult, String> {
     let SelectItem::Expr { expr, alias } = &sel.projection[0] else {
         unreachable!()
@@ -9044,9 +9316,10 @@ fn select_sequence_function(db: &mut Database, sel: &Select) -> Result<ExecResul
     let Expr::Function { name, args, .. } = expr else {
         unreachable!()
     };
-    let sequence_name = eval_expr(&args[0], &[], &[])?
+    let raw_name = eval_expr(&args[0], &[], &[])?
         .to_text()
         .ok_or_else(|| format!("{}() sequence name must not be null", name))?;
+    let sequence_name = normalize_sequence_name(&raw_name);
     let value = match name.to_ascii_lowercase().as_str() {
         "nextval" => db.next_sequence_value(&sequence_name)?,
         "currval" => db.current_sequence_value(&sequence_name)?,
@@ -12395,6 +12668,18 @@ fn eval_scalar_function(
             Ok(Value::Text("postgres".to_string()))
         }
         "current_schema" => Ok(Value::Text("public".to_string())),
+        // `current_schemas(include_implicit)` returns the effective search path
+        // as a text[]. Our search path is just `public`; when the argument is
+        // true the implicit `pg_catalog` is prepended.
+        "current_schemas" => {
+            let include_implicit = arg(&vals, 0).map(|v| v.is_true()).unwrap_or(false);
+            let arr = if include_implicit {
+                "{pg_catalog,public}"
+            } else {
+                "{public}"
+            };
+            Ok(Value::Text(arr.to_string()))
+        }
         "current_setting" => {
             // current_setting(name [, missing_ok]) — read a configuration parameter.
             let name = arg(&vals, 0)?.to_text().unwrap_or_default();
@@ -12899,6 +13184,20 @@ fn eval_scalar_function(
         // `pg_get_expr(adbin, ...)` echoes its first argument, which by
         // construction already holds the rendered SQL (pg_attrdef.adbin).
         "pg_get_expr" => Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null)),
+        // Function signature/result renderers. This engine does not model full
+        // argument lists for built-ins; pg_dump calls these only for functions
+        // it considers dumpable (none of ours are), so a best-effort empty
+        // rendering is sufficient and never reaches the emitted SQL.
+        "pg_get_function_arguments" | "pg_get_function_identity_arguments" => {
+            Ok(Value::Text(String::new()))
+        }
+        "pg_get_function_result" => Ok(Value::Text("void".to_string())),
+        "pg_get_function_sqlbody" => Ok(Value::Null),
+        // Comment lookups for shared/local objects. Comments are not tracked for
+        // databases/tablespaces here, so these return NULL (matching an object
+        // with no COMMENT). `obj_description` on relations is still served via
+        // the pg_description catalog join, not this function.
+        "shobj_description" | "obj_description" => Ok(Value::Null),
         // `acldefault(objtype, ownerId)` returns the hard-wired default access
         // privileges for an object as an `aclitem[]`. This engine does not model
         // per-object grants, so the effective default ACL is empty; pg_dump uses

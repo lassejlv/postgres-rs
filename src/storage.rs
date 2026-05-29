@@ -3115,18 +3115,20 @@ impl Database {
         table.name = to.to_string();
         self.tables.insert(to.to_string(), table);
 
-        // Re-key sequences "from.col" -> "to.col".
+        // Re-key serial sequences "<from>_<col>_seq" -> "<to>_<col>_seq".
+        let from_prefix = format!("{from}_");
         let moved: Vec<(String, Sequence)> = self
             .sequences
             .iter()
             .filter_map(|(k, v)| {
-                k.strip_prefix(&format!("{from}."))
-                    .map(|c| (c.to_string(), v.clone()))
+                k.strip_prefix(&from_prefix)
+                    .and_then(|rest| rest.strip_suffix("_seq"))
+                    .map(|col| (col.to_string(), v.clone()))
             })
             .collect();
         for (col, mut v) in moved {
-            self.sequences.remove(&format!("{from}.{col}"));
-            v.name = format!("{to}.{col}");
+            self.sequences.remove(&Self::serial_sequence_name(from, &col));
+            v.name = Self::serial_sequence_name(to, &col);
             self.sequences.insert(v.name.clone(), v);
         }
         Ok(())
@@ -3134,6 +3136,13 @@ impl Database {
 
     #[allow(dead_code)]
     /// Return the next value of a sequence, advancing it.
+    /// The implicit sequence name backing a `serial`/identity column, matching
+    /// PostgreSQL's `<table>_<column>_seq` convention so introspection and
+    /// `pg_dump` see a real-looking relation name.
+    pub fn serial_sequence_name(table: &str, column: &str) -> String {
+        format!("{table}_{column}_seq")
+    }
+
     pub fn next_sequence(&mut self, key: &str) -> i64 {
         self.sequences
             .entry(key.to_string())

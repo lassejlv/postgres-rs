@@ -1511,6 +1511,9 @@ impl Parser {
         }
         self.expect_keyword("table")?;
         self.parse_if_exists();
+        // `ALTER TABLE ONLY t ...` — the ONLY (no-inheritance) qualifier is
+        // accepted; this engine applies the action to the named table directly.
+        self.eat_keyword("only");
         let table = self.parse_object_name()?;
 
         let action = if self.eat_keyword("add") {
@@ -1584,6 +1587,53 @@ impl Parser {
             AlterAction::RowSecurity {
                 action: RowSecurityAction::NoForce,
             }
+        } else if self.is_keyword("alter") {
+            self.expect_keyword("alter")?;
+            self.eat_keyword("column");
+            let column = self.parse_ident()?;
+            if self.eat_keyword("set") {
+                if self.eat_keyword("default") {
+                    AlterAction::SetColumnDefault {
+                        column,
+                        default: self.parse_expr()?,
+                    }
+                } else if self.is_keyword("not") {
+                    self.expect_keyword("not")?;
+                    self.expect_keyword("null")?;
+                    AlterAction::SetColumnNotNull {
+                        column,
+                        not_null: true,
+                    }
+                } else {
+                    // SET STORAGE / STATISTICS / (...) / COMPRESSION: no-op.
+                    self.skip_to_statement_end();
+                    AlterAction::AlterColumnNoop
+                }
+            } else if self.eat_keyword("drop") {
+                if self.eat_keyword("default") {
+                    AlterAction::DropColumnDefault { column }
+                } else {
+                    self.expect_keyword("not")?;
+                    self.expect_keyword("null")?;
+                    AlterAction::SetColumnNotNull {
+                        column,
+                        not_null: false,
+                    }
+                }
+            } else {
+                // ADD GENERATED / RESET (...) / TYPE ...: accept as no-op.
+                self.skip_to_statement_end();
+                AlterAction::AlterColumnNoop
+            }
+        } else if self.is_keyword("set")
+            || self.is_keyword("reset")
+            || self.is_keyword("cluster")
+            || self.is_keyword("inherit")
+            || self.is_keyword("validate")
+        {
+            // Table-level clauses we accept but do not model.
+            self.skip_to_statement_end();
+            AlterAction::Noop
         } else {
             return Err(format!(
                 "unsupported ALTER TABLE action near {:?}",
@@ -4794,6 +4844,14 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.expect(&Token::RParen)?;
         Ok(Some(Box::new(expr)))
+    }
+
+    /// Consume the remaining tokens of the current statement (up to but not
+    /// including a `;`). Used to accept-and-ignore unmodeled clause tails.
+    fn skip_to_statement_end(&mut self) {
+        while self.peek().is_some() && !matches!(self.peek(), Some(Token::Semicolon)) {
+            self.advance();
+        }
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, String> {
