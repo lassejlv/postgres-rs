@@ -44,6 +44,7 @@ pub enum Statement {
     AlterSequence(AlterSequence),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
+    AlterExtension(AlterExtension),
     Insert(Insert),
     Copy(Copy),
     Truncate(Truncate),
@@ -404,6 +405,13 @@ pub struct CreateExtension {
 pub struct DropExtension {
     pub name: String,
     pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterExtension {
+    pub name: String,
+    pub to_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -620,12 +628,18 @@ pub struct CreateFunction {
     pub return_type_name: Option<String>,
     /// The function body extracted from the dollar-quoted (or string) literal.
     pub body: String,
+    /// Optional external link symbol from `AS 'library', 'symbol'`, used by
+    /// `LANGUAGE c` functions.
+    pub link_symbol: Option<String>,
     /// The language given by `LANGUAGE <lang>` (lowercased); defaults to `sql`.
     pub language: String,
     /// `SECURITY DEFINER` was specified (`prosecdef`). `SECURITY INVOKER` (the
     /// default) leaves this false. Behaviorally moot single-user, but recorded
     /// and exposed via `pg_proc.prosecdef`.
     pub security_definer: bool,
+    /// `STRICT` / `RETURNS NULL ON NULL INPUT` (`proisstrict`). Strict
+    /// functions are not invoked when any argument is NULL.
+    pub strict: bool,
 }
 
 /// `DROP FUNCTION [IF EXISTS] name [(argtypes)]`.
@@ -1294,10 +1308,7 @@ pub enum MergeSource {
     /// A named table (`USING src s`).
     Table { name: String, alias: Option<String> },
     /// A parenthesized subquery (`USING (SELECT ...) AS s`).
-    Subquery {
-        select: Box<Select>,
-        alias: String,
-    },
+    Subquery { select: Box<Select>, alias: String },
     /// A `(VALUES (...), ...) AS s(col, ...)` construct.
     Values {
         rows: Vec<Vec<Expr>>,

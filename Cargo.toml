@@ -6,6 +6,16 @@ description = "A fast, lightweight, PostgreSQL wire-compatible database written 
 
 [workspace]
 members = [
+    ".",
+    "crates/types",
+    "crates/sql",
+    "crates/auth",
+    "crates/protocol",
+    "crates/engine",
+    "crates/server",
+]
+default-members = [
+    ".",
     "crates/types",
     "crates/sql",
     "crates/auth",

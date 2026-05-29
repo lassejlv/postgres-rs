@@ -144,7 +144,16 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
         }
         Statement::DropExtension(d) => {
             let exists = if d.if_exists { "IF EXISTS " } else { "" };
-            format!("DROP EXTENSION {exists}{}", ident(&d.name))
+            let cascade = if d.cascade { " CASCADE" } else { "" };
+            format!("DROP EXTENSION {exists}{}{cascade}", ident(&d.name))
+        }
+        Statement::AlterExtension(a) => {
+            let version = a
+                .to_version
+                .as_ref()
+                .map(|v| format!(" TO {}", quote_string(v)))
+                .unwrap_or_default();
+            format!("ALTER EXTENSION {} UPDATE{version}", ident(&a.name))
         }
         Statement::DropRole(d) => {
             let exists = if d.if_exists { "IF EXISTS " } else { "" };
@@ -530,10 +539,7 @@ fn grant_sql(object: &GrantObject, grantees: &[Grantee], revoke: bool) -> String
                     .join(", "),
             };
             if revoke {
-                format!(
-                    "REVOKE {privs} ON {} FROM {grantee_list}",
-                    ident(table)
-                )
+                format!("REVOKE {privs} ON {} FROM {grantee_list}", ident(table))
             } else {
                 format!("GRANT {privs} ON {} TO {grantee_list}", ident(table))
             }
@@ -621,7 +627,11 @@ fn create_type_sql(c: &CreateType) -> String {
     match &c.kind {
         CreateTypeKind::Enum { labels } => {
             let labels: Vec<String> = labels.iter().map(|l| quote_string(l)).collect();
-            format!("CREATE TYPE {} AS ENUM ({})", ident(&c.name), labels.join(", "))
+            format!(
+                "CREATE TYPE {} AS ENUM ({})",
+                ident(&c.name),
+                labels.join(", ")
+            )
         }
         CreateTypeKind::Composite { attributes } => {
             let attrs: Vec<String> = attributes
@@ -666,6 +676,10 @@ fn dollar_quote(body: &str) -> String {
     unreachable!("a free dollar-quote tag always exists")
 }
 
+fn string_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 fn create_function_sql(c: &CreateFunction) -> String {
     let replace = if c.or_replace { "OR REPLACE " } else { "" };
     let args: Vec<String> = c
@@ -684,11 +698,20 @@ fn create_function_sql(c: &CreateFunction) -> String {
     if let Some(rt) = &c.return_type_name {
         s.push_str(&format!(" RETURNS {rt}"));
     }
-    s.push_str(&format!(
-        " AS {} LANGUAGE {}",
-        dollar_quote(&c.body),
-        c.language
-    ));
+    let body = if c.language.eq_ignore_ascii_case("c") {
+        let mut body = string_literal(&c.body);
+        if let Some(symbol) = &c.link_symbol {
+            body.push_str(", ");
+            body.push_str(&string_literal(symbol));
+        }
+        body
+    } else {
+        dollar_quote(&c.body)
+    };
+    s.push_str(&format!(" AS {body} LANGUAGE {}", c.language));
+    if c.strict {
+        s.push_str(" STRICT");
+    }
     if c.security_definer {
         s.push_str(" SECURITY DEFINER");
     }
@@ -812,7 +835,11 @@ fn partition_bound_sql(bound: &PartitionBound) -> String {
             expr_to_sql(to)
         ),
         PartitionBound::List(values) => {
-            let items = values.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ");
+            let items = values
+                .iter()
+                .map(expr_to_sql)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("FOR VALUES IN ({items})")
         }
         PartitionBound::Hash { modulus, remainder } => {
@@ -984,7 +1011,10 @@ fn alter_table_sql(a: &AlterTable) -> String {
                 )
             }
             TableConstraint::Exclude { name, definition } => {
-                format!("ALTER TABLE {t} ADD CONSTRAINT {} {definition}", ident(name))
+                format!(
+                    "ALTER TABLE {t} ADD CONSTRAINT {} {definition}",
+                    ident(name)
+                )
             }
         },
         AlterAction::DropConstraint { name, if_exists } => {
@@ -1280,12 +1310,7 @@ fn merge_source_sql(source: &MergeSource) -> String {
                 let list: Vec<String> = columns.iter().map(|c| ident(c)).collect();
                 format!(" ({})", list.join(", "))
             };
-            format!(
-                "(VALUES {}) AS {}{}",
-                tuples.join(", "),
-                ident(alias),
-                cols
-            )
+            format!("(VALUES {}) AS {}{}", tuples.join(", "), ident(alias), cols)
         }
     }
 }
@@ -1357,7 +1382,11 @@ pub fn select_to_sql(sel: &Select) -> String {
                 format!("{}{} AS ({})", ident(&cte.name), columns, body)
             })
             .collect();
-        let kw = if recursive { "WITH RECURSIVE " } else { "WITH " };
+        let kw = if recursive {
+            "WITH RECURSIVE "
+        } else {
+            "WITH "
+        };
         s.push_str(&format!("{kw}{} ", ctes.join(", ")));
     }
     s.push_str("SELECT ");

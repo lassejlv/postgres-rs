@@ -316,7 +316,8 @@ impl Parser {
     fn parse_revoke(&mut self) -> Result<Statement, String> {
         self.expect_keyword("revoke")?;
         // Optional `GRANT OPTION FOR` / `ADMIN OPTION FOR` prefix — ignored.
-        if (self.is_keyword("grant") || self.is_keyword("admin")) && self.is_keyword_at(1, "option") {
+        if (self.is_keyword("grant") || self.is_keyword("admin")) && self.is_keyword_at(1, "option")
+        {
             self.advance();
             self.advance();
             self.expect_keyword("for")?;
@@ -805,7 +806,9 @@ impl Parser {
             return self.parse_create_policy();
         }
         if or_replace {
-            return Err("CREATE OR REPLACE is only supported for VIEW, FUNCTION, RULE, AGGREGATE".into());
+            return Err(
+                "CREATE OR REPLACE is only supported for VIEW, FUNCTION, RULE, AGGREGATE".into(),
+            );
         }
         if self.eat_keyword("extension") {
             let if_not_exists = self.parse_if_not_exists();
@@ -1231,9 +1234,17 @@ impl Parser {
             // Optional `CONSTRAINT name` prefix for a column-level constraint.
             // Only consume it when a constraint keyword actually follows.
             let explicit_name = if self.is_keyword("constraint")
-                && ["primary", "references", "check", "unique", "not", "null", "default"]
-                    .iter()
-                    .any(|kw| self.is_keyword_at(2, kw))
+                && [
+                    "primary",
+                    "references",
+                    "check",
+                    "unique",
+                    "not",
+                    "null",
+                    "default",
+                ]
+                .iter()
+                .any(|kw| self.is_keyword_at(2, kw))
             {
                 self.advance();
                 Some(self.parse_ident()?)
@@ -1258,8 +1269,7 @@ impl Parser {
                 self.parse_fk_actions_tail();
                 let validated = !self.parse_not_valid();
                 self.parse_deferrable_tail();
-                let cname =
-                    explicit_name.unwrap_or_else(|| format!("{table}_{name}_fkey"));
+                let cname = explicit_name.unwrap_or_else(|| format!("{table}_{name}_fkey"));
                 inline.push(TableConstraint::ForeignKey {
                     name: cname,
                     column: name.clone(),
@@ -1331,18 +1341,21 @@ impl Parser {
                 break;
             }
         }
-        Ok((ColumnDef {
-            name,
-            data_type,
-            type_name,
-            not_null,
-            primary_key,
-            default,
-            serial,
-            identity,
-            identity_always,
-            generated,
-        }, inline))
+        Ok((
+            ColumnDef {
+                name,
+                data_type,
+                type_name,
+                not_null,
+                primary_key,
+                default,
+                serial,
+                identity,
+                identity_always,
+                generated,
+            },
+            inline,
+        ))
     }
 
     fn skip_identity_options(&mut self) {
@@ -1505,6 +1518,24 @@ impl Parser {
                 AlterDatabaseAction::SetConnectionLimit { limit }
             };
             return Ok(Statement::AlterDatabase(AlterDatabase { name, action }));
+        }
+        if self.eat_keyword("extension") {
+            let name = self.parse_object_name()?;
+            self.expect_keyword("update")?;
+            let to_version = if self.eat_keyword("to") {
+                Some(match self.advance() {
+                    Some(Token::StringLit(s))
+                    | Some(Token::Word(s))
+                    | Some(Token::QuotedIdent(s)) => s,
+                    other => return Err(format!("expected extension version, found {other:?}")),
+                })
+            } else {
+                None
+            };
+            return Ok(Statement::AlterExtension(AlterExtension {
+                name,
+                to_version,
+            }));
         }
         if self.eat_keyword("policy") {
             return self.parse_alter_policy();
@@ -1922,8 +1953,7 @@ impl Parser {
             } else if self.eat_keyword("set") {
                 let _ = self.eat_keyword("null") || self.eat_keyword("default");
             } else {
-                let _ = self.eat_keyword("restrict")
-                    || self.eat_keyword("cascade");
+                let _ = self.eat_keyword("restrict") || self.eat_keyword("cascade");
             }
         }
     }
@@ -2144,12 +2174,13 @@ impl Parser {
                 // bare type from a named arg by one token, so peek: if the next
                 // token is a word that is NOT immediately a `,`/`)` after, and
                 // the token after it starts a type, treat the first as a name.
-                let arg_name = if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::QuotedIdent(_)))
-                    && !matches!(
-                        self.tokens.get(self.pos + 1),
-                        Some(Token::Comma) | Some(Token::RParen) | Some(Token::LParen)
-                    )
-                {
+                let arg_name = if matches!(
+                    self.peek(),
+                    Some(Token::Word(_)) | Some(Token::QuotedIdent(_))
+                ) && !matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Comma) | Some(Token::RParen) | Some(Token::LParen)
+                ) {
                     Some(self.parse_ident()?)
                 } else {
                     None
@@ -2199,11 +2230,15 @@ impl Parser {
         // The remaining clauses (AS, LANGUAGE, and various attributes) may come
         // in any order. Loop collecting them.
         let mut body: Option<String> = None;
+        let mut link_symbol: Option<String> = None;
         let mut language = "sql".to_string();
         let mut security_definer = false;
+        let mut strict = false;
         loop {
             if self.eat_keyword("as") {
-                body = Some(self.parse_function_body()?);
+                let (parsed_body, parsed_symbol) = self.parse_function_body()?;
+                body = Some(parsed_body);
+                link_symbol = parsed_symbol;
             } else if self.eat_keyword("language") {
                 language = match self.advance() {
                     Some(Token::Word(w)) => w.to_ascii_lowercase(),
@@ -2216,7 +2251,6 @@ impl Parser {
                 || self.eat_keyword("stable")
                 || self.eat_keyword("volatile")
                 || self.eat_keyword("leakproof")
-                || self.eat_keyword("strict")
                 || self.eat_keyword("window")
                 || self.eat_keyword("parallel")
                 || self.eat_keyword("cost")
@@ -2224,24 +2258,26 @@ impl Parser {
                 || self.eat_keyword("support")
             {
                 // Accept and discard a trailing simple argument if present.
-                if matches!(
-                    self.peek(),
-                    Some(Token::Word(_)) | Some(Token::Number(_))
-                ) && !self.is_keyword("as")
+                if matches!(self.peek(), Some(Token::Word(_)) | Some(Token::Number(_)))
+                    && !self.is_keyword("as")
                     && !self.is_keyword("language")
                 {
                     self.advance();
                 }
+            } else if self.eat_keyword("strict") {
+                strict = true;
             } else if self.eat_keyword("called") {
                 self.eat_keyword("on");
                 self.eat_keyword("null");
                 self.eat_keyword("input");
+                strict = false;
             } else if self.eat_keyword("returns") {
                 // `RETURNS NULL ON NULL INPUT`.
                 self.eat_keyword("null");
                 self.eat_keyword("on");
                 self.eat_keyword("null");
                 self.eat_keyword("input");
+                strict = true;
             } else if self.eat_keyword("security") {
                 if self.eat_keyword("definer") {
                     security_definer = true;
@@ -2276,24 +2312,33 @@ impl Parser {
             return_type,
             return_type_name,
             body,
+            link_symbol,
             language,
             security_definer,
+            strict,
         }))
     }
 
     /// Read the function body literal following `AS`: a string or dollar-quoted
     /// literal (the lexer hands both back as `StringLit`). A two-part `AS
-    /// 'obj', 'sym'` form (C functions) keeps the first part.
-    fn parse_function_body(&mut self) -> Result<String, String> {
+    /// 'obj', 'sym'` form (C functions) records the second part as the external
+    /// link symbol.
+    fn parse_function_body(&mut self) -> Result<(String, Option<String>), String> {
         let body = match self.advance() {
             Some(Token::StringLit(s)) => s,
             other => return Err(format!("expected function body, found {other:?}")),
         };
-        if self.eat(&Token::Comma) {
-            // C-language link symbol; accept and discard.
-            let _ = self.advance();
-        }
-        Ok(body)
+        let link_symbol = if self.eat(&Token::Comma) {
+            match self.advance() {
+                Some(Token::StringLit(s)) | Some(Token::Word(s)) | Some(Token::QuotedIdent(s)) => {
+                    Some(s)
+                }
+                other => return Err(format!("expected C function link symbol, found {other:?}")),
+            }
+        } else {
+            None
+        };
+        Ok((body, link_symbol))
     }
 
     /// Consume a balanced `( ... )` group, assuming the opening paren is next.
@@ -2474,7 +2519,9 @@ impl Parser {
                     | Some(Token::QuotedIdent(w))
                     | Some(Token::StringLit(w))
                     | Some(Token::Number(w)) => w,
-                    other => return Err(format!("expected aggregate option value, found {other:?}")),
+                    other => {
+                        return Err(format!("expected aggregate option value, found {other:?}"));
+                    }
                 };
                 options.push((key, value));
                 if self.eat(&Token::Comma) {
@@ -2824,9 +2871,13 @@ impl Parser {
         if self.eat_keyword("extension") {
             let if_exists = self.parse_if_exists();
             let name = self.parse_object_name()?;
-            self.eat_keyword("cascade");
+            let cascade = self.eat_keyword("cascade");
             self.eat_keyword("restrict");
-            return Ok(Statement::DropExtension(DropExtension { name, if_exists }));
+            return Ok(Statement::DropExtension(DropExtension {
+                name,
+                if_exists,
+                cascade,
+            }));
         }
         if self.eat_keyword("schema") {
             let if_exists = self.parse_if_exists();
@@ -3042,7 +3093,7 @@ impl Parser {
                 other => {
                     return Err(format!(
                         "expected STDIN/STDOUT or a file path in COPY, got {other:?}"
-                    ))
+                    ));
                 }
             },
         };
@@ -3104,7 +3155,11 @@ impl Parser {
                 Some(Token::StringLit(s)) if s.chars().count() == 1 => {
                     copy.delimiter = s.chars().next();
                 }
-                other => return Err(format!("COPY DELIMITER must be a single character, got {other:?}")),
+                other => {
+                    return Err(format!(
+                        "COPY DELIMITER must be a single character, got {other:?}"
+                    ));
+                }
             }
         } else if self.eat_keyword("header") {
             // Optional boolean argument; default true when bare.
@@ -3388,7 +3443,10 @@ impl Parser {
                 let rhs = Select {
                     projection: tuple
                         .into_iter()
-                        .map(|e| SelectItem::Expr { expr: e, alias: None })
+                        .map(|e| SelectItem::Expr {
+                            expr: e,
+                            alias: None,
+                        })
                         .collect(),
                     ..Select::default()
                 };
@@ -3793,9 +3851,7 @@ impl Parser {
     /// e.g. `YEAR TO MONTH`, `DAY TO SECOND`, or a single `DAY`. Returns the
     /// canonical lower-case form joined by spaces, or `None` if absent.
     fn parse_interval_qualifier(&mut self) -> Option<String> {
-        const FIELDS: &[&str] = &[
-            "year", "month", "day", "hour", "minute", "second",
-        ];
+        const FIELDS: &[&str] = &["year", "month", "day", "hour", "minute", "second"];
         let is_field = |p: Option<&Token>| match p {
             Some(Token::Word(w)) => FIELDS.contains(&w.to_ascii_lowercase().as_str()),
             _ => false,
@@ -4490,9 +4546,9 @@ impl Parser {
                 // plain `DataType` cast would lose the distinction.
                 e = match raw.as_deref() {
                     Some(
-                        name @ ("regclass" | "regtype" | "regnamespace" | "regproc"
-                        | "regrole" | "regprocedure" | "regoper" | "regoperator"
-                        | "regconfig" | "regdictionary"),
+                        name @ ("regclass" | "regtype" | "regnamespace" | "regproc" | "regrole"
+                        | "regprocedure" | "regoper" | "regoperator" | "regconfig"
+                        | "regdictionary"),
                     ) => Expr::Function {
                         name: format!("__cast_{name}"),
                         args: vec![e],
@@ -5148,8 +5204,21 @@ fn binding_power(op: BinaryOp) -> (u8, u8) {
 /// here is not an alias.
 fn is_select_clause_keyword(w: &str) -> bool {
     const KW: &[&str] = &[
-        "from", "where", "order", "limit", "offset", "group", "having", "as", "and", "or",
-        "union", "intersect", "except", "for", "fetch",
+        "from",
+        "where",
+        "order",
+        "limit",
+        "offset",
+        "group",
+        "having",
+        "as",
+        "and",
+        "or",
+        "union",
+        "intersect",
+        "except",
+        "for",
+        "fetch",
     ];
     KW.iter().any(|k| w.eq_ignore_ascii_case(k))
 }

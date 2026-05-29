@@ -8,6 +8,7 @@ pub mod disk;
 pub mod executor;
 pub mod index;
 pub mod lock;
+pub mod native;
 pub mod plpgsql;
 pub mod storage;
 pub mod wal;

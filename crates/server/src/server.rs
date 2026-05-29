@@ -9,15 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::ScramServer;
 use crate::bind;
-use crate::hba::{HbaConfig, HbaMethod};
 use crate::executor::{self, ExecResult, FieldDescription};
+use crate::hba::{HbaConfig, HbaMethod};
 use crate::lock::{LockManager, LockMode, LockObject, TryAcquire};
 use crate::protocol::{FrontendMessage, MessageBuilder, Startup, read_message, read_startup};
 use crate::sql::Parser;
@@ -182,7 +182,12 @@ pub fn serve_on(listener: TcpListener, data_dir: Option<String>) -> io::Result<(
 /// the periodic driver.
 fn spawn_autovacuum_worker(shared: &Arc<Shared>) {
     let on = std::env::var("PGRS_AUTOVACUUM")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false);
     if !on {
         return;
@@ -193,12 +198,18 @@ fn spawn_autovacuum_worker(shared: &Arc<Shared>) {
         .filter(|s| *s > 0)
         .unwrap_or(60);
     let shared = Arc::clone(shared);
-    thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(interval_secs));
-        if let Ok(mut db) = shared.db.lock() {
-            let vacuumed = db.autovacuum_once();
-            if !vacuumed.is_empty() {
-                eprintln!("autovacuum: vacuumed {} table(s): {}", vacuumed.len(), vacuumed.join(", "));
+    thread::spawn(move || {
+        loop {
+            thread::sleep(std::time::Duration::from_secs(interval_secs));
+            if let Ok(mut db) = shared.db.lock() {
+                let vacuumed = db.autovacuum_once();
+                if !vacuumed.is_empty() {
+                    eprintln!(
+                        "autovacuum: vacuumed {} table(s): {}",
+                        vacuumed.len(),
+                        vacuumed.join(", ")
+                    );
+                }
             }
         }
     });
@@ -316,11 +327,7 @@ impl Session {
     }
 }
 
-fn handle_connection(
-    stream: TcpStream,
-    shared: Arc<Shared>,
-    peer_ip: String,
-) -> io::Result<()> {
+fn handle_connection(stream: TcpStream, shared: Arc<Shared>, peer_ip: String) -> io::Result<()> {
     stream.set_nodelay(true).ok();
     let read_half = stream.try_clone()?;
     let mut reader = BufReader::new(read_half);
@@ -893,7 +900,8 @@ fn copy_from_stdin<R: Read, W: Write>(
         }
     }
 
-    let count = match copy_from_bytes(shared, session, copy, columns, delimiter, null_marker, &buf) {
+    let count = match copy_from_bytes(shared, session, copy, columns, delimiter, null_marker, &buf)
+    {
         Ok(n) => n,
         Err(e) => return Ok(Err(e)),
     };
@@ -1273,8 +1281,15 @@ fn run_copy_file(
         CopyDirection::From => {
             let buf = std::fs::read(path)
                 .map_err(|e| format!("could not read COPY source \"{path}\": {e}"))?;
-            let count =
-                copy_from_bytes(shared, session, copy, &columns, delimiter, &null_marker, &buf)?;
+            let count = copy_from_bytes(
+                shared,
+                session,
+                copy,
+                &columns,
+                delimiter,
+                &null_marker,
+                &buf,
+            )?;
             Ok(ExecResult::Command(format!("COPY {count}")))
         }
     }
@@ -2210,13 +2225,7 @@ fn replay(db: &mut Database, contents: &str) -> usize {
     if contents.trim().is_empty() {
         return 0;
     }
-    let statements = match Parser::parse_sql(contents) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to parse WAL, starting empty: {e}");
-            return 0;
-        }
-    };
+    let statements = parse_wal_statements(contents);
     let mut applied = 0;
     for stmt in statements {
         if matches!(stmt, Statement::Empty) {
@@ -2228,6 +2237,32 @@ fn replay(db: &mut Database, contents: &str) -> usize {
         }
     }
     applied
+}
+
+fn parse_wal_statements(contents: &str) -> Vec<Statement> {
+    match Parser::parse_sql(contents) {
+        Ok(statements) => statements,
+        Err(e) => {
+            eprintln!("warning: failed to parse complete WAL, recovering prefix: {e}");
+            let mut statements = Vec::new();
+            for record in wal_records(contents) {
+                match Parser::parse_sql(record) {
+                    Ok(mut parsed) => statements.append(&mut parsed),
+                    Err(e) => {
+                        eprintln!("warning: stopped WAL prefix recovery at malformed record: {e}");
+                        break;
+                    }
+                }
+            }
+            statements
+        }
+    }
+}
+
+fn wal_records(contents: &str) -> impl Iterator<Item = &str> {
+    contents
+        .split_inclusive(";\n")
+        .filter(|record| record.ends_with(";\n"))
 }
 
 /// Whether a statement changes table *data* (DML), used both for write-set
@@ -2270,6 +2305,7 @@ fn is_mutation(stmt: &Statement) -> bool {
     match stmt {
         Statement::CreateTable(_)
         | Statement::CreateExtension(_)
+        | Statement::AlterExtension(_)
         | Statement::CreateRole(_)
         | Statement::CreateSequence(_)
         | Statement::CreateSchema(_)
@@ -2489,12 +2525,12 @@ fn authenticate<R: io::Read, W: Write>(
         return match config.match_method(database, username, peer_ip) {
             Some(HbaMethod::Trust) => Ok(AuthOutcome::Ok),
             Some(HbaMethod::Reject) | None => Ok(AuthOutcome::Rejected),
-            Some(HbaMethod::Password) => {
-                Ok(bool_outcome(cleartext_authenticate(reader, writer, &password)?))
-            }
-            Some(HbaMethod::Md5) => {
-                Ok(bool_outcome(md5_authenticate(reader, writer, &password, username)?))
-            }
+            Some(HbaMethod::Password) => Ok(bool_outcome(cleartext_authenticate(
+                reader, writer, &password,
+            )?)),
+            Some(HbaMethod::Md5) => Ok(bool_outcome(md5_authenticate(
+                reader, writer, &password, username,
+            )?)),
             Some(HbaMethod::ScramSha256) => {
                 Ok(bool_outcome(scram_authenticate(reader, writer, &password)?))
             }
@@ -2539,7 +2575,10 @@ fn load_hba_config() -> Option<HbaConfig> {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         return Some(HbaConfig::parse(&text));
     }
-    if let Some(rules) = std::env::var("PGRS_HBA_RULES").ok().filter(|r| !r.is_empty()) {
+    if let Some(rules) = std::env::var("PGRS_HBA_RULES")
+        .ok()
+        .filter(|r| !r.is_empty())
+    {
         // Allow `;`-separated inline rules in addition to newlines.
         let normalized = rules.replace(';', "\n");
         return Some(HbaConfig::parse(&normalized));
@@ -2823,12 +2862,45 @@ mod tests {
         run("CHECKPOINT");
 
         // A fresh recovery from the same directory sees the checkpointed rows.
-        let recovered = crate::disk::DiskStore::open(&dir).unwrap().recover().unwrap();
+        let recovered = crate::disk::DiskStore::open(&dir)
+            .unwrap()
+            .recover()
+            .unwrap();
         let kv = recovered.table("kv").expect("kv recovered");
         assert_eq!(kv.rows.len(), 2);
         assert_eq!(kv.rows[0], vec![Value::Int(1), Value::Text("one".into())]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn logical_wal_replay_recovers_well_formed_prefix_from_torn_tail() {
+        let mut db = Database::new();
+        let log = "\
+            CREATE TABLE t (id integer PRIMARY KEY, v integer);\n\
+            INSERT INTO t VALUES (1, 10);\n\
+            INSERT INTO t VALUES (2, 20);\n\
+            INSERT INTO t VALUES (3, 30";
+
+        assert_eq!(replay(&mut db, log), 3);
+        let table = db.table("t").expect("table recovered");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0], vec![Value::Int(1), Value::Int(10)]);
+        assert_eq!(table.rows[1], vec![Value::Int(2), Value::Int(20)]);
+    }
+
+    #[test]
+    fn logical_wal_replay_stops_at_first_malformed_record() {
+        let mut db = Database::new();
+        let log = "\
+            CREATE TABLE t (id integer PRIMARY KEY);\n\
+            INSERT INTO t VALUES (1);\n\
+            INSERT INTO missing VALUES (2;\n\
+            INSERT INTO t VALUES (3);\n";
+
+        assert_eq!(replay(&mut db, log), 2);
+        let table = db.table("t").expect("table recovered");
+        assert_eq!(table.rows, vec![vec![Value::Int(1)]]);
     }
 
     /// A bare session with dummy cancellation/notification handles.
@@ -3387,7 +3459,12 @@ mod tests {
         let s = shared();
         let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
-        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, NULL)").unwrap();
+        run(
+            &s,
+            &mut sess,
+            "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, NULL)",
+        )
+        .unwrap();
 
         let path = temp_copy_path("text");
         let p = path.to_str().unwrap();
@@ -3417,7 +3494,12 @@ mod tests {
         let s = shared();
         let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
-        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        run(
+            &s,
+            &mut sess,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .unwrap();
 
         let path = temp_copy_path("query");
         let p = path.to_str().unwrap();
@@ -3425,7 +3507,9 @@ mod tests {
         run(
             &s,
             &mut sess,
-            &format!("COPY (SELECT id, name FROM t WHERE id > 1 ORDER BY id) TO '{p}' WITH (FORMAT csv)"),
+            &format!(
+                "COPY (SELECT id, name FROM t WHERE id > 1 ORDER BY id) TO '{p}' WITH (FORMAT csv)"
+            ),
         )
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -3462,10 +3546,20 @@ mod tests {
 
         let path = temp_copy_path("bin");
         let p = path.to_str().unwrap();
-        run(&s, &mut sess, &format!("COPY t TO '{p}' WITH (FORMAT binary)")).unwrap();
+        run(
+            &s,
+            &mut sess,
+            &format!("COPY t TO '{p}' WITH (FORMAT binary)"),
+        )
+        .unwrap();
 
         run(&s, &mut sess, "DELETE FROM t").unwrap();
-        run(&s, &mut sess, &format!("COPY t FROM '{p}' WITH (FORMAT binary)")).unwrap();
+        run(
+            &s,
+            &mut sess,
+            &format!("COPY t FROM '{p}' WITH (FORMAT binary)"),
+        )
+        .unwrap();
 
         let got = {
             let mut db = s.db.lock().unwrap();
@@ -3509,7 +3603,10 @@ mod tests {
             }
             i += 1 + len;
         }
-        assert_eq!(&payload[..COPY_BINARY_SIGNATURE.len()], COPY_BINARY_SIGNATURE);
+        assert_eq!(
+            &payload[..COPY_BINARY_SIGNATURE.len()],
+            COPY_BINARY_SIGNATURE
+        );
 
         // Feed it back via COPY FROM STDIN (binary).
         run(&s, &mut sess, "DELETE FROM t").unwrap();
@@ -3699,7 +3796,10 @@ mod tests {
         let mut setup = new_session();
         run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
         let err = run_stmt_err(&s, &mut setup, "LOCK TABLE t");
-        assert!(err.contains("can only be used in transaction blocks"), "{err}");
+        assert!(
+            err.contains("can only be used in transaction blocks"),
+            "{err}"
+        );
     }
 
     #[test]

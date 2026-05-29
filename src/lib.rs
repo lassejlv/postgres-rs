@@ -5,9 +5,9 @@
 //! [`storage`], and [`server`] while the implementation lives under `crates/`.
 
 pub use postgres_auth::{auth, crypto, hba};
-pub use postgres_engine::{disk, executor, index, lock, plpgsql, storage, wal};
+pub use postgres_engine::{disk, executor, index, lock, native, plpgsql, storage, wal};
 pub use postgres_protocol as protocol;
 pub use postgres_server::{bind, server};
 pub use postgres_sql as sql;
-pub use postgres_types::{numeric, types};
 pub use postgres_types::{BigDecimal, DataType, Value};
+pub use postgres_types::{numeric, types};

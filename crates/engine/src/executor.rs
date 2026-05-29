@@ -3,14 +3,20 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::env;
+use std::ffi::{c_int, c_void};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::index::Bound;
+use crate::native::{self, NativeSpiResult, NativeUdf};
 use crate::numeric::BigDecimal;
 use crate::sql::ast::*;
 use crate::sql::serialize::{expr_to_sql, select_to_sql};
 use crate::storage::{
     Aggregate, CheckConstraint, Column, Database, ExclusionConstraint, ForeignKeyConstraint,
-    MaterializedView, Policy, Rule, SqlFunction, Table, Trigger, UniqueConstraint, View,
+    FunctionSignature, MaterializedView, Policy, Rule, SqlFunction, Table, Trigger,
+    UniqueConstraint, View,
 };
 use crate::types::{DataType, Value};
 
@@ -53,6 +59,8 @@ struct ScalarUdf {
     body: Expr,
     /// The declared return type, used to coerce the result.
     return_type: Option<DataType>,
+    /// Whether NULL input short-circuits to NULL without evaluating the body.
+    strict: bool,
 }
 
 /// A `LANGUAGE plpgsql` scalar function: its raw body and parameter info. The
@@ -67,6 +75,8 @@ struct PlpgsqlUdf {
     body: String,
     /// The declared return type, used to coerce the result.
     return_type: Option<DataType>,
+    /// Whether NULL input short-circuits to NULL without interpreting the body.
+    strict: bool,
 }
 
 thread_local! {
@@ -81,6 +91,11 @@ thread_local! {
     /// statement, keyed by `(lowercased name, arity)`. Resolved by
     /// `eval_scalar_function` the same way as `SCALAR_UDFS`.
     static PLPGSQL_UDFS: std::cell::RefCell<HashMap<(String, usize), PlpgsqlUdf>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// `LANGUAGE c` scalar functions backed by a shared library and exported
+    /// symbol. Values cross the boundary through [`crate::native`]'s compact C ABI.
+    static NATIVE_UDFS: std::cell::RefCell<HashMap<(String, usize), NativeUdf>> =
         std::cell::RefCell::new(HashMap::new());
 
     /// Rendered `CREATE INDEX ...` / constraint definitions keyed by catalog
@@ -135,7 +150,8 @@ fn flush_guc_writes(db: &mut Database) {
 fn refresh_scalar_udfs(db: &Database) {
     let mut map = HashMap::new();
     let mut pl_map = HashMap::new();
-    for f in db.all_functions() {
+    let mut native_map = HashMap::new();
+    for (function_idx, f) in db.all_functions().into_iter().enumerate() {
         let arg_names: Vec<String> = f
             .arg_names
             .iter()
@@ -149,6 +165,23 @@ fn refresh_scalar_udfs(db: &Database) {
                     arg_types: f.arg_types.clone(),
                     body: f.body.clone(),
                     return_type: f.return_type,
+                    strict: f.strict,
+                },
+            );
+            continue;
+        }
+        if f.language == "c" {
+            let symbol = f.link_symbol.clone().unwrap_or_else(|| f.name.clone());
+            native_map.insert(
+                (f.name.to_ascii_lowercase(), f.arg_types.len()),
+                NativeUdf {
+                    name: f.name.clone(),
+                    arg_types: f.arg_types.clone(),
+                    return_type: f.return_type,
+                    library_path: f.body.clone(),
+                    symbol,
+                    oid: user_function_oid(function_idx) as u32,
+                    strict: f.strict,
                 },
             );
             continue;
@@ -164,12 +197,14 @@ fn refresh_scalar_udfs(db: &Database) {
                     arg_types: f.arg_types.clone(),
                     body,
                     return_type: f.return_type,
+                    strict: f.strict,
                 },
             );
         }
     }
     SCALAR_UDFS.with(|cell| *cell.borrow_mut() = map);
     PLPGSQL_UDFS.with(|cell| *cell.borrow_mut() = pl_map);
+    NATIVE_UDFS.with(|cell| *cell.borrow_mut() = native_map);
 }
 
 /// Quote an SQL identifier only when it needs quoting (mirrors psql output:
@@ -379,12 +414,10 @@ fn substitute_udf_args(expr: &Expr, args: &[Value], arg_names: &[String]) -> Exp
             let idx = (*n as usize).wrapping_sub(1);
             args.get(idx).map(lit).unwrap_or(Expr::Null)
         }
-        Expr::Column(name) => {
-            match arg_names.iter().position(|a| a.eq_ignore_ascii_case(name)) {
-                Some(idx) => args.get(idx).map(lit).unwrap_or(Expr::Null),
-                None => expr.clone(),
-            }
-        }
+        Expr::Column(name) => match arg_names.iter().position(|a| a.eq_ignore_ascii_case(name)) {
+            Some(idx) => args.get(idx).map(lit).unwrap_or(Expr::Null),
+            None => expr.clone(),
+        },
         Expr::Unary { op, expr } => Expr::Unary {
             op: *op,
             expr: Box::new(substitute_udf_args(expr, args, arg_names)),
@@ -499,6 +532,9 @@ fn substitute_udf_args(expr: &Expr, args: &[Value], arg_names: &[String]) -> Exp
 fn try_eval_scalar_udf(name: &str, vals: &[Value]) -> Option<Result<Value, String>> {
     let key = (name.to_ascii_lowercase(), vals.len());
     let udf = SCALAR_UDFS.with(|cell| cell.borrow().get(&key).cloned())?;
+    if udf.strict && vals.iter().any(Value::is_null) {
+        return Some(Ok(Value::Null));
+    }
     // Coerce each argument to its declared type before substitution.
     let mut coerced = Vec::with_capacity(vals.len());
     for (v, ty) in vals.iter().zip(udf.arg_types.iter()) {
@@ -521,6 +557,9 @@ fn try_eval_scalar_udf(name: &str, vals: &[Value]) -> Option<Result<Value, Strin
 fn try_eval_plpgsql_udf(name: &str, vals: &[Value]) -> Option<Result<Value, String>> {
     let key = (name.to_ascii_lowercase(), vals.len());
     let udf = PLPGSQL_UDFS.with(|cell| cell.borrow().get(&key).cloned())?;
+    if udf.strict && vals.iter().any(Value::is_null) {
+        return Some(Ok(Value::Null));
+    }
     let mut coerced = Vec::with_capacity(vals.len());
     for (v, ty) in vals.iter().zip(udf.arg_types.iter()) {
         match coerce(v.clone(), *ty) {
@@ -529,6 +568,28 @@ fn try_eval_plpgsql_udf(name: &str, vals: &[Value]) -> Option<Result<Value, Stri
         }
     }
     let result = crate::plpgsql::eval_plpgsql(&udf.body, &udf.arg_names, &coerced);
+    Some(match (result, udf.return_type) {
+        (Ok(v), Some(ty)) => coerce(v, ty),
+        (other, _) => other,
+    })
+}
+
+/// Evaluate a user-defined `LANGUAGE c` scalar function call through the native
+/// extension ABI. Returns `None` when no native function matches name/arity.
+fn try_eval_native_udf(name: &str, vals: &[Value]) -> Option<Result<Value, String>> {
+    let key = (name.to_ascii_lowercase(), vals.len());
+    let udf = NATIVE_UDFS.with(|cell| cell.borrow().get(&key).cloned())?;
+    if udf.strict && vals.iter().any(Value::is_null) {
+        return Some(Ok(Value::Null));
+    }
+    let mut coerced = Vec::with_capacity(vals.len());
+    for (v, ty) in vals.iter().zip(udf.arg_types.iter()) {
+        match coerce(v.clone(), *ty) {
+            Ok(c) => coerced.push(c),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    let result = native::eval_native_udf(&udf, &coerced);
     Some(match (result, udf.return_type) {
         (Ok(v), Some(ty)) => coerce(v, ty),
         (other, _) => other,
@@ -544,16 +605,98 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
     refresh_catalog_defs(db);
     // Expose configuration parameters to `current_setting(...)`.
     refresh_guc_snapshot(db);
-    let result = execute_dispatch(db, stmt);
+    let db_ptr = db as *mut Database as *mut c_void;
+    let result = native::with_spi_handler(db_ptr, execute_native_spi_handler, || {
+        execute_dispatch(db, stmt)
+    });
     // Apply any `set_config(...)` writes performed during evaluation.
     flush_guc_writes(db);
     result
+}
+
+unsafe fn execute_native_spi_handler(
+    ctx: *mut c_void,
+    query: &str,
+    read_only: bool,
+    count: i64,
+) -> Result<NativeSpiResult, String> {
+    if ctx.is_null() {
+        return Err("SPI_execute has no active database context".into());
+    }
+    let db = unsafe { &mut *(ctx as *mut Database) };
+    execute_native_spi_statement(db, query, read_only, count)
+}
+
+fn execute_native_spi_statement(
+    db: &mut Database,
+    query: &str,
+    read_only: bool,
+    count: i64,
+) -> Result<NativeSpiResult, String> {
+    let mut stmts: Vec<Statement> = crate::sql::Parser::parse_sql(query)?
+        .into_iter()
+        .filter(|stmt| !matches!(stmt, Statement::Empty))
+        .collect();
+    if stmts.len() != 1 {
+        return Err("SPI_execute supports one statement".into());
+    }
+    let Some(stmt) = stmts.pop() else {
+        return Err("SPI_execute requires a statement".into());
+    };
+    let returning_code = native_spi_returning_code(&stmt);
+    let command_code = native_spi_command_code(&stmt);
+    if read_only && !matches!(stmt, Statement::Select(_)) {
+        return Err("SPI_execute read-only mode rejected a write statement".into());
+    }
+    let result = execute_dispatch(db, stmt)?;
+    match result {
+        ExecResult::Rows { mut rows, .. } => {
+            if count > 0 {
+                rows.truncate(count as usize);
+            }
+            Ok(NativeSpiResult::returning(returning_code, rows))
+        }
+        ExecResult::Command(tag) => Ok(NativeSpiResult::command(
+            command_code,
+            command_tag_count(&tag),
+        )),
+        ExecResult::Empty => Ok(NativeSpiResult::command(native::SPI_OK_UTILITY, 0)),
+    }
+}
+
+fn native_spi_returning_code(stmt: &Statement) -> c_int {
+    match stmt {
+        Statement::Insert(_) => native::SPI_OK_INSERT_RETURNING,
+        Statement::Update(_) => native::SPI_OK_UPDATE_RETURNING,
+        Statement::Delete(_) => native::SPI_OK_DELETE_RETURNING,
+        Statement::Select(_) => native::SPI_OK_SELECT,
+        _ => native::SPI_OK_UTILITY,
+    }
+}
+
+fn native_spi_command_code(stmt: &Statement) -> c_int {
+    match stmt {
+        Statement::Insert(_) => native::SPI_OK_INSERT,
+        Statement::Update(_) => native::SPI_OK_UPDATE,
+        Statement::Delete(_) => native::SPI_OK_DELETE,
+        Statement::Merge(_) => native::SPI_OK_MERGE,
+        Statement::Select(_) => native::SPI_OK_SELECT,
+        _ => native::SPI_OK_UTILITY,
+    }
+}
+
+fn command_tag_count(tag: &str) -> usize {
+    tag.rsplit(' ')
+        .next()
+        .and_then(|part| part.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 fn execute_dispatch(db: &mut Database, stmt: Statement) -> Result<ExecResult, String> {
     match stmt {
         Statement::CreateTable(c) => exec_create_table(db, c),
         Statement::CreateExtension(c) => exec_create_extension(db, c),
+        Statement::AlterExtension(a) => exec_alter_extension(db, a),
         Statement::CreateRole(c) => exec_create_role(db, c),
         Statement::CreateSequence(c) => exec_create_sequence(db, c),
         Statement::CreateSchema(c) => exec_create_schema(db, c),
@@ -645,10 +788,7 @@ fn execute_dispatch(db: &mut Database, stmt: Statement) -> Result<ExecResult, St
         } => {
             if session {
                 if let Some(level) = isolation {
-                    db.set_system_setting(
-                        "transaction_isolation".into(),
-                        level.guc_value().into(),
-                    );
+                    db.set_system_setting("transaction_isolation".into(), level.guc_value().into());
                 }
             }
             Ok(ExecResult::Command("SET".into()))
@@ -660,9 +800,7 @@ fn execute_dispatch(db: &mut Database, stmt: Statement) -> Result<ExecResult, St
             Ok(ExecResult::Command("PREPARE TRANSACTION".into()))
         }
         Statement::CommitPrepared { .. } => Ok(ExecResult::Command("COMMIT PREPARED".into())),
-        Statement::RollbackPrepared { .. } => {
-            Ok(ExecResult::Command("ROLLBACK PREPARED".into()))
-        }
+        Statement::RollbackPrepared { .. } => Ok(ExecResult::Command("ROLLBACK PREPARED".into())),
         Statement::Empty => Ok(ExecResult::Empty),
     }
 }
@@ -672,10 +810,7 @@ fn exec_create_catalog_object(db: &mut Database, c: CatalogObject) -> Result<Exe
     Ok(ExecResult::Command(format!("CREATE {}", c.kind.keyword())))
 }
 
-fn exec_drop_catalog_object(
-    db: &mut Database,
-    d: DropCatalogObject,
-) -> Result<ExecResult, String> {
+fn exec_drop_catalog_object(db: &mut Database, d: DropCatalogObject) -> Result<ExecResult, String> {
     db.drop_catalog_object(d.kind.keyword(), &d.name, d.if_exists)?;
     Ok(ExecResult::Command(format!("DROP {}", d.kind.keyword())))
 }
@@ -802,6 +937,7 @@ fn explain_statement(db: &Database, stmt: &Statement) -> Vec<String> {
         Statement::Merge(m) => vec![format!("Merge on {}", m.target)],
         Statement::CreateTable(c) => vec![format!("Create Table {}", c.name)],
         Statement::CreateExtension(c) => vec![format!("Create Extension {}", c.name)],
+        Statement::AlterExtension(a) => vec![format!("Alter Extension {}", a.name)],
         Statement::CreateRole(c) => vec![format!("Create Role {}", c.name)],
         Statement::CreateSequence(c) => vec![format!("Create Sequence {}", c.name)],
         Statement::CreateSchema(c) => vec![format!("Create Schema {}", c.name)],
@@ -1285,7 +1421,10 @@ fn resolve_source_schema(
     if let Some(sub) = &tref.subquery {
         let fields = select_fields_with_ctes(db, sub, ctes)?;
         let qual = tref.qualifier();
-        let names: Vec<String> = fields.iter().map(|f| format!("{qual}.{}", f.name)).collect();
+        let names: Vec<String> = fields
+            .iter()
+            .map(|f| format!("{qual}.{}", f.name))
+            .collect();
         let types: Vec<DataType> = fields.iter().map(|f| f.data_type).collect();
         let (names, types, _) = apply_column_aliases(tref, names, types, Vec::new());
         return Ok((names, types));
@@ -1802,7 +1941,8 @@ fn resolve_subquery_source(
     qual: &str,
     ctes: &CteMap,
 ) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
-    let ExecResult::Rows { fields, rows, .. } = exec_select_with_ctes(db, sub.clone(), ctes)? else {
+    let ExecResult::Rows { fields, rows, .. } = exec_select_with_ctes(db, sub.clone(), ctes)?
+    else {
         return Err("subquery in FROM did not produce rows".into());
     };
     let mut names = Vec::with_capacity(fields.len());
@@ -1841,9 +1981,7 @@ fn apply_column_aliases(
 /// which is exactly when `select_own_columns` needs the schema during
 /// correlation analysis. Returns `None` for functions whose schema this engine
 /// cannot derive statically, letting callers fall back to materialization.
-fn virtual_set_returning_function_schema(
-    tref: &TableRef,
-) -> Option<(Vec<String>, Vec<DataType>)> {
+fn virtual_set_returning_function_schema(tref: &TableRef) -> Option<(Vec<String>, Vec<DataType>)> {
     let q = tref.qualifier();
     let (cols, types): (Vec<String>, Vec<DataType>) = match tref.name.to_ascii_lowercase().as_str()
     {
@@ -1904,7 +2042,11 @@ fn virtual_set_returning_function(
                 })
                 .unwrap_or(0);
             let name = format!("{}.{}", tref.qualifier(), tref.name.to_ascii_lowercase());
-            Ok((vec![name], vec![DataType::Int8], vec![vec![Value::Int(oid)]]))
+            Ok((
+                vec![name],
+                vec![DataType::Int8],
+                vec![vec![Value::Int(oid)]],
+            ))
         }
         // `pg_options_to_table(text[])` expands a reloptions/foreign-options
         // array into (option_name, option_value) rows. No object in this engine
@@ -2180,8 +2322,7 @@ fn collect_eq_facts<'a>(conjuncts: &[&'a Expr], target: &Table) -> EqFacts<'a> {
             // Normalise `col = const` (either operand order) into the map.
             if let (Some(col), Some(v)) = (column_index_of(left, target), const_value(right)) {
                 by_column.entry(col).or_insert(v);
-            } else if let (Some(col), Some(v)) =
-                (column_index_of(right, target), const_value(left))
+            } else if let (Some(col), Some(v)) = (column_index_of(right, target), const_value(left))
             {
                 by_column.entry(col).or_insert(v);
             }
@@ -2518,7 +2659,10 @@ fn reorder_inner_joins(db: &Database, from: &FromClause) -> Option<FromClause> {
         }
     }
     let n = rels.len();
-    let qualifiers: Vec<String> = rels.iter().map(|(t, _)| t.qualifier().to_string()).collect();
+    let qualifiers: Vec<String> = rels
+        .iter()
+        .map(|(t, _)| t.qualifier().to_string())
+        .collect();
 
     // The ON predicates form a *pool* of join conditions, each tagged with the
     // set of qualifiers it references. They are not tied to a particular
@@ -2794,7 +2938,11 @@ fn collect_constraints(db: &Database) -> Vec<(String, String, &'static str)> {
             out.push((
                 table_name.clone(),
                 c.name.clone(),
-                if c.primary_key { "PRIMARY KEY" } else { "UNIQUE" },
+                if c.primary_key {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
             ));
         }
         for c in table.foreign_key_constraints() {
@@ -3058,7 +3206,11 @@ fn virtual_information_schema(
                             txt("pg_catalog"),
                             Value::Text(dt.pg_type_name().to_string()),
                             txt(if c.identity { "YES" } else { "NO" }),
-                            txt(if c.generated.is_some() { "ALWAYS" } else { "NEVER" }),
+                            txt(if c.generated.is_some() {
+                                "ALWAYS"
+                            } else {
+                                "NEVER"
+                            }),
                         ]);
                     }
                 }
@@ -3187,9 +3339,7 @@ fn virtual_information_schema(
                     Value::Text(kc.table_name),
                     Value::Text(kc.column_name),
                     Value::Int(kc.ordinal),
-                    kc.unique_position
-                        .map(Value::Int)
-                        .unwrap_or(Value::Null),
+                    kc.unique_position.map(Value::Int).unwrap_or(Value::Null),
                 ]);
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
@@ -3331,6 +3481,8 @@ const USER_CONSTRAINT_OID_BASE: i64 = 49152;
 const USER_ATTRDEF_OID_BASE: i64 = 57344;
 /// Base OID for synthesized sequence relation OIDs.
 const USER_SEQUENCE_OID_BASE: i64 = 65536;
+/// Base OID for synthesized user function OIDs in `pg_proc`.
+const USER_FUNCTION_OID_BASE: i64 = 73728;
 
 fn user_table_oid(index: usize) -> i64 {
     USER_TABLE_OID_BASE + index as i64
@@ -3350,6 +3502,28 @@ fn user_attrdef_oid(table_index: usize, column_index: usize) -> i64 {
 
 fn user_sequence_oid(index: usize) -> i64 {
     USER_SEQUENCE_OID_BASE + index as i64
+}
+
+fn user_function_oid(index: usize) -> i64 {
+    USER_FUNCTION_OID_BASE + index as i64
+}
+
+fn user_function_oid_by_signature(db: &Database, sig: &FunctionSignature) -> Option<i64> {
+    db.all_functions()
+        .into_iter()
+        .enumerate()
+        .find(|(_, f)| {
+            f.name.eq_ignore_ascii_case(&sig.name) && f.arg_type_names == sig.arg_type_names
+        })
+        .map(|(idx, _)| user_function_oid(idx))
+}
+
+fn extension_oid_by_name(db: &Database, name: &str) -> Option<i64> {
+    db.extensions()
+        .into_iter()
+        .enumerate()
+        .find(|(_, ext)| ext.name.eq_ignore_ascii_case(name))
+        .map(|(idx, _)| 13563 + idx as i64)
 }
 
 /// Resolve a role name to its OID via the role catalog (`pg_roles`/`pg_authid`),
@@ -3557,18 +3731,18 @@ fn virtual_pg_catalog_inner(
                     Value::Bool(relhastriggers),
                     Value::Bool(relrowsecurity),
                     Value::Bool(relforcerowsecurity),
-                    Value::Bool(false), // relhasoids
-                    Value::Bool(false), // relispartition
-                    Value::Int(0),      // reltablespace
-                    Value::Int(0),      // reltoastrelid
-                    Value::Int(0),      // reloftype
+                    Value::Bool(false),           // relhasoids
+                    Value::Bool(false),           // relispartition
+                    Value::Int(0),                // reltablespace
+                    Value::Int(0),                // reltoastrelid
+                    Value::Int(0),                // reloftype
                     Value::Text("d".to_string()), // relreplident (default)
-                    Value::Null,        // reloptions
-                    Value::Null,        // relpartbound
-                    Value::Int(0),      // relfrozenxid
-                    Value::Int(0),      // relminmxid
-                    Value::Bool(true),  // relispopulated
-                    Value::Null,        // relacl (default privileges)
+                    Value::Null,                  // reloptions
+                    Value::Null,                  // relpartbound
+                    Value::Int(0),                // relfrozenxid
+                    Value::Int(0),                // relminmxid
+                    Value::Bool(true),            // relispopulated
+                    Value::Null,                  // relacl (default privileges)
                 ]
             };
             let mut rows = Vec::new();
@@ -3580,7 +3754,9 @@ fn virtual_pg_catalog_inner(
                 let has_index = table
                     .map(|t| !t.indexes().is_empty() || !t.unique_constraints().is_empty())
                     .unwrap_or(false);
-                let nchecks = table.map(|t| t.check_constraints().len() as i64).unwrap_or(0);
+                let nchecks = table
+                    .map(|t| t.check_constraints().len() as i64)
+                    .unwrap_or(0);
                 // Foreign keys are implemented via system triggers in real
                 // PostgreSQL (on both the referencing and referenced tables), so
                 // psql gates its FK / "Referenced by" footer queries on
@@ -3600,9 +3776,7 @@ fn virtual_pg_catalog_inner(
                 let (reltuples, relpages) = table
                     .map(|t| (t.reltuples() as f64, t.relpages() as i64))
                     .unwrap_or((0.0, 0));
-                let owner_oid = table
-                    .map(|t| role_oid(db, t.owner()))
-                    .unwrap_or(10);
+                let owner_oid = table.map(|t| role_oid(db, t.owner())).unwrap_or(10);
                 let row_security = table.map(|t| t.row_security()).unwrap_or(false);
                 let force_row_security = table.map(|t| t.force_row_security()).unwrap_or(false);
                 rows.push(row(
@@ -3735,7 +3909,12 @@ fn virtual_pg_catalog_inner(
                         _ => 16000 + i as i64,
                     };
                     // Owner is the bootstrap superuser (OID 10); ACL NULL = default.
-                    vec![Value::Int(oid), Value::Text(schema), Value::Int(10), Value::Null]
+                    vec![
+                        Value::Int(oid),
+                        Value::Text(schema),
+                        Value::Int(10),
+                        Value::Null,
+                    ]
                 })
                 .collect();
             Ok(qualify_virtual(qualifier, &cols, rows))
@@ -3868,23 +4047,23 @@ fn virtual_pg_catalog_inner(
             // I/O functions are modeled; OID 0 = "none").
             let type_tail = || -> Vec<Value> {
                 vec![
-                    Value::Int(0),          // typinput
-                    Value::Int(0),          // typoutput
-                    Value::Int(0),          // typreceive
-                    Value::Int(0),          // typsend
-                    Value::Int(0),          // typanalyze
-                    Value::Int(0),          // typmodin
-                    Value::Int(0),          // typmodout
-                    Value::Int(0),          // typsubscript
+                    Value::Int(0),           // typinput
+                    Value::Int(0),           // typoutput
+                    Value::Int(0),           // typreceive
+                    Value::Int(0),           // typsend
+                    Value::Int(0),           // typanalyze
+                    Value::Int(0),           // typmodin
+                    Value::Int(0),           // typmodout
+                    Value::Int(0),           // typsubscript
                     Value::Text(",".into()), // typdelim
                     Value::Text("i".into()), // typalign
-                    Value::Bool(false),     // typispreferred
-                    Value::Null,            // typdefault
-                    Value::Null,            // typdefaultbin
-                    Value::Int(0),          // typbasetype
-                    Value::Int(-1),         // typtypmod
-                    Value::Bool(false),     // typnotnull
-                    Value::Int(0),          // typndims
+                    Value::Bool(false),      // typispreferred
+                    Value::Null,             // typdefault
+                    Value::Null,             // typdefaultbin
+                    Value::Int(0),           // typbasetype
+                    Value::Int(-1),          // typtypmod
+                    Value::Bool(false),      // typnotnull
+                    Value::Int(0),           // typndims
                 ]
             };
             let mut rows: Vec<Vec<Value>> = DataType::ALL
@@ -3902,10 +4081,10 @@ fn virtual_pg_catalog_inner(
                         Value::Int(collation),
                         Value::Int(0),
                         Value::Int(0),
-                        Value::Int(10),  // typowner
-                        Value::Null,     // typacl
+                        Value::Int(10),    // typowner
+                        Value::Null,       // typacl
                         Value::Bool(true), // typisdefined
-                        Value::Int(0),   // typarray
+                        Value::Int(0),     // typarray
                         // 'x' (extended) for varlena text-ish types, 'p' (plain)
                         // for fixed-width by-value types.
                         Value::Text(if dt.type_size() < 0 { "x" } else { "p" }.into()),
@@ -3929,10 +4108,10 @@ fn virtual_pg_catalog_inner(
                     Value::Int(0),
                     Value::Int(0),
                     Value::Int(0),
-                    Value::Int(10),  // typowner
-                    Value::Null,     // typacl
-                    Value::Bool(true), // typisdefined
-                    Value::Int(0),   // typarray
+                    Value::Int(10),          // typowner
+                    Value::Null,             // typacl
+                    Value::Bool(true),       // typisdefined
+                    Value::Int(0),           // typarray
                     Value::Text("x".into()), // typstorage (extended)
                 ];
                 base.extend(type_tail());
@@ -3970,8 +4149,7 @@ fn virtual_pg_catalog_inner(
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
                 if let Some(table) = db.table(&table_name) {
                     for (column_idx, column) in table.columns.iter().enumerate() {
-                        let has_def =
-                            column.default.is_some() || column.generated.is_some();
+                        let has_def = column.default.is_some() || column.generated.is_some();
                         // text/varchar/char collate to "default" (oid 100); other
                         // types have no collation (0). This mirrors pg closely
                         // enough that psql's collation subquery returns no rows.
@@ -3983,7 +4161,11 @@ fn virtual_pg_catalog_inner(
                         // Match the type's natural storage so pg_dump never
                         // emits a redundant `SET STORAGE` line: 'x' (extended)
                         // for varlena types, 'p' (plain) for fixed-width ones.
-                        let storage = if column.data_type.type_size() < 0 { "x" } else { "p" };
+                        let storage = if column.data_type.type_size() < 0 {
+                            "x"
+                        } else {
+                            "p"
+                        };
                         rows.push(vec![
                             Value::Int(user_table_oid(table_idx)),
                             Value::Text(column.name.clone()),
@@ -4004,17 +4186,17 @@ fn virtual_pg_catalog_inner(
                             Value::Text(if column.generated.is_some() { "s" } else { "" }.into()),
                             Value::Bool(has_def),
                             Value::Int(collation),
-                            Value::Null,    // attacl (default privileges)
-                            Value::Int(-1), // attstattarget (default)
-                            Value::Null,    // attoptions
-                            Value::Null,    // attfdwoptions
+                            Value::Null,                 // attacl (default privileges)
+                            Value::Int(-1),              // attstattarget (default)
+                            Value::Null,                 // attoptions
+                            Value::Null,                 // attfdwoptions
                             Value::Text(storage.into()), // attstorage
-                            Value::Text("i".into()), // attalign (int)
-                            Value::Bool(true),       // attislocal
-                            Value::Int(0),           // attinhcount
-                            Value::Text("".into()),  // attcompression (none)
-                            Value::Bool(false),      // atthasmissing
-                            Value::Null,             // attmissingval
+                            Value::Text("i".into()),     // attalign (int)
+                            Value::Bool(true),           // attislocal
+                            Value::Int(0),               // attinhcount
+                            Value::Text("".into()),      // attcompression (none)
+                            Value::Bool(false),          // atthasmissing
+                            Value::Null,                 // attmissingval
                         ]);
                     }
                 }
@@ -4187,7 +4369,8 @@ fn virtual_pg_catalog_inner(
                     }
                     let fk_base = check_base + table.check_constraints().len();
                     for (fk_idx, constraint) in table.foreign_key_constraints().iter().enumerate() {
-                        let confrelid = relation_oid_by_name(db, &constraint.ref_table).unwrap_or(0);
+                        let confrelid =
+                            relation_oid_by_name(db, &constraint.ref_table).unwrap_or(0);
                         rows.push(vec![
                             Value::Int(user_constraint_oid(table_idx, fk_base + fk_idx)),
                             Value::Text(constraint.name.clone()),
@@ -4349,7 +4532,24 @@ fn virtual_pg_catalog_inner(
                 ("refobjsubid", DataType::Int4),
                 ("deptype", DataType::Text),
             ];
-            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+            let mut rows = Vec::new();
+            for (extension, signature) in db.all_extension_function_dependencies() {
+                if let (Some(function_oid), Some(extension_oid)) = (
+                    user_function_oid_by_signature(db, &signature),
+                    extension_oid_by_name(db, &extension),
+                ) {
+                    rows.push(vec![
+                        Value::Int(catalog_self_oid("pg_proc")),
+                        Value::Int(function_oid),
+                        Value::Int(0),
+                        Value::Int(catalog_self_oid("pg_extension")),
+                        Value::Int(extension_oid),
+                        Value::Int(0),
+                        Value::Text("e".into()),
+                    ]);
+                }
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
         }
         "pg_roles" => {
             let cols = [
@@ -4632,9 +4832,8 @@ fn virtual_pg_catalog_inner(
             ];
             let mut rows = rows;
             // User-defined functions and aggregates appear after the built-ins,
-            // with synthetic OIDs starting at 16384 (the first user OID).
-            let mut oid = 16384i64;
-            for f in db.all_functions() {
+            // with synthetic OIDs in a stable user range.
+            for (idx, f) in db.all_functions().into_iter().enumerate() {
                 let argtypes = f
                     .arg_types
                     .iter()
@@ -4643,16 +4842,17 @@ fn virtual_pg_catalog_inner(
                     .join(" ");
                 let ret = f.return_type.unwrap_or(DataType::Text);
                 rows.push(pg_proc_row_full(
-                    oid,
+                    user_function_oid(idx),
                     &f.name,
                     "f",
                     ret,
                     &argtypes,
+                    f.strict,
                     false,
                     f.security_definer,
                 ));
-                oid += 1;
             }
+            let mut oid = user_function_oid(db.all_functions().len());
             for a in db.all_aggregates() {
                 rows.push(pg_proc_row(oid, &a.name, "a", DataType::Text, ""));
                 oid += 1;
@@ -5239,7 +5439,7 @@ fn pg_proc_row_set(
     argtypes: &str,
     retset: bool,
 ) -> Vec<Value> {
-    pg_proc_row_full(oid, name, kind, ret, argtypes, retset, false)
+    pg_proc_row_full(oid, name, kind, ret, argtypes, false, retset, false)
 }
 
 fn pg_proc_row_full(
@@ -5248,6 +5448,7 @@ fn pg_proc_row_full(
     kind: &str,
     ret: DataType,
     argtypes: &str,
+    strict: bool,
     retset: bool,
     secdef: bool,
 ) -> Vec<Value> {
@@ -5258,7 +5459,7 @@ fn pg_proc_row_full(
         Value::Int(10),
         Value::Int(12),
         Value::Text(kind.into()),
-        Value::Bool(false),
+        Value::Bool(strict),
         Value::Bool(retset),
         Value::Bool(secdef), // prosecdef
         Value::Int(ret.oid() as i64),
@@ -5269,23 +5470,23 @@ fn pg_proc_row_full(
         } else {
             argtypes.split_whitespace().count() as i64
         }), // pronargs
-        Value::Null, // proacl
-        Value::Text("i".into()), // provolatile (immutable)
-        Value::Text("s".into()), // proparallel (safe)
-        Value::Bool(false),      // proleakproof
+        Value::Null,              // proacl
+        Value::Text("i".into()),  // provolatile (immutable)
+        Value::Text("s".into()),  // proparallel (safe)
+        Value::Bool(false),       // proleakproof
         Value::Float(if kind == "a" { 1.0 } else { 100.0 }), // procost
-        Value::Float(if retset { 1000.0 } else { 0.0 }),     // prorows
+        Value::Float(if retset { 1000.0 } else { 0.0 }), // prorows
         Value::Text(name.into()), // prosrc (internal name)
-        Value::Null,             // probin
-        Value::Null,             // prosqlbody
-        Value::Null,             // proconfig
-        Value::Null,             // proargnames
-        Value::Null,             // proallargtypes
-        Value::Null,             // proargmodes
-        Value::Null,             // proargdefaults
-        Value::Null,             // protrftypes
-        Value::Int(0),           // prosupport
-        Value::Int(0),           // provariadic
+        Value::Null,              // probin
+        Value::Null,              // prosqlbody
+        Value::Null,              // proconfig
+        Value::Null,              // proargnames
+        Value::Null,              // proallargtypes
+        Value::Null,              // proargmodes
+        Value::Null,              // proargdefaults
+        Value::Null,              // protrftypes
+        Value::Int(0),            // prosupport
+        Value::Int(0),            // provariadic
     ]
 }
 
@@ -5524,7 +5725,10 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
     // column type before the table is built.
     let resolved_bound = if let Some(po) = &c.partition_of {
         let parent = db.table(&po.parent).expect("parent existed above");
-        let scheme = parent.partition_scheme().expect("partitioned above").clone();
+        let scheme = parent
+            .partition_scheme()
+            .expect("partitioned above")
+            .clone();
         let key_type = parent.columns[scheme.column].data_type;
         Some(resolve_partition_bound(&po.bound, key_type)?)
     } else {
@@ -5544,9 +5748,12 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
         table.set_inherits(parents);
     }
     if let Some(pb) = &c.partition_by {
-        let column = table
-            .column_index(&pb.column)
-            .ok_or_else(|| format!("column \"{}\" named in partition key does not exist", pb.column))?;
+        let column = table.column_index(&pb.column).ok_or_else(|| {
+            format!(
+                "column \"{}\" named in partition key does not exist",
+                pb.column
+            )
+        })?;
         table.set_partition_scheme(crate::storage::PartitionScheme {
             strategy: pb.strategy,
             column,
@@ -5615,7 +5822,11 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
     db.create_table(table)?;
     // Register this table as a partition of its parent (for parent scans and so
     // psql / pg_inherits can enumerate them).
-    if let Some(parent) = c.partition_of.as_ref().and_then(|po| db.table_mut(&po.parent)) {
+    if let Some(parent) = c
+        .partition_of
+        .as_ref()
+        .and_then(|po| db.table_mut(&po.parent))
+    {
         parent.add_partition(c.name.clone());
     }
     Ok(ExecResult::Command("CREATE TABLE".into()))
@@ -5662,18 +5873,70 @@ fn constraint_column_indices(table: &Table, columns: &[String]) -> Result<Vec<us
 
 fn exec_create_extension(db: &mut Database, c: CreateExtension) -> Result<ExecResult, String> {
     let name = c.name.clone();
-    let installed = db.create_extension(c.name, c.version, c.if_not_exists)?;
-    // For a recognized built-in extension, run its bundled install script so the
-    // objects it provides (functions, etc.) actually exist. `installed` is false
-    // when `IF NOT EXISTS` matched an existing extension — skip re-running then.
-    if installed && let Some(script) = builtin_extension_script(&name) {
+    if db.extension_version(&name).is_some() {
+        if c.if_not_exists {
+            return Ok(ExecResult::Command("CREATE EXTENSION".into()));
+        }
+        return Err(format!("extension \"{name}\" already exists"));
+    }
+
+    let external = load_external_extension(&name, c.version.as_deref())?;
+    let target_version = external
+        .as_ref()
+        .map(|ext| ext.version.clone())
+        .or_else(|| c.version.clone())
+        .unwrap_or_else(|| "1.0".into());
+
+    if let Some(ext) = external {
+        let before = db.function_signatures();
+        run_extension_script(db, &ext.install_sql)
+            .map_err(|e| format!("failed to install extension \"{name}\": {e}"))?;
+        register_extension_script_functions(db, &name, before);
+    } else if let Some(script) = builtin_extension_script(&name) {
+        let before = db.function_signatures();
         run_extension_script(db, script)
             .map_err(|e| format!("failed to install extension \"{name}\": {e}"))?;
+        register_extension_script_functions(db, &name, before);
     }
+    db.create_extension(c.name, Some(target_version), false)?;
     Ok(ExecResult::Command("CREATE EXTENSION".into()))
 }
 
-/// Run each statement of a built-in extension's bundled SQL install/uninstall
+fn exec_alter_extension(db: &mut Database, a: AlterExtension) -> Result<ExecResult, String> {
+    let old_version = db
+        .extension_version(&a.name)
+        .ok_or_else(|| format!("extension \"{}\" does not exist", a.name))?;
+    let update = load_external_extension_update(&a.name, &old_version, a.to_version.as_deref())?;
+    let Some(update) = update else {
+        return Err(format!(
+            "extension \"{}\" has no update path from \"{}\"",
+            a.name, old_version
+        ));
+    };
+    if update.version == old_version {
+        return Ok(ExecResult::Command("ALTER EXTENSION".into()));
+    }
+    let before = db.function_signatures();
+    run_extension_script(db, &update.install_sql)
+        .map_err(|e| format!("failed to update extension \"{}\": {e}", a.name))?;
+    register_extension_script_functions(db, &a.name, before);
+    db.set_extension_version(&a.name, update.version)?;
+    Ok(ExecResult::Command("ALTER EXTENSION".into()))
+}
+
+fn register_extension_script_functions(
+    db: &mut Database,
+    extension_name: &str,
+    before: HashSet<FunctionSignature>,
+) {
+    let after = db.function_signatures();
+    db.register_extension_functions(
+        extension_name,
+        after.into_iter().filter(|sig| !before.contains(sig)),
+    );
+}
+
+/// Run each statement of an extension's SQL install/uninstall/update
 /// script against `db`.
 fn run_extension_script(db: &mut Database, script: &str) -> Result<(), String> {
     for stmt in crate::sql::Parser::parse_sql(script)? {
@@ -5683,6 +5946,136 @@ fn run_extension_script(db: &mut Database, script: &str) -> Result<(), String> {
         execute_dispatch(db, stmt)?;
     }
     Ok(())
+}
+
+struct ExternalExtensionScript {
+    version: String,
+    install_sql: String,
+}
+
+#[derive(Default)]
+struct ExtensionControl {
+    default_version: Option<String>,
+    module_path: Option<String>,
+}
+
+fn load_external_extension(
+    name: &str,
+    requested_version: Option<&str>,
+) -> Result<Option<ExternalExtensionScript>, String> {
+    let Some((dir, control)) = read_extension_control(name)? else {
+        return Ok(None);
+    };
+    let version = requested_version
+        .map(str::to_string)
+        .or(control.default_version.clone())
+        .unwrap_or_else(|| "1.0".into());
+    let script = dir.join(format!("{name}--{version}.sql"));
+    if !script.exists() {
+        if requested_version.is_some() || control.default_version.is_some() {
+            return Err(format!(
+                "extension \"{name}\" install script not found: {}",
+                script.display()
+            ));
+        }
+        return Ok(None);
+    }
+    Ok(Some(ExternalExtensionScript {
+        version,
+        install_sql: load_extension_script(&script, name, &control)?,
+    }))
+}
+
+fn load_external_extension_update(
+    name: &str,
+    old_version: &str,
+    requested_version: Option<&str>,
+) -> Result<Option<ExternalExtensionScript>, String> {
+    let Some((dir, control)) = read_extension_control(name)? else {
+        return Ok(None);
+    };
+    let version = requested_version
+        .map(str::to_string)
+        .or(control.default_version.clone())
+        .unwrap_or_else(|| old_version.to_string());
+    if version == old_version {
+        return Ok(Some(ExternalExtensionScript {
+            version,
+            install_sql: String::new(),
+        }));
+    }
+    let script = dir.join(format!("{name}--{old_version}--{version}.sql"));
+    if !script.exists() {
+        return Err(format!(
+            "extension \"{name}\" update script not found: {}",
+            script.display()
+        ));
+    }
+    Ok(Some(ExternalExtensionScript {
+        version,
+        install_sql: load_extension_script(&script, name, &control)?,
+    }))
+}
+
+fn read_extension_control(name: &str) -> Result<Option<(PathBuf, ExtensionControl)>, String> {
+    let Ok(dir) = env::var("PGRS_EXTENSION_DIR") else {
+        return Ok(None);
+    };
+    let dir = PathBuf::from(dir);
+    let path = dir.join(format!("{name}.control"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "failed to read extension control file {}: {e}",
+            path.display()
+        )
+    })?;
+    Ok(Some((dir, parse_extension_control(&contents))))
+}
+
+fn parse_extension_control(contents: &str) -> ExtensionControl {
+    let mut control = ExtensionControl::default();
+    for raw_line in contents.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = extension_control_value(value);
+        match key.trim() {
+            "default_version" => control.default_version = Some(value),
+            "module_path" => control.module_path = Some(value),
+            _ => {}
+        }
+    }
+    control
+}
+
+fn extension_control_value(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("''", "'")
+    } else {
+        value.to_string()
+    }
+}
+
+fn load_extension_script(
+    path: &Path,
+    extension_name: &str,
+    control: &ExtensionControl,
+) -> Result<String, String> {
+    let script = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read extension script {}: {e}", path.display()))?;
+    let module_path = control
+        .module_path
+        .clone()
+        .unwrap_or_else(|| format!("$libdir/{extension_name}"));
+    Ok(script.replace("MODULE_PATHNAME", &module_path))
 }
 
 /// The bundled install SQL script for a recognized built-in extension, or
@@ -5857,8 +6250,10 @@ fn exec_create_function(db: &mut Database, c: CreateFunction) -> Result<ExecResu
             return_type: c.return_type,
             return_type_name: c.return_type_name,
             body: c.body,
+            link_symbol: c.link_symbol,
             language: c.language,
             security_definer: c.security_definer,
+            strict: c.strict,
         },
         c.or_replace,
     )?;
@@ -6159,10 +6554,19 @@ fn exec_drop_table(db: &mut Database, d: DropTable) -> Result<ExecResult, String
 }
 
 fn exec_drop_extension(db: &mut Database, d: DropExtension) -> Result<ExecResult, String> {
+    let owned_functions = db.extension_functions(&d.name);
     let removed = db.drop_extension(&d.name, d.if_exists)?;
-    // When a recognized built-in extension is actually removed, run its
-    // uninstall script to drop the objects its install script created.
-    if removed && let Some(script) = builtin_extension_uninstall_script(&d.name) {
+    if !removed {
+        return Ok(ExecResult::Command("DROP EXTENSION".into()));
+    }
+    for sig in &owned_functions {
+        db.drop_function(&sig.name, Some(&sig.arg_type_names), true)?;
+    }
+    // Older databases may have a built-in extension installed before extension
+    // ownership tracking existed; keep the legacy cleanup path for those.
+    if owned_functions.is_empty()
+        && let Some(script) = builtin_extension_uninstall_script(&d.name)
+    {
         run_extension_script(db, script)?;
     }
     Ok(ExecResult::Command("DROP EXTENSION".into()))
@@ -6591,9 +6995,12 @@ fn exec_alter_policy(db: &mut Database, a: AlterPolicy) -> Result<ExecResult, St
     let table = db
         .table_mut(&a.table)
         .ok_or_else(|| format!("relation \"{}\" does not exist", a.table))?;
-    let policy = table
-        .policy_mut(&a.name)
-        .ok_or_else(|| format!("policy \"{}\" for table \"{}\" does not exist", a.name, a.table))?;
+    let policy = table.policy_mut(&a.name).ok_or_else(|| {
+        format!(
+            "policy \"{}\" for table \"{}\" does not exist",
+            a.name, a.table
+        )
+    })?;
     if let Some(roles) = a.roles {
         policy.roles = roles;
     }
@@ -6676,10 +7083,7 @@ fn enforce_user_types(db: &Database, columns: &[Column], row: &[Value]) -> Resul
         if let Some(domain) = db.domain(type_name) {
             if value.is_null() {
                 if domain.not_null {
-                    return Err(format!(
-                        "domain {} does not allow null values",
-                        domain.name
-                    ));
+                    return Err(format!("domain {} does not allow null values", domain.name));
                 }
                 continue;
             }
@@ -6761,10 +7165,9 @@ fn check_foreign_key_value(
     let ref_idx = referenced
         .column_index(ref_column)
         .expect("referenced column checked");
-    let found = referenced
-        .rows
-        .iter()
-        .any(|row| compare_values(&referenced.detoast_value(&row[ref_idx]), value) == Some(Ordering::Equal));
+    let found = referenced.rows.iter().any(|row| {
+        compare_values(&referenced.detoast_value(&row[ref_idx]), value) == Some(Ordering::Equal)
+    });
     if found {
         Ok(())
     } else {
@@ -6815,8 +7218,10 @@ fn check_parent_key_not_referenced(
                 continue;
             }
             let referenced = child.rows.iter().any(|child_row| {
-                compare_values(&child.detoast_value(&child_row[constraint.column]), parent_value)
-                    == Some(Ordering::Equal)
+                compare_values(
+                    &child.detoast_value(&child_row[constraint.column]),
+                    parent_value,
+                ) == Some(Ordering::Equal)
             });
             if referenced {
                 return Err(format!(
@@ -7336,7 +7741,9 @@ fn route_partition(db: &Database, parent: &str, key: &Value) -> Result<String, S
     use crate::storage::PartitionBoundSpec;
     let parent_table = db.table(parent).expect("parent existed");
     for name in parent_table.partitions() {
-        let Some(child) = db.table(name) else { continue };
+        let Some(child) = db.table(name) else {
+            continue;
+        };
         let Some(bound) = child.partition_bound() else {
             continue;
         };
@@ -7544,9 +7951,7 @@ fn visit_child_exprs(
     f: &mut dyn FnMut(&Expr) -> Result<(), String>,
 ) -> Result<(), String> {
     match expr {
-        Expr::Unary { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::Cast { expr, .. } => f(expr)?,
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => f(expr)?,
         Expr::Binary { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
             f(left)?;
             f(right)?;
@@ -7614,9 +8019,7 @@ fn map_child_exprs(
     f: &mut dyn FnMut(&mut Expr) -> Result<(), String>,
 ) -> Result<(), String> {
     match expr {
-        Expr::Unary { expr, .. }
-        | Expr::IsNull { expr, .. }
-        | Expr::Cast { expr, .. } => f(expr)?,
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => f(expr)?,
         Expr::Binary { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
             f(left)?;
             f(right)?;
@@ -8128,7 +8531,11 @@ fn resolve_correlated(
     match expr {
         Expr::ScalarSubquery(sel) => {
             let specialised = specialize_select(db, sel, outer_cols, outer_row, ctes)?;
-            Ok(value_to_literal(exec_scalar_subquery(db, &specialised, ctes)?))
+            Ok(value_to_literal(exec_scalar_subquery(
+                db,
+                &specialised,
+                ctes,
+            )?))
         }
         Expr::Exists(sel) => {
             let specialised = specialize_select(db, sel, outer_cols, outer_row, ctes)?;
@@ -9128,7 +9535,10 @@ fn is_large_object_projection(items: &[SelectItem]) -> bool {
 /// Decode a `bytea` text representation into raw bytes. Accepts PostgreSQL hex
 /// format (`\x48656c6c6f`); any other text is taken as its raw UTF-8 bytes.
 fn bytea_to_bytes(text: &str) -> Result<Vec<u8>, String> {
-    if let Some(hex) = text.strip_prefix("\\x").or_else(|| text.strip_prefix("\\X")) {
+    if let Some(hex) = text
+        .strip_prefix("\\x")
+        .or_else(|| text.strip_prefix("\\X"))
+    {
         let hex: String = hex.chars().filter(|c| !c.is_ascii_whitespace()).collect();
         if !hex.len().is_multiple_of(2) {
             return Err("invalid hexadecimal data: odd number of digits".into());
@@ -9214,7 +9624,10 @@ fn select_large_object_functions(db: &mut Database, sel: &Select) -> Result<Exec
         }
         "lo_get" => {
             let oid = int_arg(0)? as u32;
-            (Value::Text(bytes_to_bytea(db.lo_get(oid)?)), DataType::Bytea)
+            (
+                Value::Text(bytes_to_bytea(db.lo_get(oid)?)),
+                DataType::Bytea,
+            )
         }
         _ => unreachable!(),
     };
@@ -9402,8 +9815,7 @@ fn eval_unnest(args: &[Expr]) -> Result<Vec<Value>, String> {
         return Ok(Vec::new());
     }
     let text = v.to_text().unwrap_or_default();
-    let values =
-        parse_array_text(&text).ok_or_else(|| "unnest() requires an array".to_string())?;
+    let values = parse_array_text(&text).ok_or_else(|| "unnest() requires an array".to_string())?;
     Ok(values
         .into_iter()
         .map(|e| match e {
@@ -9541,7 +9953,15 @@ fn grouped_select(
     // emitted in order; within a set, groups keep first-seen order.
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
     for set in &sets {
-        grouped_set_rows(sel, set, &all_group_exprs, col_names, &fields, rows, &mut keyed)?;
+        grouped_set_rows(
+            sel,
+            set,
+            &all_group_exprs,
+            col_names,
+            &fields,
+            rows,
+            &mut keyed,
+        )?;
     }
 
     // DISTINCT over the grouped output rows.
@@ -9745,10 +10165,7 @@ fn materialize_ctes(
         // A `WITH RECURSIVE` CTE whose body is `base UNION [ALL] <term that
         // references the CTE>` is evaluated to a fixpoint; everything else is a
         // one-shot materialization.
-        if cte.recursive
-            && !cte.select.set_ops.is_empty()
-            && recursive_term_self_references(cte)
-        {
+        if cte.recursive && !cte.select.set_ops.is_empty() && recursive_term_self_references(cte) {
             let relation = materialize_recursive_cte(db, cte, &map)?;
             map.insert(cte.name.clone(), relation);
             continue;
@@ -9830,8 +10247,7 @@ fn materialize_recursive_cte(
     let recursive_select = (*set_ops[0].select).clone();
 
     // Seed: evaluate the base term.
-    let ExecResult::Rows { fields, rows, .. } =
-        exec_select_with_ctes(db, base_select, outer)?
+    let ExecResult::Rows { fields, rows, .. } = exec_select_with_ctes(db, base_select, outer)?
     else {
         return Err(format!("WITH query \"{}\" did not produce rows", cte.name));
     };
@@ -9841,7 +10257,11 @@ fn materialize_recursive_cte(
         .collect();
     apply_cte_column_aliases(cte, &mut fields)?;
 
-    let mut result = if union_all { rows.clone() } else { distinct_rows(rows) };
+    let mut result = if union_all {
+        rows.clone()
+    } else {
+        distinct_rows(rows)
+    };
     let mut working = result.clone();
     let mut iterations = 0;
 
@@ -9890,7 +10310,10 @@ fn materialize_recursive_cte(
         }
     }
 
-    Ok(CteRelation { fields, rows: result })
+    Ok(CteRelation {
+        fields,
+        rows: result,
+    })
 }
 
 fn exec_update(db: &mut Database, mut upd: Update) -> Result<ExecResult, String> {
@@ -10166,11 +10589,7 @@ fn build_merge_source(
                 .collect();
             Ok((names, rows))
         }
-        MergeSource::Values {
-            rows,
-            columns,
-            ..
-        } => {
+        MergeSource::Values { rows, columns, .. } => {
             let width = rows.first().map(|r| r.len()).unwrap_or(0);
             let names: Vec<String> = (0..width)
                 .map(|i| {
@@ -10337,9 +10756,10 @@ fn exec_merge(db: &mut Database, mut merge: Merge) -> Result<ExecResult, String>
                                 Some(names) => names
                                     .iter()
                                     .map(|n| {
-                                        columns.iter().position(|c| &c.name == n).expect(
-                                            "INSERT column existence validated above",
-                                        )
+                                        columns
+                                            .iter()
+                                            .position(|c| &c.name == n)
+                                            .expect("INSERT column existence validated above")
                                     })
                                     .collect(),
                                 None => (0..columns.len()).collect(),
@@ -11227,7 +11647,7 @@ fn parse_jsonpath(path: &str) -> Result<Vec<JsonPathStep>, String> {
                 return Err(format!(
                     "unsupported jsonpath token '{}' in: {path}",
                     other as char
-                ))
+                ));
             }
         }
     }
@@ -11702,9 +12122,9 @@ fn json_contains(outer: &JsonValue, inner: &JsonValue) -> bool {
                 .find(|(ok, _)| ok == k)
                 .is_some_and(|(_, ov)| json_contains(ov, iv))
         }),
-        (JsonValue::Array(o), JsonValue::Array(i)) => i
-            .iter()
-            .all(|ie| o.iter().any(|oe| json_contains(oe, ie))),
+        (JsonValue::Array(o), JsonValue::Array(i)) => {
+            i.iter().all(|ie| o.iter().any(|oe| json_contains(oe, ie)))
+        }
         // A top-level array contains a scalar if that scalar is an element.
         (JsonValue::Array(o), scalar) => o.iter().any(|oe| json_equal(oe, scalar)),
         (a, b) => json_equal(a, b),
@@ -11933,9 +12353,21 @@ fn add_time_component(iv: &mut Interval, tok: &str) -> Result<(), String> {
         None => (false, tok),
     };
     let mut parts = tok.split(':');
-    let h: f64 = parts.next().unwrap_or("0").parse().map_err(|_| "invalid interval time".to_string())?;
-    let m: f64 = parts.next().unwrap_or("0").parse().map_err(|_| "invalid interval time".to_string())?;
-    let s: f64 = parts.next().unwrap_or("0").parse().map_err(|_| "invalid interval time".to_string())?;
+    let h: f64 = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "invalid interval time".to_string())?;
+    let m: f64 = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "invalid interval time".to_string())?;
+    let s: f64 = parts
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "invalid interval time".to_string())?;
     let secs = h * 3600.0 + m * 60.0 + s;
     iv.seconds += if neg { -secs } else { secs };
     Ok(())
@@ -11966,13 +12398,23 @@ fn format_interval(iv: &Interval) -> String {
     let years = iv.months / 12;
     let mons = iv.months % 12;
     if years != 0 {
-        parts.push(format!("{years} year{}", if years.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{years} year{}",
+            if years.abs() == 1 { "" } else { "s" }
+        ));
     }
     if mons != 0 {
-        parts.push(format!("{mons} mon{}", if mons.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{mons} mon{}",
+            if mons.abs() == 1 { "" } else { "s" }
+        ));
     }
     if iv.days != 0 {
-        parts.push(format!("{} day{}", iv.days, if iv.days.abs() == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} day{}",
+            iv.days,
+            if iv.days.abs() == 1 { "" } else { "s" }
+        ));
     }
     if iv.seconds != 0.0 || parts.is_empty() {
         let neg = iv.seconds < 0.0;
@@ -12517,8 +12959,7 @@ fn eval_scalar_function(
             let values = parse_array_text(&text)
                 .ok_or_else(|| "array_remove() requires an array".to_string())?;
             let target = elem.to_text();
-            let kept: Vec<Option<String>> =
-                values.into_iter().filter(|v| *v != target).collect();
+            let kept: Vec<Option<String>> = values.into_iter().filter(|v| *v != target).collect();
             Ok(Value::Text(array_text_from_elements(&kept)))
         }
         "__subscript" => {
@@ -12531,9 +12972,10 @@ fn eval_scalar_function(
             }
             let i = match idx {
                 Value::Int(i) => *i,
-                other => other.to_text().and_then(|t| t.parse::<i64>().ok()).ok_or_else(
-                    || "array subscript must be an integer".to_string(),
-                )?,
+                other => other
+                    .to_text()
+                    .and_then(|t| t.parse::<i64>().ok())
+                    .ok_or_else(|| "array subscript must be an integer".to_string())?,
             };
             let text = array.to_text().unwrap_or_default();
             // A non-array scalar (e.g. pg_dump's `typname[0]` on a `name`
@@ -12578,10 +13020,7 @@ fn eval_scalar_function(
         // Multirange constructors: accept and store as text `{range, ...}`.
         "int4multirange" | "int8multirange" | "nummultirange" | "tsmultirange"
         | "tstzmultirange" | "datemultirange" => {
-            let parts: Vec<String> = vals
-                .iter()
-                .filter_map(|v| v.to_text())
-                .collect();
+            let parts: Vec<String> = vals.iter().filter_map(|v| v.to_text()).collect();
             Ok(Value::Text(format!("{{{}}}", parts.join(", "))))
         }
         // Geometric constructor `point(x, y)` -> text `(x,y)`.
@@ -12609,7 +13048,11 @@ fn eval_scalar_function(
             let matches = jsonpath_query(source, &path)?;
             // `jsonb_path_query` is set-returning in PostgreSQL; in scalar
             // context we return the first match (or NULL if none).
-            Ok(matches.into_iter().next().map(Value::Text).unwrap_or(Value::Null))
+            Ok(matches
+                .into_iter()
+                .next()
+                .map(Value::Text)
+                .unwrap_or(Value::Null))
         }
         "jsonb_path_exists" | "json_path_exists" => {
             let source = arg(&vals, 0)?;
@@ -12926,10 +13369,7 @@ fn eval_scalar_function(
                 chars.into_iter().take(take as usize).collect()
             } else {
                 let take = if n < 0 { (len + n).max(0) } else { n.min(len) };
-                chars
-                    .into_iter()
-                    .skip((len - take) as usize)
-                    .collect()
+                chars.into_iter().skip((len - take) as usize).collect()
             };
             Ok(Value::Text(result))
         }
@@ -13249,7 +13689,10 @@ fn eval_scalar_function(
             Some(result) => result,
             None => match try_eval_plpgsql_udf(other, &vals) {
                 Some(result) => result,
-                None => Err(format!("function {other}() does not exist")),
+                None => match try_eval_native_udf(other, &vals) {
+                    Some(result) => result,
+                    None => Err(format!("function {other}() does not exist")),
+                },
             },
         },
     }
@@ -13421,12 +13864,7 @@ fn collect_window_fns(expr: &Expr, out: &mut Vec<Expr>) {
 
 /// Replace each window-function node in `expr` with the precomputed literal for
 /// row `row_idx`, leaving everything else intact.
-fn substitute_window_fns(
-    expr: &Expr,
-    wfns: &[Expr],
-    wvals: &[Vec<Value>],
-    row_idx: usize,
-) -> Expr {
+fn substitute_window_fns(expr: &Expr, wfns: &[Expr], wvals: &[Vec<Value>], row_idx: usize) -> Expr {
     if let Expr::Function { over: Some(_), .. } = expr {
         if let Some(k) = wfns.iter().position(|w| w == expr) {
             return value_to_literal(wvals[k][row_idx].clone());
@@ -13628,15 +14066,7 @@ fn compute_window_values(
                         .iter()
                         .map(|&idx| rows[idx].clone())
                         .collect();
-                    eval_aggregate(
-                        &lname,
-                        args,
-                        *star,
-                        *distinct,
-                        None,
-                        col_names,
-                        &frame_rows,
-                    )?
+                    eval_aggregate(&lname, args, *star, *distinct, None, col_names, &frame_rows)?
                 }
                 other => return Err(format!("window function {other}() is not supported")),
             };
@@ -13776,7 +14206,10 @@ fn eval_aggregate(
     // Ordered-set aggregates: `f([fraction]) WITHIN GROUP (ORDER BY expr)`.
     // Desugared so the ordered expression is the last argument; for
     // percentile_* the direct fraction argument is `args[0]`.
-    if matches!(lname.as_str(), "percentile_cont" | "percentile_disc" | "mode") {
+    if matches!(
+        lname.as_str(),
+        "percentile_cont" | "percentile_disc" | "mode"
+    ) {
         let ordered_expr = args
             .last()
             .ok_or_else(|| format!("{lname}() requires a WITHIN GROUP (ORDER BY ...) clause"))?;
@@ -13822,9 +14255,7 @@ fn eval_aggregate(
             to_f64(&eval_expr(&args[0], col_names, row)?)?
         };
         if !(0.0..=1.0).contains(&frac) {
-            return Err(format!(
-                "percentile value {frac} is not between 0 and 1"
-            ));
+            return Err(format!("percentile value {frac} is not between 0 and 1"));
         }
         if vals.is_empty() {
             return Ok(Value::Null);
@@ -13988,9 +14419,7 @@ fn eval_aggregate(
             }
             if distinct {
                 let mut seen = std::collections::HashSet::new();
-                elems.retain(|v| {
-                    seen.insert(v.clone().unwrap_or_else(|| "\0NULL".to_string()))
-                });
+                elems.retain(|v| seen.insert(v.clone().unwrap_or_else(|| "\0NULL".to_string())));
             }
             Ok(Value::Text(array_text_from_elements(&elems)))
         }
@@ -14091,9 +14520,9 @@ fn coerce(v: Value, target: DataType) -> Result<Value, String> {
             // e.g. `0.1::float8::numeric` reads as `0.1`.
             Value::Float(f) => {
                 let text = Value::Float(f).to_text().unwrap_or_default();
-                BigDecimal::parse(&text).map(Value::Numeric).ok_or_else(|| {
-                    format!("invalid input syntax for type numeric: \"{text}\"")
-                })
+                BigDecimal::parse(&text)
+                    .map(Value::Numeric)
+                    .ok_or_else(|| format!("invalid input syntax for type numeric: \"{text}\""))
             }
             Value::Text(s) => BigDecimal::parse(s.trim())
                 .map(Value::Numeric)

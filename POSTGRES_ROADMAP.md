@@ -240,7 +240,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `bigint`
 - [x] `real`
 - [x] `double precision`
-- [x] `numeric` / `decimal` as f64-backed values
+- [x] `numeric` / `decimal` as exact arbitrary-precision values
 - [x] `boolean`
 - [x] `text`
 - [x] `varchar`
@@ -458,6 +458,31 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Extension catalog metadata
 - [x] Extension SQL install scripts
 - [ ] C extension ABI
+  - [x] Native scalar UDF ABI via `CREATE FUNCTION ... LANGUAGE c`
+  - [x] Dynamic shared-library loading with `dlopen`/`dlsym`
+  - [x] Loader validation for `PG_MODULE_MAGIC` and `PG_FUNCTION_INFO_V1`
+  - [x] Optional `_PG_init` module hook execution on first library load
+  - [x] PostgreSQL-style `PG_FUNCTION_ARGS`/`Datum` scalar call ABI subset
+  - [x] `FmgrInfo` call metadata for C functions (`flinfo`, `fn_oid`, `fn_nargs`, `fn_extra`)
+  - [x] `STRICT` / `RETURNS NULL ON NULL INPUT` behavior and `fn_strict` metadata
+  - [x] Per-call native allocation callbacks for `palloc`/`palloc0`/`repalloc`/`pfree`
+  - [x] Minimal `MemoryContext` allocation API for `fn_mcxt` cached state
+  - [x] `CurrentMemoryContext` / `MemoryContextSwitchTo` for cached extension allocations
+  - [x] PostgreSQL-style extension helper header (`PG_MODULE_MAGIC`, function metadata, `palloc`, text helpers)
+  - [x] `elog(ERROR, ...)` / `ereport(ERROR, (errmsg(...)))` propagation from C functions
+  - [x] `GetConfigOptionByName` GUC reads from C functions
+  - [x] Custom-GUC registration shims (`DefineCustom*Variable`) for `_PG_init` defaults
+  - [x] Minimal type syscache support (`SearchSysCache1`/`SearchSysCache2` for `TYPEOID`/`TYPENAMENSP`, `Form_pg_type`)
+  - [x] Minimal current-function syscache support (`SearchSysCache1(PROCOID)`, `Form_pg_proc`)
+  - [x] Common type/function catalog helper shims (`get_typlenbyvalalign`, `format_type_be`, `get_func_*`)
+  - [x] SPI `SELECT` support for C functions, including table-backed reads
+  - [x] SPI command execution for C functions (`INSERT`/`UPDATE`/`DELETE`) with PostgreSQL-style result codes
+  - [x] Minimal prepared SPI plan shims (`SPI_prepare`, `SPI_execute_plan`)
+  - [x] Extension control files and versioned install/update scripts
+  - [x] Extension-owned function dependency tracking in `pg_depend`
+  - [x] Dropping extensions removes owned C/SQL functions
+  - [ ] Full PostgreSQL server extension ABI compatibility (fmgr metadata, memory contexts, full SPI)
+  - [ ] Full cascade/restrict dependency enforcement for non-extension dependents
 - [x] `plpgsql` (usable subset)
 - [ ] Other procedural languages
 - [x] Triggers (FOR EACH ROW; no NEW/OLD binding)
@@ -520,3 +545,4 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Crash-recovery fault injection
 - [x] Concurrency stress tests
 - [x] Benchmark suite for planner/storage changes
+- [x] Workspace-wide private crate tests through default `cargo test`

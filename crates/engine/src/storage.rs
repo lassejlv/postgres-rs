@@ -550,7 +550,10 @@ impl Table {
     /// `reltuples` to surface in `pg_class`: the analyzed estimate when present,
     /// otherwise the current live row count.
     pub fn reltuples(&self) -> usize {
-        self.stats.as_ref().map(|s| s.reltuples).unwrap_or(self.rows.len())
+        self.stats
+            .as_ref()
+            .map(|s| s.reltuples)
+            .unwrap_or(self.rows.len())
     }
 
     /// `relpages` to surface in `pg_class`: the analyzed estimate when present,
@@ -694,11 +697,7 @@ impl Table {
             self.next_toast_id += 1;
             let full = std::mem::take(s);
             self.toast.insert(id, full);
-            *cell = Value::Text(format!(
-                "{}{id}{}",
-                Self::TOAST_PREFIX,
-                Self::TOAST_SUFFIX
-            ));
+            *cell = Value::Text(format!("{}{id}{}", Self::TOAST_PREFIX, Self::TOAST_SUFFIX));
         }
     }
 
@@ -897,8 +896,7 @@ impl Table {
     pub fn index_on(&self, column: usize) -> Option<&Index> {
         let mut chosen: Option<&Index> = None;
         for idx in &self.indexes {
-            let range_capable =
-                idx.method.is_ordered() || idx.method == IndexMethod::Brin;
+            let range_capable = idx.method.is_ordered() || idx.method == IndexMethod::Brin;
             if idx.columns == [column]
                 && idx.expr.is_none()
                 && idx.predicate.is_none()
@@ -1390,21 +1388,73 @@ fn same_unique_key(left: &[Value], right: &[Value], columns: &[usize]) -> bool {
 /// are intentionally absent here. The list is the union of the standard GUCs the
 /// roadmap calls out plus the timeout knobs.
 pub const GUC_DEFAULTS: &[(&str, &str, &str)] = &[
-    ("server_encoding", "UTF8", "Sets the server (database) character set encoding."),
-    ("client_encoding", "UTF8", "Sets the client's character set encoding."),
-    ("standard_conforming_strings", "on", "Causes '...' strings to treat backslashes literally."),
-    ("DateStyle", "ISO, MDY", "Sets the display format for date and time values."),
-    ("TimeZone", "UTC", "Sets the time zone for displaying and interpreting time stamps."),
-    ("IntervalStyle", "postgres", "Sets the display format for interval values."),
+    (
+        "server_encoding",
+        "UTF8",
+        "Sets the server (database) character set encoding.",
+    ),
+    (
+        "client_encoding",
+        "UTF8",
+        "Sets the client's character set encoding.",
+    ),
+    (
+        "standard_conforming_strings",
+        "on",
+        "Causes '...' strings to treat backslashes literally.",
+    ),
+    (
+        "DateStyle",
+        "ISO, MDY",
+        "Sets the display format for date and time values.",
+    ),
+    (
+        "TimeZone",
+        "UTC",
+        "Sets the time zone for displaying and interpreting time stamps.",
+    ),
+    (
+        "IntervalStyle",
+        "postgres",
+        "Sets the display format for interval values.",
+    ),
     ("integer_datetimes", "on", "Datetimes are integer based."),
-    ("transaction_isolation", "read committed", "Sets the current transaction's isolation level."),
-    ("transaction_read_only", "off", "Sets the current transaction's read-only status."),
-    ("application_name", "", "Sets the application name to be reported in statistics and logs."),
-    ("statement_timeout", "0", "Sets the maximum allowed duration of any statement (ms; 0 disables)."),
-    ("idle_in_transaction_session_timeout", "0", "Sets the maximum allowed idle time between queries, when in a transaction (ms; 0 disables)."),
-    ("lock_timeout", "0", "Sets the maximum allowed duration of any wait for a lock (ms; 0 disables)."),
+    (
+        "transaction_isolation",
+        "read committed",
+        "Sets the current transaction's isolation level.",
+    ),
+    (
+        "transaction_read_only",
+        "off",
+        "Sets the current transaction's read-only status.",
+    ),
+    (
+        "application_name",
+        "",
+        "Sets the application name to be reported in statistics and logs.",
+    ),
+    (
+        "statement_timeout",
+        "0",
+        "Sets the maximum allowed duration of any statement (ms; 0 disables).",
+    ),
+    (
+        "idle_in_transaction_session_timeout",
+        "0",
+        "Sets the maximum allowed idle time between queries, when in a transaction (ms; 0 disables).",
+    ),
+    (
+        "lock_timeout",
+        "0",
+        "Sets the maximum allowed duration of any wait for a lock (ms; 0 disables).",
+    ),
     ("bytea_output", "hex", "Sets the output format for bytea."),
-    ("extra_float_digits", "1", "Sets the number of digits displayed for floating-point values."),
+    (
+        "extra_float_digits",
+        "1",
+        "Sets the number of digits displayed for floating-point values.",
+    ),
 ];
 
 /// Default value for a built-in GUC, keyed by lowercased name. Returns `None`
@@ -1446,6 +1496,7 @@ pub struct Database {
     /// Domains (`CREATE DOMAIN`), keyed by lowercased name.
     domains: HashMap<String, Domain>,
     extensions: HashMap<String, Extension>,
+    extension_function_deps: HashMap<String, HashSet<FunctionSignature>>,
     roles: HashMap<String, Role>,
     comments: HashMap<CommentObject, String>,
     security_labels: HashMap<(String, CommentObject), String>,
@@ -1532,6 +1583,7 @@ impl Default for Database {
             user_types: HashMap::new(),
             domains: HashMap::new(),
             extensions,
+            extension_function_deps: HashMap::new(),
             roles,
             comments: HashMap::new(),
             security_labels: HashMap::new(),
@@ -1553,8 +1605,7 @@ impl Default for Database {
     }
 }
 
-/// A stored user-defined function. Only `LANGUAGE sql` bodies are interpreted;
-/// other languages are accepted and catalogued but not callable.
+/// A stored user-defined function.
 #[derive(Debug, Clone)]
 pub struct SqlFunction {
     pub name: String,
@@ -1567,9 +1618,29 @@ pub struct SqlFunction {
     pub return_type: Option<DataType>,
     pub return_type_name: Option<String>,
     pub body: String,
+    /// Optional external link symbol from `AS 'library', 'symbol'`, used by
+    /// `LANGUAGE c` functions.
+    pub link_symbol: Option<String>,
     pub language: String,
     /// `SECURITY DEFINER` flag (`prosecdef`); false = SECURITY INVOKER (default).
     pub security_definer: bool,
+    /// `STRICT` / `RETURNS NULL ON NULL INPUT` flag (`proisstrict`).
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FunctionSignature {
+    pub name: String,
+    pub arg_type_names: Vec<String>,
+}
+
+impl SqlFunction {
+    pub fn signature(&self) -> FunctionSignature {
+        FunctionSignature {
+            name: self.name.clone(),
+            arg_type_names: self.arg_type_names.clone(),
+        }
+    }
 }
 
 /// A stored trigger.
@@ -1921,7 +1992,8 @@ impl Database {
     pub fn record_commit(&mut self, write_set: &HashSet<String>) -> u64 {
         self.commit_version += 1;
         for table in write_set {
-            self.table_versions.insert(table.clone(), self.commit_version);
+            self.table_versions
+                .insert(table.clone(), self.commit_version);
         }
         self.commit_version
     }
@@ -2497,19 +2569,25 @@ impl Database {
 
     /// All functions, flattened and sorted by name (for catalog introspection).
     pub fn all_functions(&self) -> Vec<SqlFunction> {
-        let mut out: Vec<SqlFunction> =
-            self.functions.values().flat_map(|v| v.iter().cloned()).collect();
+        let mut out: Vec<SqlFunction> = self
+            .functions
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
+    pub fn function_signatures(&self) -> HashSet<FunctionSignature> {
+        self.functions
+            .values()
+            .flat_map(|v| v.iter().map(SqlFunction::signature))
+            .collect()
+    }
+
     /// Register a function. With `or_replace`, an existing overload with the
     /// same argument-type signature is replaced; otherwise it errors.
-    pub fn create_function(
-        &mut self,
-        func: SqlFunction,
-        or_replace: bool,
-    ) -> Result<(), String> {
+    pub fn create_function(&mut self, func: SqlFunction, or_replace: bool) -> Result<(), String> {
         let key = func.name.to_ascii_lowercase();
         let overloads = self.functions.entry(key).or_default();
         if let Some(slot) = overloads
@@ -2566,6 +2644,17 @@ impl Database {
         }
         if overloads.is_empty() {
             self.functions.remove(&key);
+        }
+        let sig = arg_types.map(|types| FunctionSignature {
+            name: name.to_string(),
+            arg_type_names: types.to_vec(),
+        });
+        for deps in self.extension_function_deps.values_mut() {
+            if let Some(sig) = &sig {
+                deps.remove(sig);
+            } else {
+                deps.retain(|dep| !dep.name.eq_ignore_ascii_case(name));
+            }
         }
         Ok(true)
     }
@@ -2644,12 +2733,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn drop_rule(
-        &mut self,
-        name: &str,
-        table: &str,
-        if_exists: bool,
-    ) -> Result<bool, String> {
+    pub fn drop_rule(&mut self, name: &str, table: &str, if_exists: bool) -> Result<bool, String> {
         let key = name.to_ascii_lowercase();
         match self.rules.get(&key) {
             Some(r) if r.table.eq_ignore_ascii_case(table) => {
@@ -2657,7 +2741,9 @@ impl Database {
                 Ok(true)
             }
             _ if if_exists => Ok(false),
-            _ => Err(format!("rule \"{name}\" for relation \"{table}\" does not exist")),
+            _ => Err(format!(
+                "rule \"{name}\" for relation \"{table}\" does not exist"
+            )),
         }
     }
 
@@ -2745,6 +2831,56 @@ impl Database {
         extensions
     }
 
+    pub fn extension_version(&self, name: &str) -> Option<String> {
+        self.extensions.get(name).map(|ext| ext.version.clone())
+    }
+
+    pub fn set_extension_version(&mut self, name: &str, version: String) -> Result<(), String> {
+        let ext = self
+            .extensions
+            .get_mut(name)
+            .ok_or_else(|| format!("extension \"{name}\" does not exist"))?;
+        ext.version = version;
+        Ok(())
+    }
+
+    pub fn register_extension_functions<I>(&mut self, extension: &str, funcs: I)
+    where
+        I: IntoIterator<Item = FunctionSignature>,
+    {
+        let deps = self
+            .extension_function_deps
+            .entry(extension.to_string())
+            .or_default();
+        deps.extend(funcs);
+    }
+
+    pub fn extension_functions(&self, extension: &str) -> Vec<FunctionSignature> {
+        let mut funcs: Vec<FunctionSignature> = self
+            .extension_function_deps
+            .get(extension)
+            .map(|deps| deps.iter().cloned().collect())
+            .unwrap_or_default();
+        funcs.sort();
+        funcs
+    }
+
+    pub fn all_extension_function_dependencies(&self) -> Vec<(String, FunctionSignature)> {
+        let mut deps: Vec<(String, FunctionSignature)> = self
+            .extension_function_deps
+            .iter()
+            .flat_map(|(extension, funcs)| {
+                funcs
+                    .iter()
+                    .cloned()
+                    .map(|func| (extension.clone(), func))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        deps.sort();
+        deps
+    }
+
     pub fn roles(&self) -> Vec<Role> {
         let mut roles: Vec<Role> = self.roles.values().cloned().collect();
         roles.sort_by(|a, b| a.oid.cmp(&b.oid));
@@ -2781,14 +2917,20 @@ impl Database {
 
     /// Grant table privileges to a grantee. Returns silently; acceptance only.
     pub fn grant_table_privilege(&mut self, table: &str, grantee: &str, privilege: &str) {
-        self.table_privileges
-            .insert((table.to_string(), grantee.to_string(), privilege.to_string()));
+        self.table_privileges.insert((
+            table.to_string(),
+            grantee.to_string(),
+            privilege.to_string(),
+        ));
     }
 
     /// Revoke a table privilege from a grantee.
     pub fn revoke_table_privilege(&mut self, table: &str, grantee: &str, privilege: &str) {
-        self.table_privileges
-            .remove(&(table.to_string(), grantee.to_string(), privilege.to_string()));
+        self.table_privileges.remove(&(
+            table.to_string(),
+            grantee.to_string(),
+            privilege.to_string(),
+        ));
     }
 
     /// Record that `member` is a member of `group` (role membership).
@@ -2865,6 +3007,7 @@ impl Database {
 
     pub fn drop_extension(&mut self, name: &str, if_exists: bool) -> Result<bool, String> {
         if self.extensions.remove(name).is_some() {
+            self.extension_function_deps.remove(name);
             return Ok(true);
         }
         if if_exists {
@@ -3127,7 +3270,8 @@ impl Database {
             })
             .collect();
         for (col, mut v) in moved {
-            self.sequences.remove(&Self::serial_sequence_name(from, &col));
+            self.sequences
+                .remove(&Self::serial_sequence_name(from, &col));
             v.name = Self::serial_sequence_name(to, &col);
             self.sequences.insert(v.name.clone(), v);
         }
