@@ -12,12 +12,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim AS runtime
 
-RUN useradd --system --uid 10001 --create-home --home-dir /home/pgrs pgrs && \
-    mkdir -p /data && chown pgrs:pgrs /data
+# Runs as root: Railway mounts its persistent volume at /data owned by root,
+# and an unprivileged user can't write to it.
+RUN mkdir -p /data
 
 COPY --from=builder /usr/local/bin/postgres-rs /usr/local/bin/postgres-rs
-
-USER pgrs
 
 ENV PGRS_DATA=/data
 VOLUME ["/data"]
