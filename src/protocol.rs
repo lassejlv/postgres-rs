@@ -45,12 +45,24 @@ pub fn read_startup<R: Read>(r: &mut R) -> io::Result<Startup> {
     }
     let mut body = vec![0u8; (len - 4) as usize];
     r.read_exact(&mut body)?;
+    if body.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "startup packet too short",
+        ));
+    }
     let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
 
     match code {
         SSL_REQUEST_CODE => Ok(Startup::SslRequest),
         GSS_ENC_REQUEST_CODE => Ok(Startup::GssEncRequest),
         CANCEL_REQUEST_CODE => {
+            if body.len() < 12 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cancel request too short",
+                ));
+            }
             let pid = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
             let secret = i32::from_be_bytes([body[8], body[9], body[10], body[11]]);
             Ok(Startup::CancelRequest { pid, secret })
@@ -155,17 +167,19 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Option<FrontendMessage>> {
         b'B' => parse_bind(&body)?,
         b'D' => {
             let kind = *body.first().unwrap_or(&b'S');
-            let (name, _) = read_cstr_slice(&body[1..])?;
+            let rest = body.get(1..).unwrap_or(&[]);
+            let (name, _) = read_cstr_slice(rest)?;
             FrontendMessage::Describe { kind, name }
         }
         b'E' => {
             let (portal, rest) = read_cstr_slice(&body)?;
-            let max_rows = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let max_rows = read_be_i32(rest)?;
             FrontendMessage::Execute { portal, max_rows }
         }
         b'C' => {
             let kind = *body.first().unwrap_or(&b'S');
-            let (name, _) = read_cstr_slice(&body[1..])?;
+            let rest = body.get(1..).unwrap_or(&[]);
+            let (name, _) = read_cstr_slice(rest)?;
             FrontendMessage::Close { kind, name }
         }
         b'S' => FrontendMessage::Sync,
@@ -184,13 +198,11 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Option<FrontendMessage>> {
 
 fn parse_parse(body: &[u8]) -> io::Result<FrontendMessage> {
     let (name, rest) = read_cstr_slice(body)?;
-    let (query, rest) = read_cstr_slice(rest)?;
-    let n = i16::from_be_bytes([rest[0], rest[1]]) as usize;
+    let (query, mut cur) = read_cstr_slice(rest)?;
+    let n = take_count(&mut cur)?;
     let mut param_types = Vec::with_capacity(n);
-    let mut cur = &rest[2..];
     for _ in 0..n {
-        param_types.push(i32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]));
-        cur = &cur[4..];
+        param_types.push(take_i32(&mut cur)?);
     }
     Ok(FrontendMessage::Parse {
         name,
@@ -201,38 +213,30 @@ fn parse_parse(body: &[u8]) -> io::Result<FrontendMessage> {
 
 fn parse_bind(body: &[u8]) -> io::Result<FrontendMessage> {
     let (portal, rest) = read_cstr_slice(body)?;
-    let (statement, rest) = read_cstr_slice(rest)?;
-    let mut cur = rest;
+    let (statement, mut cur) = read_cstr_slice(rest)?;
 
-    let nf = i16::from_be_bytes([cur[0], cur[1]]) as usize;
-    cur = &cur[2..];
+    let nf = take_count(&mut cur)?;
     let mut param_formats = Vec::with_capacity(nf);
     for _ in 0..nf {
-        param_formats.push(i16::from_be_bytes([cur[0], cur[1]]));
-        cur = &cur[2..];
+        param_formats.push(take_i16(&mut cur)?);
     }
 
-    let np = i16::from_be_bytes([cur[0], cur[1]]) as usize;
-    cur = &cur[2..];
+    let np = take_count(&mut cur)?;
     let mut params = Vec::with_capacity(np);
     for _ in 0..np {
-        let plen = i32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]);
-        cur = &cur[4..];
+        let plen = take_i32(&mut cur)?;
         if plen < 0 {
             params.push(None);
         } else {
             let plen = plen as usize;
-            params.push(Some(cur[..plen].to_vec()));
-            cur = &cur[plen..];
+            params.push(Some(take_bytes(&mut cur, plen)?.to_vec()));
         }
     }
 
-    let nr = i16::from_be_bytes([cur[0], cur[1]]) as usize;
-    cur = &cur[2..];
+    let nr = take_count(&mut cur)?;
     let mut result_formats = Vec::with_capacity(nr);
     for _ in 0..nr {
-        result_formats.push(i16::from_be_bytes([cur[0], cur[1]]));
-        cur = &cur[2..];
+        result_formats.push(take_i16(&mut cur)?);
     }
 
     Ok(FrontendMessage::Bind {
@@ -242,6 +246,55 @@ fn parse_bind(body: &[u8]) -> io::Result<FrontendMessage> {
         param_formats,
         result_formats,
     })
+}
+
+/// Error helper for a message body that ended sooner than the framing implied.
+fn short_message() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "message body truncated")
+}
+
+/// Read a big-endian i16 *count* (must be non-negative) from the front of
+/// `cur`. A negative count is malformed; reject it rather than letting a huge
+/// `as usize` cast overflow an allocation.
+fn take_count(cur: &mut &[u8]) -> io::Result<usize> {
+    let n = take_i16(cur)?;
+    if n < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative field count",
+        ));
+    }
+    Ok(n as usize)
+}
+
+/// Read a big-endian i16 from the front of `cur`, advancing it.
+fn take_i16(cur: &mut &[u8]) -> io::Result<i16> {
+    let b = take_bytes(cur, 2)?;
+    Ok(i16::from_be_bytes([b[0], b[1]]))
+}
+
+/// Read a big-endian i32 from the front of `cur`, advancing it.
+fn take_i32(cur: &mut &[u8]) -> io::Result<i32> {
+    let b = take_bytes(cur, 4)?;
+    Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Split `n` bytes off the front of `cur`, advancing it; errs if too short.
+fn take_bytes<'a>(cur: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
+    if cur.len() < n {
+        return Err(short_message());
+    }
+    let (head, tail) = cur.split_at(n);
+    *cur = tail;
+    Ok(head)
+}
+
+/// Read a big-endian i32 from a fixed slice (must be at least 4 bytes).
+fn read_be_i32(b: &[u8]) -> io::Result<i32> {
+    if b.len() < 4 {
+        return Err(short_message());
+    }
+    Ok(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 // --- backend message builder -------------------------------------------------

@@ -2557,7 +2557,7 @@ fn explain_returns_query_plan_rows() {
     assert_eq!(
         r,
         vec![
-            vec![Value::Text("Seq Scan on t".into())],
+            vec![Value::Text("Seq Scan on t (rows=1)".into())],
             vec![Value::Text("  Filter".into())],
             vec![Value::Text("  Sort".into())],
             vec![Value::Text("  Limit".into())],
@@ -2587,9 +2587,163 @@ fn explain_analyze_executes_and_reports_observed_rows() {
     assert_eq!(
         r,
         vec![
-            vec![Value::Text("Seq Scan on t (actual rows=2)".into())],
+            vec![Value::Text("Seq Scan on t (rows=1) (actual rows=2)".into())],
             vec![Value::Text("  Filter".into())],
             vec![Value::Text("  Sort".into())],
+        ]
+    );
+}
+
+/// Collect an EXPLAIN result's QUERY PLAN column into one newline-joined string.
+fn plan_text(res: ExecResult) -> String {
+    rows(res)
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text plan line, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn analyze_populates_planner_statistics() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id integer, grp integer)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 20)",
+    );
+
+    // Before ANALYZE, pg_class.reltuples falls back to the live row count.
+    let r = rows(run(
+        &mut db,
+        "SELECT reltuples FROM pg_class WHERE relname = 't'",
+    ));
+    assert_eq!(r, vec![vec![Value::Float(5.0)]]);
+
+    run(&mut db, "ANALYZE t");
+
+    // reltuples reflects the analyzed estimate.
+    let r = rows(run(
+        &mut db,
+        "SELECT reltuples FROM pg_class WHERE relname = 't'",
+    ));
+    assert_eq!(r, vec![vec![Value::Float(5.0)]]);
+
+    // The collected ndistinct drives selectivity: grp has 2 distinct values, so
+    // an equality on grp is estimated at 5/2 ≈ 3 rows (rounded, clamped).
+    let p = plan_text(run(&mut db, "EXPLAIN SELECT * FROM t WHERE grp = 10"));
+    assert!(p.contains("(rows=3)"), "plan was:\n{p}");
+}
+
+#[test]
+fn explain_chooses_index_scan_when_selective() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id integer, v integer)");
+    let values: String = (0..100)
+        .map(|i| format!("({i}, {})", i % 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run(&mut db, &format!("INSERT INTO t VALUES {values}"));
+    run(&mut db, "CREATE INDEX t_id_idx ON t (id)");
+    run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
+    run(&mut db, "ANALYZE t");
+
+    // Equality on the unique-ish `id` (ndistinct=100) is highly selective: the
+    // planner should pick the index and estimate ~1 row.
+    let p = plan_text(run(&mut db, "EXPLAIN SELECT * FROM t WHERE id = 42"));
+    assert!(
+        p.contains("Index Scan using t_id_idx") && p.contains("(rows=1)"),
+        "plan was:\n{p}"
+    );
+
+    // Equality on `v` (ndistinct=4) matches ~25 rows; an index still beats a
+    // 100-row seq scan, so an index scan is chosen with a ~25-row estimate.
+    let p = plan_text(run(&mut db, "EXPLAIN SELECT * FROM t WHERE v = 1"));
+    assert!(p.contains("Index Scan using t_v_idx"), "plan was:\n{p}");
+    assert!(p.contains("(rows=25)"), "plan was:\n{p}");
+
+    // No predicate → a plain seq scan over all rows.
+    let p = plan_text(run(&mut db, "EXPLAIN SELECT * FROM t"));
+    assert!(p.contains("Seq Scan on t (rows=100)"), "plan was:\n{p}");
+}
+
+#[test]
+fn explain_three_table_join_drives_from_smallest() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE big (id integer, m integer)");
+    run(&mut db, "CREATE TABLE mid (id integer, b integer)");
+    run(&mut db, "CREATE TABLE small (id integer)");
+    // big: 50 rows, mid: 10 rows, small: 2 rows.
+    let big: String = (0..50)
+        .map(|i| format!("({i}, {})", i % 10))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run(&mut db, &format!("INSERT INTO big VALUES {big}"));
+    let mid: String = (0..10)
+        .map(|i| format!("({i}, {i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run(&mut db, &format!("INSERT INTO mid VALUES {mid}"));
+    run(&mut db, "INSERT INTO small VALUES (0), (1)");
+    run(&mut db, "ANALYZE");
+
+    // Written big -> mid -> small, but the planner should drive from `small`.
+    let p = plan_text(run(
+        &mut db,
+        "EXPLAIN SELECT * FROM big \
+         JOIN mid ON big.m = mid.id \
+         JOIN small ON mid.b = small.id",
+    ));
+    let lines: Vec<&str> = p.lines().collect();
+    // First scan node (the drive relation) must be `small`.
+    let first_scan = lines
+        .iter()
+        .find(|l| l.contains("-> "))
+        .expect("a scan node");
+    assert!(
+        first_scan.contains("on small"),
+        "expected smallest table to drive, plan was:\n{p}"
+    );
+}
+
+#[test]
+fn join_reordering_preserves_results() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE a (id integer, b_id integer)");
+    run(&mut db, "CREATE TABLE b (id integer, c_id integer)");
+    run(&mut db, "CREATE TABLE c (id integer, label text)");
+    run(
+        &mut db,
+        "INSERT INTO a VALUES (1, 10), (2, 10), (3, 20), (4, 30)",
+    );
+    run(&mut db, "INSERT INTO b VALUES (10, 100), (20, 200), (30, 300)");
+    run(
+        &mut db,
+        "INSERT INTO c VALUES (100, 'x'), (200, 'y'), (300, 'z')",
+    );
+
+    let query = "SELECT a.id, c.label FROM a \
+         JOIN b ON a.b_id = b.id \
+         JOIN c ON b.c_id = c.id \
+         ORDER BY a.id";
+
+    // Result without statistics (no reordering applied).
+    let before = rows(run(&mut db, query));
+
+    // Same query after ANALYZE populates stats and enables reordering.
+    run(&mut db, "ANALYZE");
+    let after = rows(run(&mut db, query));
+
+    assert_eq!(before, after);
+    assert_eq!(
+        after,
+        vec![
+            vec![Value::Int(1), Value::Text("x".into())],
+            vec![Value::Int(2), Value::Text("x".into())],
+            vec![Value::Int(3), Value::Text("y".into())],
+            vec![Value::Int(4), Value::Text("z".into())],
         ]
     );
 }
@@ -4996,4 +5150,1328 @@ fn interval_literal_parses_and_normalizes() {
 
     let r = rows(run(&mut db, "SELECT INTERVAL '1-2' YEAR TO MONTH"));
     assert_eq!(r, vec![vec![Value::Text("1 year 2 mons".into())]]);
+}
+
+// --- table inheritance -------------------------------------------------------
+
+#[test]
+fn inheritance_parent_scan_includes_children() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE animal (id integer, name text)");
+    run(
+        &mut db,
+        "CREATE TABLE dog (breed text) INHERITS (animal)",
+    );
+    // The child gets the parent's columns prepended to its own.
+    run(&mut db, "INSERT INTO animal (id, name) VALUES (1, 'generic')");
+    run(
+        &mut db,
+        "INSERT INTO dog (id, name, breed) VALUES (2, 'rex', 'lab')",
+    );
+
+    // Scanning the parent returns parent rows AND child rows (default).
+    let r = rows(run(&mut db, "SELECT id, name FROM animal ORDER BY id"));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::Text("generic".into())],
+            vec![Value::Int(2), Value::Text("rex".into())],
+        ]
+    );
+
+    // ONLY restricts to the parent's own rows.
+    let r = rows(run(&mut db, "SELECT id, name FROM ONLY animal ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(1), Value::Text("generic".into())]]);
+
+    // The child has the parent's columns (prepended) plus its own.
+    let r = rows(run(
+        &mut db,
+        "SELECT id, name, breed FROM dog ORDER BY id",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Int(2),
+            Value::Text("rex".into()),
+            Value::Text("lab".into())
+        ]]
+    );
+}
+
+#[test]
+fn inheritance_multi_level_and_pg_inherits() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE base (a integer)");
+    run(&mut db, "CREATE TABLE mid (b integer) INHERITS (base)");
+    run(&mut db, "CREATE TABLE leaf (c integer) INHERITS (mid)");
+    run(&mut db, "INSERT INTO base (a) VALUES (1)");
+    run(&mut db, "INSERT INTO mid (a, b) VALUES (2, 20)");
+    run(&mut db, "INSERT INTO leaf (a, b, c) VALUES (3, 30, 300)");
+
+    // Scanning the root unions grandchildren too.
+    let r = rows(run(&mut db, "SELECT a FROM base ORDER BY a"));
+    assert_eq!(
+        r,
+        vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]
+    );
+
+    // pg_inherits has one row per direct child→parent link.
+    let r = rows(run(
+        &mut db,
+        "SELECT inhseqno FROM pg_inherits ORDER BY inhseqno",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(1)]]);
+}
+
+// --- partitioned tables ------------------------------------------------------
+
+#[test]
+fn range_partition_routing_and_scan() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE measurement (id integer, val integer) PARTITION BY RANGE (val)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE measurement_low PARTITION OF measurement FOR VALUES FROM (0) TO (100)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE measurement_high PARTITION OF measurement FOR VALUES FROM (100) TO (200)",
+    );
+
+    run(&mut db, "INSERT INTO measurement (id, val) VALUES (1, 10), (2, 150)");
+
+    // Each row routed to the right partition.
+    let r = rows(run(
+        &mut db,
+        "SELECT id, val FROM measurement_low ORDER BY id",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1), Value::Int(10)]]);
+    let r = rows(run(
+        &mut db,
+        "SELECT id, val FROM measurement_high ORDER BY id",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(2), Value::Int(150)]]);
+
+    // Parent scan unions all partitions.
+    let r = rows(run(&mut db, "SELECT id, val FROM measurement ORDER BY id"));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(150)],
+        ]
+    );
+
+    // A value matching no partition errors.
+    let err = Parser::parse_sql("INSERT INTO measurement (id, val) VALUES (3, 999)")
+        .and_then(|mut s| executor::execute(&mut db, s.remove(0)).map(|_| ()))
+        .expect_err("out-of-range insert should fail");
+    assert_eq!(
+        err,
+        "no partition of relation \"measurement\" found for row"
+    );
+}
+
+#[test]
+fn list_partition_routing() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE sales (id integer, region text) PARTITION BY LIST (region)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE sales_eu PARTITION OF sales FOR VALUES IN ('de', 'fr')",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE sales_us PARTITION OF sales FOR VALUES IN ('us')",
+    );
+    run(
+        &mut db,
+        "INSERT INTO sales (id, region) VALUES (1, 'de'), (2, 'us'), (3, 'fr')",
+    );
+
+    let r = rows(run(&mut db, "SELECT id FROM sales_eu ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+    let r = rows(run(&mut db, "SELECT id FROM sales_us ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(2)]]);
+    let r = rows(run(&mut db, "SELECT id FROM sales ORDER BY id"));
+    assert_eq!(
+        r,
+        vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)]]
+    );
+
+    let err = Parser::parse_sql("INSERT INTO sales (id, region) VALUES (4, 'jp')")
+        .and_then(|mut s| executor::execute(&mut db, s.remove(0)).map(|_| ()))
+        .expect_err("unlisted value should fail");
+    assert_eq!(err, "no partition of relation \"sales\" found for row");
+}
+
+#[test]
+fn hash_partition_routing() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE h (id integer) PARTITION BY HASH (id)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO h (id) VALUES (1), (2), (3), (4), (5)",
+    );
+
+    // Every row must land in exactly one of the two partitions; together they
+    // reconstruct the full set, and the parent scan equals their union.
+    let mut total = rows(run(&mut db, "SELECT id FROM h0 ORDER BY id"));
+    total.extend(rows(run(&mut db, "SELECT id FROM h1 ORDER BY id")));
+    total.sort_by_key(|r| match &r[0] {
+        Value::Int(i) => *i,
+        _ => 0,
+    });
+    assert_eq!(
+        total,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+            vec![Value::Int(5)],
+        ]
+    );
+
+    let parent = rows(run(&mut db, "SELECT id FROM h ORDER BY id"));
+    assert_eq!(parent, total);
+}
+
+#[test]
+fn plain_table_unaffected_by_partitioning_changes() {
+    // A table with no parents / partitions scans exactly as before.
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE plain (id integer)");
+    run(&mut db, "INSERT INTO plain VALUES (1), (2)");
+    let r = rows(run(&mut db, "SELECT id FROM plain ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    // ONLY on a plain table is a no-op.
+    let r = rows(run(&mut db, "SELECT id FROM ONLY plain ORDER BY id"));
+    assert_eq!(r, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+// --- extended DDL: accept + catalog/store (parse → tag → round-trip) ---------
+
+use postgres_rs::sql::serialize::statement_to_sql;
+
+/// Parse one statement and assert it serializes and re-parses to itself.
+fn round_trip_one(sql: &str) {
+    let stmt = Parser::parse_sql(sql)
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    let serialized = statement_to_sql(&stmt);
+    let reparsed = Parser::parse_sql(&serialized)
+        .expect("reparse serialized")
+        .into_iter()
+        .next()
+        .expect("one statement");
+    assert_eq!(stmt, reparsed, "round-trip mismatch for: {sql}\n -> {serialized}");
+}
+
+fn cmd_tag(res: ExecResult) -> String {
+    match res {
+        ExecResult::Command(t) => t,
+        other => panic!("expected command, got {}", tag_of(&other)),
+    }
+}
+
+#[test]
+fn copy_file_and_binary_forms_round_trip() {
+    // STDIN/STDOUT forms (unchanged behavior).
+    round_trip_one("COPY t FROM STDIN");
+    round_trip_one("COPY t (a, b) TO STDOUT WITH (FORMAT csv, HEADER)");
+    // File paths.
+    round_trip_one("COPY t FROM '/tmp/in.csv' WITH (FORMAT csv)");
+    round_trip_one("COPY t (a, b) TO '/var/data/out.dat'");
+    // Binary format, for STDIN/STDOUT and files.
+    round_trip_one("COPY t FROM STDIN WITH (FORMAT binary)");
+    round_trip_one("COPY t TO '/tmp/out.bin' WITH (FORMAT binary)");
+    // COPY of a query to a file.
+    round_trip_one("COPY (SELECT id, name FROM t WHERE id > 1) TO '/tmp/q.csv' WITH (FORMAT csv)");
+}
+
+#[test]
+fn inheritance_and_partition_clauses_round_trip() {
+    round_trip_one("CREATE TABLE dog (breed text) INHERITS (animal)");
+    round_trip_one("CREATE TABLE m (id integer, val integer) PARTITION BY RANGE (val)");
+    round_trip_one("CREATE TABLE l (id integer, region text) PARTITION BY LIST (region)");
+    round_trip_one("CREATE TABLE h (id integer) PARTITION BY HASH (id)");
+    round_trip_one("CREATE TABLE m_lo PARTITION OF m FOR VALUES FROM (0) TO (100)");
+    round_trip_one("CREATE TABLE l_eu PARTITION OF l FOR VALUES IN ('de', 'fr')");
+    round_trip_one("CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0)");
+}
+
+#[test]
+fn exclusion_constraint_in_create_table_and_alter() {
+    let mut db = Database::new();
+    let tag = cmd_tag(run(
+        &mut db,
+        "CREATE TABLE rooms (id int, during int4range, EXCLUDE USING gist (during WITH &&))",
+    ));
+    assert_eq!(tag, "CREATE TABLE");
+    let tag = cmd_tag(run(
+        &mut db,
+        "ALTER TABLE rooms ADD CONSTRAINT no_overlap EXCLUDE USING gist (during WITH &&)",
+    ));
+    assert_eq!(tag, "ALTER TABLE");
+    // Dropping the named exclusion constraint succeeds.
+    let tag = cmd_tag(run(&mut db, "ALTER TABLE rooms DROP CONSTRAINT no_overlap"));
+    assert_eq!(tag, "ALTER TABLE");
+    round_trip_one("CREATE TABLE r2 (id int, c int4range, EXCLUDE USING gist (c WITH &&))");
+    round_trip_one("ALTER TABLE r2 ADD CONSTRAINT x EXCLUDE USING gist (c WITH &&)");
+}
+
+#[test]
+fn deferrable_constraints_and_set_constraints() {
+    let mut db = Database::new();
+    let tag = cmd_tag(run(
+        &mut db,
+        "CREATE TABLE p (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)",
+    ));
+    assert_eq!(tag, "CREATE TABLE");
+    let tag = cmd_tag(run(
+        &mut db,
+        "CREATE TABLE c (id int, pid int, \
+         CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+    ));
+    assert_eq!(tag, "CREATE TABLE");
+    let tag = cmd_tag(run(&mut db, "SET CONSTRAINTS ALL DEFERRED"));
+    assert_eq!(tag, "SET CONSTRAINTS");
+    let tag = cmd_tag(run(&mut db, "SET CONSTRAINTS fk IMMEDIATE"));
+    assert_eq!(tag, "SET CONSTRAINTS");
+    round_trip_one(
+        "CREATE TABLE c2 (id int, pid int, \
+         CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+    );
+}
+
+#[test]
+fn operator_classes_families_and_operators() {
+    let mut db = Database::new();
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE OPERATOR CLASS my_ops DEFAULT FOR TYPE int4 USING btree AS OPERATOR 1 <",
+        )),
+        "CREATE OPERATOR CLASS"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "CREATE OPERATOR FAMILY my_fam USING btree")),
+        "CREATE OPERATOR FAMILY"
+    );
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE OPERATOR === (LEFTARG = int4, RIGHTARG = int4, FUNCTION = int4eq)",
+        )),
+        "CREATE OPERATOR"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP OPERATOR === (int4, int4)")),
+        "DROP OPERATOR"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP OPERATOR CLASS my_ops USING btree")),
+        "DROP OPERATOR CLASS"
+    );
+    round_trip_one("CREATE OPERATOR FAMILY my_fam USING btree");
+    round_trip_one("CREATE OPERATOR === (LEFTARG = int4, RIGHTARG = int4, FUNCTION = int4eq)");
+}
+
+#[test]
+fn event_triggers() {
+    let mut db = Database::new();
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION snitch()",
+        )),
+        "CREATE EVENT TRIGGER"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP EVENT TRIGGER et")),
+        "DROP EVENT TRIGGER"
+    );
+    round_trip_one("CREATE EVENT TRIGGER et ON ddl_command_start EXECUTE FUNCTION snitch()");
+}
+
+#[test]
+fn foreign_data_wrappers_servers_mappings_and_tables() {
+    let mut db = Database::new();
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE FOREIGN DATA WRAPPER w HANDLER h OPTIONS (a 'b')",
+        )),
+        "CREATE FOREIGN DATA WRAPPER"
+    );
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (host 'localhost')",
+        )),
+        "CREATE SERVER"
+    );
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE USER MAPPING FOR postgres SERVER s OPTIONS (user 'a')",
+        )),
+        "CREATE USER MAPPING"
+    );
+    // A foreign table is stored like a regular table so it appears in catalogs.
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE FOREIGN TABLE ft (id int, name text) SERVER s OPTIONS (tab 'x')",
+        )),
+        "CREATE TABLE"
+    );
+    let r = run(&mut db, "INSERT INTO ft (id, name) VALUES (1, 'a')");
+    assert!(matches!(r, ExecResult::Command(ref t) if t == "INSERT 0 1"));
+    assert_eq!(cmd_tag(run(&mut db, "DROP FOREIGN TABLE ft")), "DROP TABLE");
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP USER MAPPING FOR postgres SERVER s")),
+        "DROP USER MAPPING"
+    );
+    assert_eq!(cmd_tag(run(&mut db, "DROP SERVER s")), "DROP SERVER");
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP FOREIGN DATA WRAPPER w")),
+        "DROP FOREIGN DATA WRAPPER"
+    );
+    round_trip_one("CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (host 'localhost')");
+}
+
+#[test]
+fn publications_and_subscriptions() {
+    let mut db = Database::new();
+    assert_eq!(
+        cmd_tag(run(&mut db, "CREATE PUBLICATION p FOR ALL TABLES")),
+        "CREATE PUBLICATION"
+    );
+    assert_eq!(
+        cmd_tag(run(
+            &mut db,
+            "CREATE SUBSCRIPTION sub CONNECTION 'host=x dbname=d' PUBLICATION p",
+        )),
+        "CREATE SUBSCRIPTION"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP SUBSCRIPTION sub")),
+        "DROP SUBSCRIPTION"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "DROP PUBLICATION IF EXISTS p")),
+        "DROP PUBLICATION"
+    );
+    round_trip_one("CREATE PUBLICATION p FOR ALL TABLES");
+    round_trip_one("CREATE SUBSCRIPTION sub CONNECTION 'host=x dbname=d' PUBLICATION p");
+}
+
+#[test]
+fn replication_slot_functions() {
+    let mut db = Database::new();
+    let r = rows(run(
+        &mut db,
+        "SELECT pg_create_physical_replication_slot('slot1')",
+    ));
+    assert_eq!(r, vec![vec![Value::Text("slot1".into())]]);
+    let r = rows(run(&mut db, "SELECT pg_drop_replication_slot('slot1')"));
+    assert_eq!(r, vec![vec![Value::Null]]);
+}
+
+#[test]
+fn two_phase_commit_statements_execute() {
+    // Executed directly (autocommit / replay path), 2PC commands acknowledge.
+    let mut db = Database::new();
+    assert_eq!(
+        cmd_tag(run(&mut db, "PREPARE TRANSACTION 'gid1'")),
+        "PREPARE TRANSACTION"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "COMMIT PREPARED 'gid1'")),
+        "COMMIT PREPARED"
+    );
+    assert_eq!(
+        cmd_tag(run(&mut db, "ROLLBACK PREPARED 'gid1'")),
+        "ROLLBACK PREPARED"
+    );
+    round_trip_one("PREPARE TRANSACTION 'gid1'");
+    round_trip_one("COMMIT PREPARED 'gid1'");
+    round_trip_one("ROLLBACK PREPARED 'gid1'");
+}
+
+/// information_schema.columns exposes the full ORM/JDBC column metadata set.
+#[test]
+fn information_schema_columns_full_metadata() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE books (\
+            id serial PRIMARY KEY, \
+            title text NOT NULL DEFAULT 'untitled', \
+            pages integer, \
+            isbn text)",
+    );
+    let r = rows(run(
+        &mut db,
+        "SELECT column_name, ordinal_position, column_default, is_nullable, \
+                data_type, udt_name, numeric_precision \
+         FROM information_schema.columns \
+         WHERE table_name = 'books' ORDER BY ordinal_position",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("id".into()),
+                Value::Int(1),
+                Value::Null,
+                Value::Text("NO".into()),
+                Value::Text("integer".into()),
+                Value::Text("int4".into()),
+                Value::Int(32),
+            ],
+            vec![
+                Value::Text("title".into()),
+                Value::Int(2),
+                Value::Text("'untitled'".into()),
+                Value::Text("NO".into()),
+                Value::Text("text".into()),
+                Value::Text("text".into()),
+                Value::Null,
+            ],
+            vec![
+                Value::Text("pages".into()),
+                Value::Int(3),
+                Value::Null,
+                Value::Text("YES".into()),
+                Value::Text("integer".into()),
+                Value::Text("int4".into()),
+                Value::Int(32),
+            ],
+            vec![
+                Value::Text("isbn".into()),
+                Value::Int(4),
+                Value::Null,
+                Value::Text("YES".into()),
+                Value::Text("text".into()),
+                Value::Text("text".into()),
+                Value::Null,
+            ],
+        ]
+    );
+}
+
+/// table_constraints / key_column_usage / referential_constraints /
+/// constraint_column_usage cover the PK, UNIQUE and FK introspection ORMs run.
+#[test]
+fn information_schema_constraint_views() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE authors (id serial PRIMARY KEY, name text NOT NULL)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE books (\
+            id serial PRIMARY KEY, \
+            isbn text, \
+            author_id integer, \
+            CONSTRAINT books_author_id_fkey FOREIGN KEY (author_id) REFERENCES authors(id))",
+    );
+    run(
+        &mut db,
+        "CREATE UNIQUE INDEX books_isbn_idx ON books (isbn)",
+    );
+
+    let r = rows(run(
+        &mut db,
+        "SELECT constraint_name, constraint_type \
+         FROM information_schema.table_constraints \
+         WHERE table_name = 'books' ORDER BY constraint_name",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("books_author_id_fkey".into()),
+                Value::Text("FOREIGN KEY".into()),
+            ],
+            vec![
+                Value::Text("books_id_pkey".into()),
+                Value::Text("PRIMARY KEY".into()),
+            ],
+            vec![
+                Value::Text("books_isbn_idx".into()),
+                Value::Text("UNIQUE".into()),
+            ],
+        ]
+    );
+
+    let r = rows(run(
+        &mut db,
+        "SELECT constraint_name, column_name, ordinal_position \
+         FROM information_schema.key_column_usage \
+         WHERE table_name = 'books' ORDER BY constraint_name",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("books_author_id_fkey".into()),
+                Value::Text("author_id".into()),
+                Value::Int(1),
+            ],
+            vec![
+                Value::Text("books_id_pkey".into()),
+                Value::Text("id".into()),
+                Value::Int(1),
+            ],
+            vec![
+                Value::Text("books_isbn_idx".into()),
+                Value::Text("isbn".into()),
+                Value::Int(1),
+            ],
+        ]
+    );
+
+    let r = rows(run(
+        &mut db,
+        "SELECT constraint_name, unique_constraint_name, update_rule, delete_rule \
+         FROM information_schema.referential_constraints",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("books_author_id_fkey".into()),
+            Value::Text("authors_id_pkey".into()),
+            Value::Text("NO ACTION".into()),
+            Value::Text("NO ACTION".into()),
+        ]]
+    );
+
+    // The FK's constraint_column_usage points at the *referenced* parent column.
+    let r = rows(run(
+        &mut db,
+        "SELECT table_name, column_name \
+         FROM information_schema.constraint_column_usage \
+         WHERE constraint_name = 'books_author_id_fkey'",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![Value::Text("authors".into()), Value::Text("id".into())]]
+    );
+}
+
+/// schemata, views and sequences views report live catalog objects.
+#[test]
+fn information_schema_schemata_views_sequences() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id integer)");
+    run(&mut db, "CREATE VIEW v AS SELECT id FROM t");
+    run(&mut db, "CREATE SEQUENCE s START 5 INCREMENT 2");
+
+    let r = rows(run(
+        &mut db,
+        "SELECT schema_name FROM information_schema.schemata \
+         WHERE schema_name = 'public'",
+    ));
+    assert_eq!(r, vec![vec![Value::Text("public".into())]]);
+
+    let r = rows(run(
+        &mut db,
+        "SELECT table_name FROM information_schema.views",
+    ));
+    assert_eq!(r, vec![vec![Value::Text("v".into())]]);
+
+    let r = rows(run(
+        &mut db,
+        "SELECT sequence_name, data_type, start_value, increment \
+         FROM information_schema.sequences",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("s".into()),
+            Value::Text("bigint".into()),
+            Value::Text("5".into()),
+            Value::Text("2".into()),
+        ]]
+    );
+}
+
+/// The pg_attribute column list psql `\d <table>` issues (with format_type)
+/// returns each column's resolved type name and nullability.
+#[test]
+fn pg_attribute_column_list_with_format_type() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE widget (id integer NOT NULL, label text, qty bigint)",
+    );
+    let r = rows(run(
+        &mut db,
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
+         FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         WHERE c.relname = 'widget' AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("id".into()),
+                Value::Text("integer".into()),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::Text("label".into()),
+                Value::Text("text".into()),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Text("qty".into()),
+                Value::Text("bigint".into()),
+                Value::Bool(false),
+            ],
+        ]
+    );
+}
+
+/// Exercises the catalog queries `psql`'s `\d <table>` issues end to end: the
+/// pg_class metadata probe (resolving `'name'::regclass`), the pg_attribute
+/// column list with `format_type`, the index/constraint section with
+/// `pg_get_indexdef`/`pg_get_constraintdef`, and the foreign-key footer. This
+/// regression-protects `\d` support without needing a live `psql`.
+#[test]
+fn describe_table_catalog_queries() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE owners (id integer PRIMARY KEY)");
+    run(
+        &mut db,
+        "CREATE TABLE t ( \
+            id integer PRIMARY KEY, \
+            name text NOT NULL DEFAULT 'x', \
+            email text, \
+            owner integer, \
+            CONSTRAINT t_email_key UNIQUE (email), \
+            CONSTRAINT fk_owner FOREIGN KEY (owner) REFERENCES owners(id), \
+            CONSTRAINT t_name_chk CHECK (length(name) > 0) \
+        )",
+    );
+
+    // pg_class metadata probe, resolving the relation OID via `::regclass`.
+    let r = rows(run(
+        &mut db,
+        "SELECT relkind, relhasindex, relchecks, relhastriggers, relpersistence \
+         FROM pg_catalog.pg_class WHERE oid = 't'::pg_catalog.regclass",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("r".into()),
+            Value::Bool(true),
+            Value::Int(1),
+            // FK constraints surface as triggers so psql probes the FK footer.
+            Value::Bool(true),
+            Value::Text("p".into()),
+        ]]
+    );
+
+    // pg_attribute column list with format_type + atthasdef + attnotnull.
+    let r = rows(run(
+        &mut db,
+        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                a.attnotnull, a.atthasdef \
+         FROM pg_catalog.pg_attribute a \
+         WHERE a.attrelid = 't'::pg_catalog.regclass \
+           AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("id".into()),
+                Value::Text("integer".into()),
+                Value::Bool(true),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Text("name".into()),
+                Value::Text("text".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::Text("email".into()),
+                Value::Text("text".into()),
+                Value::Bool(false),
+                Value::Bool(false),
+            ],
+            vec![
+                Value::Text("owner".into()),
+                Value::Text("integer".into()),
+                Value::Bool(false),
+                Value::Bool(false),
+            ],
+        ]
+    );
+
+    // Index/constraint section: primary key + unique index, with rendered defs.
+    let r = rows(run(
+        &mut db,
+        "SELECT c2.relname, i.indisprimary, i.indisunique, \
+                pg_catalog.pg_get_indexdef(i.indexrelid, 0, true), \
+                pg_catalog.pg_get_constraintdef(con.oid, true), con.contype \
+         FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i \
+         LEFT JOIN pg_catalog.pg_constraint con \
+           ON (con.conrelid = i.indrelid AND con.conindid = i.indexrelid \
+               AND con.contype IN ('p','u','x')) \
+         WHERE c.oid = 't'::pg_catalog.regclass AND c.oid = i.indrelid \
+           AND i.indexrelid = c2.oid \
+         ORDER BY i.indisprimary DESC, c2.relname",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![
+                Value::Text("t_id_pkey".into()),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Text("CREATE UNIQUE INDEX t_id_pkey ON public.t USING btree (id)".into()),
+                Value::Text("PRIMARY KEY (id)".into()),
+                Value::Text("p".into()),
+            ],
+            vec![
+                Value::Text("t_email_key".into()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Text(
+                    "CREATE UNIQUE INDEX t_email_key ON public.t USING btree (email)".into(),
+                ),
+                Value::Text("UNIQUE (email)".into()),
+                Value::Text("u".into()),
+            ],
+        ]
+    );
+
+    // Check-constraint footer.
+    let r = rows(run(
+        &mut db,
+        "SELECT r.conname, pg_catalog.pg_get_constraintdef(r.oid, true) \
+         FROM pg_catalog.pg_constraint r \
+         WHERE r.conrelid = 't'::pg_catalog.regclass AND r.contype = 'c' ORDER BY 1",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("t_name_chk".into()),
+            Value::Text("CHECK ((length(name) > 0))".into()),
+        ]]
+    );
+
+    // Foreign-key footer, including `conrelid::regclass` rendering the table
+    // name back from the OID.
+    let r = rows(run(
+        &mut db,
+        "SELECT conname, conrelid::pg_catalog.regclass, \
+                pg_catalog.pg_get_constraintdef(r.oid, true) \
+         FROM pg_catalog.pg_constraint r \
+         WHERE r.conrelid = 't'::pg_catalog.regclass AND r.contype = 'f' \
+           AND conparentid = 0 ORDER BY conname",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("fk_owner".into()),
+            Value::Text("t".into()),
+            Value::Text("FOREIGN KEY (owner) REFERENCES owners(id)".into()),
+        ]]
+    );
+
+    // "Referenced by" footer for the target table (owners): confrelid points
+    // back to owners' OID.
+    let r = rows(run(
+        &mut db,
+        "SELECT conname, conrelid::pg_catalog.regclass \
+         FROM pg_catalog.pg_constraint \
+         WHERE confrelid = 'owners'::pg_catalog.regclass AND contype = 'f' ORDER BY conname",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("fk_owner".into()),
+            Value::Text("t".into()),
+        ]]
+    );
+}
+
+// --- runtime configuration parameters (GUCs) ---------------------------------
+
+/// Extract the single text value of a one-row, one-column result.
+fn scalar_text(res: ExecResult) -> String {
+    let r = rows(res);
+    assert_eq!(r.len(), 1, "expected exactly one row");
+    match &r[0][0] {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_and_show_custom_guc_round_trips() {
+    let mut db = Database::new();
+    run(&mut db, "SET myapp.feature = 'enabled'");
+    assert_eq!(scalar_text(run(&mut db, "SHOW myapp.feature")), "enabled");
+
+    // SET ... TO ... and re-reading the new value.
+    run(&mut db, "SET myapp.feature TO 'disabled'");
+    assert_eq!(scalar_text(run(&mut db, "SHOW myapp.feature")), "disabled");
+}
+
+#[test]
+fn show_standard_guc_defaults() {
+    let mut db = Database::new();
+    assert_eq!(scalar_text(run(&mut db, "SHOW client_encoding")), "UTF8");
+    assert_eq!(scalar_text(run(&mut db, "SHOW statement_timeout")), "0");
+    assert_eq!(scalar_text(run(&mut db, "SHOW TimeZone")), "UTC");
+    // search_path keeps its dedicated default.
+    assert_eq!(
+        scalar_text(run(&mut db, "SHOW search_path")),
+        "$user, public"
+    );
+}
+
+#[test]
+fn show_unknown_guc_errors() {
+    let mut db = Database::new();
+    let stmts = Parser::parse_sql("SHOW does_not_exist").unwrap();
+    let err = executor::execute(&mut db, stmts.into_iter().next().unwrap());
+    assert!(err.is_err());
+}
+
+#[test]
+fn current_setting_and_set_config_round_trip() {
+    let mut db = Database::new();
+    // set_config writes the parameter and returns the value.
+    assert_eq!(
+        scalar_text(run(&mut db, "SELECT set_config('myapp.x', 'v1', false)")),
+        "v1"
+    );
+    // current_setting reads it back (must be a separate statement so the write
+    // has been flushed to the database).
+    assert_eq!(
+        scalar_text(run(&mut db, "SELECT current_setting('myapp.x')")),
+        "v1"
+    );
+    // SHOW sees the same value.
+    assert_eq!(scalar_text(run(&mut db, "SHOW myapp.x")), "v1");
+
+    // current_setting of a known default.
+    assert_eq!(
+        scalar_text(run(&mut db, "SELECT current_setting('client_encoding')")),
+        "UTF8"
+    );
+}
+
+#[test]
+fn current_setting_missing_ok() {
+    let mut db = Database::new();
+    // Without missing_ok an unknown parameter errors.
+    let stmts = Parser::parse_sql("SELECT current_setting('nope.nope')").unwrap();
+    assert!(executor::execute(&mut db, stmts.into_iter().next().unwrap()).is_err());
+    // With missing_ok = true it returns NULL.
+    let r = rows(run(&mut db, "SELECT current_setting('nope.nope', true)"));
+    assert_eq!(r, vec![vec![Value::Null]]);
+}
+
+#[test]
+fn reset_restores_default() {
+    let mut db = Database::new();
+    run(&mut db, "SET statement_timeout = '5000'");
+    assert_eq!(scalar_text(run(&mut db, "SHOW statement_timeout")), "5000");
+    run(&mut db, "RESET statement_timeout");
+    assert_eq!(scalar_text(run(&mut db, "SHOW statement_timeout")), "0");
+
+    // SET ... TO DEFAULT is equivalent to RESET.
+    run(&mut db, "SET statement_timeout = '7000'");
+    run(&mut db, "SET statement_timeout TO DEFAULT");
+    assert_eq!(scalar_text(run(&mut db, "SHOW statement_timeout")), "0");
+
+    // Custom GUC: RESET removes it (it has no built-in default, so SHOW errors).
+    run(&mut db, "SET myapp.k = 'v'");
+    run(&mut db, "RESET myapp.k");
+    let stmts = Parser::parse_sql("SHOW myapp.k").unwrap();
+    assert!(executor::execute(&mut db, stmts.into_iter().next().unwrap()).is_err());
+}
+
+#[test]
+fn reset_all_clears_settings_and_search_path() {
+    let mut db = Database::new();
+    run(&mut db, "SET search_path = myschema, public");
+    run(&mut db, "SET myapp.k = 'v'");
+    run(&mut db, "RESET ALL");
+    assert_eq!(
+        scalar_text(run(&mut db, "SHOW search_path")),
+        "$user, public"
+    );
+    let stmts = Parser::parse_sql("SHOW myapp.k").unwrap();
+    assert!(executor::execute(&mut db, stmts.into_iter().next().unwrap()).is_err());
+}
+
+#[test]
+fn show_all_returns_setting_rows() {
+    let mut db = Database::new();
+    run(&mut db, "SET myapp.custom = 'hello'");
+    let r = rows(run(&mut db, "SHOW ALL"));
+    // Three columns: name, setting, description.
+    assert!(r.iter().all(|row| row.len() == 3));
+    // The custom setting appears with its value.
+    let custom = r
+        .iter()
+        .find(|row| row[0] == Value::Text("myapp.custom".into()))
+        .expect("custom setting present in SHOW ALL");
+    assert_eq!(custom[1], Value::Text("hello".into()));
+    // A standard GUC is present too.
+    assert!(r
+        .iter()
+        .any(|row| row[0] == Value::Text("client_encoding".into())));
+}
+
+#[test]
+fn pg_settings_reflects_custom_and_timeout_gucs() {
+    let mut db = Database::new();
+    run(&mut db, "SET myapp.flag = 'on'");
+    run(&mut db, "SET statement_timeout = '1234'");
+    let r = rows(run(
+        &mut db,
+        "SELECT name, setting FROM pg_catalog.pg_settings \
+         WHERE name IN ('myapp.flag', 'statement_timeout') ORDER BY name",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Text("myapp.flag".into()), Value::Text("on".into())],
+            vec![
+                Value::Text("statement_timeout".into()),
+                Value::Text("1234".into())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn array_column_insert_subscript_length_and_agg() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE t (id integer, vals integer[], tags text[])",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ARRAY[10,20,30], ARRAY['a','b']), \
+         (2, ARRAY[40,50], ARRAY['c'])",
+    );
+
+    // Round-trip the stored array text.
+    let r = rows(run(&mut db, "SELECT vals FROM t WHERE id = 1"));
+    assert_eq!(r, vec![vec![Value::Text("{10,20,30}".into())]]);
+
+    // 1-based element subscript.
+    let r = rows(run(&mut db, "SELECT vals[1], vals[3] FROM t WHERE id = 1"));
+    assert_eq!(
+        r,
+        vec![vec![Value::Text("10".into()), Value::Text("30".into())]]
+    );
+    // Out-of-range subscript yields NULL.
+    let r = rows(run(&mut db, "SELECT vals[9] FROM t WHERE id = 1"));
+    assert_eq!(r, vec![vec![Value::Null]]);
+
+    // array_length / cardinality.
+    let r = rows(run(
+        &mut db,
+        "SELECT array_length(vals, 1), cardinality(tags) FROM t WHERE id = 1",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(3), Value::Int(2)]]);
+
+    // array_agg over a grouped/whole-table aggregate.
+    let r = rows(run(&mut db, "SELECT array_agg(id) FROM t"));
+    assert_eq!(r, vec![vec![Value::Text("{1,2}".into())]]);
+}
+
+#[test]
+fn unnest_in_from_and_select() {
+    let mut db = Database::new();
+    // unnest as a set-returning function in FROM.
+    let r = rows(run(
+        &mut db,
+        "SELECT unnest FROM unnest(ARRAY[100,200,300]) AS x ORDER BY unnest",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Text("100".into())],
+            vec![Value::Text("200".into())],
+            vec![Value::Text("300".into())],
+        ]
+    );
+
+    // unnest in the SELECT list (set-returning projection).
+    let r = rows(run(&mut db, "SELECT unnest(ARRAY['a','b','c'])"));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Text("a".into())],
+            vec![Value::Text("b".into())],
+            vec![Value::Text("c".into())],
+        ]
+    );
+}
+
+#[test]
+fn range_constructors_operators_and_bounds() {
+    let mut db = Database::new();
+
+    // Constructor produces canonical [lo,hi) text.
+    let r = rows(run(&mut db, "SELECT int4range(1, 5)"));
+    assert_eq!(r, vec![vec![Value::Text("[1,5)".into())]]);
+
+    // lower() / upper() on a range.
+    let r = rows(run(&mut db, "SELECT lower(int4range(1, 5)), upper(int4range(1, 5))"));
+    assert_eq!(r, vec![vec![Value::Int(1), Value::Int(5)]]);
+
+    // @> element containment (5 is excluded, 4 included).
+    let r = rows(run(
+        &mut db,
+        "SELECT int4range(1, 5) @> 4, int4range(1, 5) @> 5",
+    ));
+    assert_eq!(r, vec![vec![Value::Bool(true), Value::Bool(false)]]);
+
+    // @> range containment and <@.
+    let r = rows(run(
+        &mut db,
+        "SELECT int4range(1, 10) @> int4range(2, 5), \
+         int4range(2, 5) <@ int4range(1, 10)",
+    ));
+    assert_eq!(r, vec![vec![Value::Bool(true), Value::Bool(true)]]);
+
+    // && overlap.
+    let r = rows(run(
+        &mut db,
+        "SELECT int4range(1, 5) && int4range(4, 9), \
+         int4range(1, 5) && int4range(5, 9)",
+    ));
+    assert_eq!(r, vec![vec![Value::Bool(true), Value::Bool(false)]]);
+}
+
+#[test]
+fn range_column_and_multirange_accept() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE r (id integer, span int4range)");
+    run(&mut db, "INSERT INTO r VALUES (1, int4range(10, 20))");
+    let r = rows(run(&mut db, "SELECT span FROM r WHERE id = 1"));
+    assert_eq!(r, vec![vec![Value::Text("[10,20)".into())]]);
+
+    // Containment against a stored range column.
+    let r = rows(run(
+        &mut db,
+        "SELECT id FROM r WHERE span @> 15",
+    ));
+    assert_eq!(r, vec![vec![Value::Int(1)]]);
+
+    // Multirange constructor accepted and stored as text.
+    let r = rows(run(
+        &mut db,
+        "SELECT int4multirange(int4range(1, 5), int4range(8, 10))",
+    ));
+    assert_eq!(
+        r,
+        vec![vec![Value::Text("{[1,5), [8,10)}".into())]]
+    );
+}
+
+#[test]
+fn geometric_column_round_trip_and_pg_type() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE TABLE g (id integer, p point, b box)",
+    );
+    run(&mut db, "INSERT INTO g VALUES (1, '(1,2)', '(0,0),(3,4)')");
+    let r = rows(run(&mut db, "SELECT p, b FROM g WHERE id = 1"));
+    assert_eq!(
+        r,
+        vec![vec![
+            Value::Text("(1,2)".into()),
+            Value::Text("(0,0),(3,4)".into())
+        ]]
+    );
+
+    // point(x, y) constructor.
+    let r = rows(run(&mut db, "SELECT point(5, 6)"));
+    assert_eq!(r, vec![vec![Value::Text("(5,6)".into())]]);
+
+    // Geometric and range types appear in pg_type.
+    let r = rows(run(
+        &mut db,
+        "SELECT typname FROM pg_catalog.pg_type \
+         WHERE typname IN ('point', 'int4range') ORDER BY typname",
+    ));
+    assert_eq!(
+        r,
+        vec![
+            vec![Value::Text("int4range".into())],
+            vec![Value::Text("point".into())],
+        ]
+    );
+}
+
+// --- ownership / security definer / row-level security ----------------------
+
+/// A scalar Value helper: extract the single cell of a single-row result.
+fn one(res: ExecResult) -> Value {
+    let r = rows(res);
+    assert_eq!(r.len(), 1, "expected exactly one row");
+    assert_eq!(r[0].len(), 1, "expected exactly one column");
+    r[0][0].clone()
+}
+
+#[test]
+fn pg_class_relowner_reflects_owner_and_alter_owner_to() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE owned (id integer)");
+    // Default owner is the 'postgres' superuser, OID 10.
+    let owner = one(run(
+        &mut db,
+        "SELECT relowner FROM pg_class WHERE relname = 'owned'",
+    ));
+    assert_eq!(owner, Value::Int(10));
+
+    // Create a new role and transfer ownership; relowner reflects its OID.
+    run(&mut db, "CREATE ROLE alice");
+    run(&mut db, "ALTER TABLE owned OWNER TO alice");
+    let alice_oid = one(run(
+        &mut db,
+        "SELECT oid FROM pg_roles WHERE rolname = 'alice'",
+    ));
+    let owner = one(run(
+        &mut db,
+        "SELECT relowner FROM pg_class WHERE relname = 'owned'",
+    ));
+    assert_eq!(owner, alice_oid);
+    assert_ne!(owner, Value::Int(10));
+
+    // ALTER TABLE ... OWNER TO a nonexistent role errors.
+    let stmts = Parser::parse_sql("ALTER TABLE owned OWNER TO ghost").expect("parse");
+    let err = executor::execute(&mut db, stmts.into_iter().next().unwrap());
+    assert!(err.is_err());
+}
+
+#[test]
+fn pg_proc_prosecdef_records_security_definer() {
+    let mut db = Database::new();
+    run(
+        &mut db,
+        "CREATE FUNCTION sd() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql SECURITY DEFINER",
+    );
+    run(
+        &mut db,
+        "CREATE FUNCTION si() RETURNS integer AS $$ SELECT 2 $$ LANGUAGE sql SECURITY INVOKER",
+    );
+    let secdef = one(run(
+        &mut db,
+        "SELECT prosecdef FROM pg_proc WHERE proname = 'sd'",
+    ));
+    assert_eq!(secdef, Value::Bool(true));
+    let invoker = one(run(
+        &mut db,
+        "SELECT prosecdef FROM pg_proc WHERE proname = 'si'",
+    ));
+    assert_eq!(invoker, Value::Bool(false));
+}
+
+#[test]
+fn row_level_security_flag_and_pg_policy() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE secured (id integer, tenant text)");
+    // RLS off by default.
+    let rls = one(run(
+        &mut db,
+        "SELECT relrowsecurity FROM pg_class WHERE relname = 'secured'",
+    ));
+    assert_eq!(rls, Value::Bool(false));
+
+    run(&mut db, "ALTER TABLE secured ENABLE ROW LEVEL SECURITY");
+    let rls = one(run(
+        &mut db,
+        "SELECT relrowsecurity FROM pg_class WHERE relname = 'secured'",
+    ));
+    assert_eq!(rls, Value::Bool(true));
+
+    run(&mut db, "ALTER TABLE secured FORCE ROW LEVEL SECURITY");
+    let forced = one(run(
+        &mut db,
+        "SELECT relforcerowsecurity FROM pg_class WHERE relname = 'secured'",
+    ));
+    assert_eq!(forced, Value::Bool(true));
+
+    // CREATE POLICY populates pg_policy.
+    run(
+        &mut db,
+        "CREATE POLICY tenant_isolation ON secured FOR SELECT USING (tenant = 'acme')",
+    );
+    let r = rows(run(
+        &mut db,
+        "SELECT polname, polcmd, polpermissive FROM pg_policy WHERE polname = 'tenant_isolation'",
+    ));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("tenant_isolation".into()));
+    assert_eq!(r[0][1], Value::Text("r".into())); // SELECT
+    assert_eq!(r[0][2], Value::Bool(true)); // permissive
+
+    // ALTER POLICY and DROP POLICY.
+    run(
+        &mut db,
+        "ALTER POLICY tenant_isolation ON secured USING (tenant = 'globex')",
+    );
+    let qual = one(run(
+        &mut db,
+        "SELECT polqual FROM pg_policy WHERE polname = 'tenant_isolation'",
+    ));
+    assert!(matches!(qual, Value::Text(ref s) if s.contains("globex")));
+
+    run(&mut db, "DROP POLICY tenant_isolation ON secured");
+    let r = rows(run(
+        &mut db,
+        "SELECT polname FROM pg_policy WHERE polrelid = (SELECT oid FROM pg_class WHERE relname = 'secured')",
+    ));
+    assert_eq!(r.len(), 0);
+
+    run(&mut db, "ALTER TABLE secured DISABLE ROW LEVEL SECURITY");
+    let rls = one(run(
+        &mut db,
+        "SELECT relrowsecurity FROM pg_class WHERE relname = 'secured'",
+    ));
+    assert_eq!(rls, Value::Bool(false));
 }

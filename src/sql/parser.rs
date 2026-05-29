@@ -115,6 +115,14 @@ impl Parser {
         }
     }
 
+    /// Parse a single-quoted string literal.
+    fn parse_string_literal(&mut self) -> Result<String, String> {
+        match self.advance() {
+            Some(Token::StringLit(s)) => Ok(s),
+            other => Err(format!("expected string literal, found {other:?}")),
+        }
+    }
+
     /// Parse a possibly schema-qualified name, returning the final component.
     /// We don't model schemas yet, so `public.t` collapses to `t`.
     fn parse_object_name(&mut self) -> Result<String, String> {
@@ -167,16 +175,34 @@ impl Parser {
             "refresh" => self.parse_refresh(),
             "begin" | "start" => {
                 self.advance();
-                // `START TRANSACTION` / `BEGIN [TRANSACTION|WORK]` — swallow rest.
+                // `START TRANSACTION` / `BEGIN [TRANSACTION|WORK]` followed by
+                // optional transaction modes (isolation level / read-only).
                 self.eat_keyword("transaction");
                 self.eat_keyword("work");
-                Ok(Statement::Begin)
+                let (isolation, read_only) = self.parse_transaction_modes()?;
+                Ok(Statement::Begin {
+                    isolation,
+                    read_only,
+                })
             }
             "commit" | "end" => {
                 self.advance();
+                // `COMMIT PREPARED 'gid'` is two-phase commit.
+                if self.eat_keyword("prepared") {
+                    let gid = self.parse_string_literal()?;
+                    return Ok(Statement::CommitPrepared { gid });
+                }
                 self.eat_keyword("transaction");
                 self.eat_keyword("work");
                 Ok(Statement::Commit)
+            }
+            "prepare" => {
+                self.advance();
+                // `PREPARE TRANSACTION 'gid'` is two-phase commit. Other
+                // `PREPARE name AS ...` (prepared statements) are unsupported.
+                self.expect_keyword("transaction")?;
+                let gid = self.parse_string_literal()?;
+                Ok(Statement::PrepareTransaction { gid })
             }
             "rollback" | "abort" => {
                 self.advance();
@@ -184,6 +210,9 @@ impl Parser {
                     self.eat_keyword("savepoint");
                     let name = self.parse_ident()?;
                     Ok(Statement::RollbackToSavepoint { name })
+                } else if self.eat_keyword("prepared") {
+                    let gid = self.parse_string_literal()?;
+                    Ok(Statement::RollbackPrepared { gid })
                 } else {
                     self.eat_keyword("transaction");
                     self.eat_keyword("work");
@@ -193,9 +222,22 @@ impl Parser {
             "savepoint" => self.parse_savepoint(),
             "release" => self.parse_release(),
             "set" => self.parse_set(),
+            "reset" => {
+                self.advance();
+                let name = if self.eat_keyword("all") {
+                    None
+                } else {
+                    Some(self.parse_guc_name()?)
+                };
+                Ok(Statement::ResetConfig { name })
+            }
             "show" => {
                 self.advance();
-                let name = self.parse_ident()?;
+                let name = if self.eat_keyword("all") {
+                    "all".to_string()
+                } else {
+                    self.parse_guc_name()?
+                };
                 Ok(Statement::Show { name })
             }
             other => Err(format!("unsupported statement: `{other}`")),
@@ -745,6 +787,9 @@ impl Parser {
         if self.eat_keyword("aggregate") {
             return self.parse_create_aggregate(or_replace);
         }
+        if !or_replace && self.eat_keyword("policy") {
+            return self.parse_create_policy();
+        }
         if or_replace {
             return Err("CREATE OR REPLACE is only supported for VIEW, FUNCTION, RULE, AGGREGATE".into());
         }
@@ -794,6 +839,18 @@ impl Parser {
             }));
         }
         if self.eat_keyword("user") {
+            // `CREATE USER MAPPING FOR role SERVER s [OPTIONS(...)]` is a foreign
+            // catalog object, distinct from `CREATE USER name` (a login role).
+            if self.eat_keyword("mapping") {
+                self.expect_keyword("for")?;
+                let name = self.parse_object_name()?;
+                let definition = self.collect_statement_tail();
+                return Ok(Statement::CreateCatalogObject(CatalogObject {
+                    kind: CatalogObjectKind::UserMapping,
+                    name,
+                    definition,
+                }));
+            }
             let name = self.parse_ident()?;
             let mut options = self.parse_role_options()?;
             options.login = Some(true);
@@ -869,18 +926,6 @@ impl Parser {
                 definition,
             }));
         }
-        if self.eat_keyword("user") && self.eat_keyword("mapping") {
-            // `CREATE USER MAPPING FOR role SERVER s [OPTIONS(...)]`. The name we
-            // store is the role the mapping is for.
-            self.expect_keyword("for")?;
-            let name = self.parse_object_name()?;
-            let definition = self.collect_statement_tail();
-            return Ok(Statement::CreateCatalogObject(CatalogObject {
-                kind: CatalogObjectKind::UserMapping,
-                name,
-                definition,
-            }));
-        }
         if self.eat_keyword("publication") {
             let name = self.parse_object_name()?;
             let definition = self.collect_statement_tail();
@@ -909,19 +954,37 @@ impl Parser {
         self.expect_keyword("table")?;
         let if_not_exists = self.parse_if_not_exists();
         let name = self.parse_object_name()?;
+
+        // `CREATE TABLE p PARTITION OF parent FOR VALUES ...`: a partition has no
+        // column list of its own (it inherits the parent's columns).
+        if self.is_keyword("partition") && self.is_keyword_at(1, "of") {
+            self.advance();
+            self.advance();
+            let parent = self.parse_object_name()?;
+            let bound = self.parse_partition_bound()?;
+            return Ok(Statement::CreateTable(CreateTable {
+                name,
+                columns: Vec::new(),
+                constraints: Vec::new(),
+                if_not_exists,
+                persistence,
+                inherits: Vec::new(),
+                partition_by: None,
+                partition_of: Some(PartitionOf { parent, bound }),
+            }));
+        }
+
         self.expect(&Token::LParen)?;
 
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
         loop {
-            // Model supported standalone constraints; skip the wider set for compatibility.
-            if self.is_keyword("constraint") && self.is_keyword_at(2, "exclude") {
-                self.skip_balanced_until_comma_or_rparen();
-            } else if self.is_keyword("primary")
+            if self.is_keyword("primary")
                 || self.is_keyword("unique")
                 || self.is_keyword("constraint")
                 || self.is_keyword("check")
                 || self.is_keyword("foreign")
+                || self.is_keyword("exclude")
             {
                 constraints.push(self.parse_table_constraint(&name)?);
             } else {
@@ -936,13 +999,105 @@ impl Parser {
         if columns.is_empty() {
             return Err("table must have at least one column".to_string());
         }
+
+        // `INHERITS (parent1, parent2, ...)`.
+        let mut inherits = Vec::new();
+        if self.eat_keyword("inherits") {
+            self.expect(&Token::LParen)?;
+            loop {
+                inherits.push(self.parse_object_name()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+        }
+
+        // `PARTITION BY {RANGE|LIST|HASH} (col)`.
+        let mut partition_by = None;
+        if self.is_keyword("partition") && self.is_keyword_at(1, "by") {
+            self.advance();
+            self.advance();
+            let strategy = if self.eat_keyword("range") {
+                PartitionStrategy::Range
+            } else if self.eat_keyword("list") {
+                PartitionStrategy::List
+            } else if self.eat_keyword("hash") {
+                PartitionStrategy::Hash
+            } else {
+                return Err("expected RANGE, LIST or HASH after PARTITION BY".to_string());
+            };
+            self.expect(&Token::LParen)?;
+            let column = self.parse_ident()?;
+            self.expect(&Token::RParen)?;
+            partition_by = Some(PartitionBy { strategy, column });
+        }
+
         Ok(Statement::CreateTable(CreateTable {
             name,
             columns,
             constraints,
             if_not_exists,
             persistence,
+            inherits,
+            partition_by,
+            partition_of: None,
         }))
+    }
+
+    /// Parse a partition `FOR VALUES ...` bound.
+    fn parse_partition_bound(&mut self) -> Result<PartitionBound, String> {
+        self.expect_keyword("for")?;
+        self.expect_keyword("values")?;
+        if self.eat_keyword("from") {
+            self.expect(&Token::LParen)?;
+            let from = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            self.expect_keyword("to")?;
+            self.expect(&Token::LParen)?;
+            let to = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            Ok(PartitionBound::Range { from, to })
+        } else if self.eat_keyword("in") {
+            self.expect(&Token::LParen)?;
+            let mut list = Vec::new();
+            loop {
+                list.push(self.parse_expr()?);
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+            Ok(PartitionBound::List(list))
+        } else if self.eat_keyword("with") {
+            self.expect(&Token::LParen)?;
+            let mut modulus = 0i64;
+            let mut remainder = 0i64;
+            loop {
+                let key = self.parse_ident()?;
+                let value = match self.parse_expr()? {
+                    Expr::Int(n) => n,
+                    _ => return Err("MODULUS/REMAINDER must be integers".to_string()),
+                };
+                if key.eq_ignore_ascii_case("modulus") {
+                    modulus = value;
+                } else if key.eq_ignore_ascii_case("remainder") {
+                    remainder = value;
+                } else {
+                    return Err(format!("unexpected partition option \"{key}\""));
+                }
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+            Ok(PartitionBound::Hash { modulus, remainder })
+        } else {
+            Err("expected FROM, IN or WITH after FOR VALUES".to_string())
+        }
     }
 
     /// Parse `[UNIQUE] INDEX [IF NOT EXISTS] [name] ON table (column)`.
@@ -959,14 +1114,24 @@ impl Parser {
         };
         self.expect_keyword("on")?;
         let table = self.parse_object_name()?;
-        // An optional `USING <method>`: `hash` builds a hash index, anything
-        // else (e.g. `btree`, `gin`) is treated as a B-tree.
+        // An optional `USING <method>`. Recognised access methods map to their
+        // backing structure; an unknown method is treated as a B-tree.
         let mut method = IndexMethod::Btree;
         if self.eat_keyword("using") {
             let m = self.parse_ident()?;
-            if m.eq_ignore_ascii_case("hash") {
-                method = IndexMethod::Hash;
-            }
+            method = if m.eq_ignore_ascii_case("hash") {
+                IndexMethod::Hash
+            } else if m.eq_ignore_ascii_case("gist") {
+                IndexMethod::Gist
+            } else if m.eq_ignore_ascii_case("spgist") {
+                IndexMethod::SpGist
+            } else if m.eq_ignore_ascii_case("brin") {
+                IndexMethod::Brin
+            } else if m.eq_ignore_ascii_case("gin") {
+                IndexMethod::Gin
+            } else {
+                IndexMethod::Btree
+            };
         }
         // The key list: each key is either a bare column or a parenthesised
         // expression `(expr)`. A doubled paren `((expr))` is just an expression
@@ -1036,13 +1201,21 @@ impl Parser {
                 self.expect_keyword("key")?;
                 primary_key = true;
                 not_null = true;
-            } else if self.eat_keyword("not") {
-                self.expect_keyword("null")?;
+            } else if self.is_keyword("not") && self.is_keyword_at(1, "null") {
+                self.advance();
+                self.advance();
                 not_null = true;
             } else if self.eat_keyword("null") {
                 // explicit nullable
             } else if self.eat_keyword("unique") {
                 // accepted, not yet enforced
+            } else if self.is_keyword("deferrable")
+                || self.is_keyword("initially")
+                || (self.is_keyword("not") && self.is_keyword_at(1, "deferrable"))
+            {
+                // Column-level `[NOT] DEFERRABLE` / `INITIALLY ...` — accepted,
+                // no deferral semantics applied.
+                self.parse_deferrable_tail();
             } else if self.eat_keyword("collate") {
                 let _ = self.parse_qualified_name()?;
             } else if self.eat_keyword("default") {
@@ -1159,6 +1332,30 @@ impl Parser {
                 }
             }
         }
+        // Array type suffix: `integer[]`, `text[][]`, or `integer ARRAY[3]`.
+        // Arrays are text-backed (PostgreSQL `{...}` encoding), so any element
+        // type degrades to a text-backed array recording the declared name so
+        // it round-trips and appears with a `[]`-suffixed type name.
+        let mut is_array = false;
+        if self.is_keyword("array") {
+            self.advance();
+            is_array = true;
+        }
+        while self.eat(&Token::LBracket) {
+            is_array = true;
+            // Optional dimension size, e.g. `[3]`; accepted and ignored.
+            while !self.eat(&Token::RBracket) {
+                if self.advance().is_none() {
+                    return Err("unterminated array dimension".to_string());
+                }
+            }
+        }
+        if is_array {
+            let elem = DataType::from_sql_name(&name)
+                .map(|dt| dt.pg_type_name().to_string())
+                .unwrap_or(name);
+            return Ok((DataType::Text, Some(format!("{elem}[]"))));
+        }
         // Unknown (non-built-in) names default to text but keep the declared
         // name, so a user-defined enum/domain/composite/range column can be
         // resolved and enforced at execution time.
@@ -1226,6 +1423,9 @@ impl Parser {
             };
             return Ok(Statement::AlterDatabase(AlterDatabase { name, action }));
         }
+        if self.eat_keyword("policy") {
+            return self.parse_alter_policy();
+        }
         self.expect_keyword("table")?;
         self.parse_if_exists();
         let table = self.parse_object_name()?;
@@ -1235,6 +1435,8 @@ impl Parser {
                 || self.is_keyword("unique")
                 || self.is_keyword("primary")
                 || self.is_keyword("foreign")
+                || self.is_keyword("check")
+                || self.is_keyword("exclude")
             {
                 AlterAction::AddConstraint {
                     constraint: self.parse_table_constraint(&table)?,
@@ -1274,6 +1476,31 @@ impl Parser {
                 let to = self.parse_ident()?;
                 AlterAction::RenameColumn { from, to }
             }
+        } else if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let owner = self.parse_ident()?;
+            AlterAction::OwnerTo { owner }
+        } else if self.eat_keyword("enable") {
+            self.parse_row_level_security_tail()?;
+            AlterAction::RowSecurity {
+                action: RowSecurityAction::Enable,
+            }
+        } else if self.eat_keyword("disable") {
+            self.parse_row_level_security_tail()?;
+            AlterAction::RowSecurity {
+                action: RowSecurityAction::Disable,
+            }
+        } else if self.eat_keyword("force") {
+            self.parse_row_level_security_tail()?;
+            AlterAction::RowSecurity {
+                action: RowSecurityAction::Force,
+            }
+        } else if self.eat_keyword("no") {
+            self.expect_keyword("force")?;
+            self.parse_row_level_security_tail()?;
+            AlterAction::RowSecurity {
+                action: RowSecurityAction::NoForce,
+            }
         } else {
             return Err(format!(
                 "unsupported ALTER TABLE action near {:?}",
@@ -1283,17 +1510,180 @@ impl Parser {
         Ok(Statement::AlterTable(AlterTable { table, action }))
     }
 
+    /// Consume the `ROW LEVEL SECURITY` keyword tail of an
+    /// `ALTER TABLE ... {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY`.
+    fn parse_row_level_security_tail(&mut self) -> Result<(), String> {
+        self.expect_keyword("row")?;
+        self.expect_keyword("level")?;
+        self.expect_keyword("security")?;
+        Ok(())
+    }
+
+    /// `CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE] [FOR cmd]
+    /// [TO role[,...]] [USING (expr)] [WITH CHECK (expr)]`.
+    fn parse_create_policy(&mut self) -> Result<Statement, String> {
+        let name = self.parse_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.parse_object_name()?;
+
+        let mut permissive = true;
+        if self.eat_keyword("as") {
+            if self.eat_keyword("permissive") {
+                permissive = true;
+            } else if self.eat_keyword("restrictive") {
+                permissive = false;
+            } else {
+                return Err("expected PERMISSIVE or RESTRICTIVE after AS".into());
+            }
+        }
+
+        let mut command = "all".to_string();
+        if self.eat_keyword("for") {
+            command = self.parse_policy_command()?;
+        }
+
+        let mut roles = Vec::new();
+        if self.eat_keyword("to") {
+            roles = self.parse_policy_roles()?;
+        }
+
+        let mut using = None;
+        if self.eat_keyword("using") {
+            self.expect(&Token::LParen)?;
+            using = Some(self.parse_expr()?);
+            self.expect(&Token::RParen)?;
+        }
+
+        let mut with_check = None;
+        if self.eat_keyword("with") {
+            self.expect_keyword("check")?;
+            self.expect(&Token::LParen)?;
+            with_check = Some(self.parse_expr()?);
+            self.expect(&Token::RParen)?;
+        }
+
+        Ok(Statement::CreatePolicy(CreatePolicy {
+            name,
+            table,
+            permissive,
+            command,
+            roles,
+            using,
+            with_check,
+        }))
+    }
+
+    /// `ALTER POLICY name ON table [TO role[,...]] [USING (expr)] [WITH CHECK (expr)]`.
+    fn parse_alter_policy(&mut self) -> Result<Statement, String> {
+        let name = self.parse_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.parse_object_name()?;
+
+        // `ALTER POLICY name ON t RENAME TO new` — accepted minimally.
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let _new = self.parse_ident()?;
+            return Ok(Statement::AlterPolicy(AlterPolicy {
+                name,
+                table,
+                roles: None,
+                using: None,
+                with_check: None,
+            }));
+        }
+
+        let mut roles = None;
+        if self.eat_keyword("to") {
+            roles = Some(self.parse_policy_roles()?);
+        }
+
+        let mut using = None;
+        if self.eat_keyword("using") {
+            self.expect(&Token::LParen)?;
+            using = Some(self.parse_expr()?);
+            self.expect(&Token::RParen)?;
+        }
+
+        let mut with_check = None;
+        if self.eat_keyword("with") {
+            self.expect_keyword("check")?;
+            self.expect(&Token::LParen)?;
+            with_check = Some(self.parse_expr()?);
+            self.expect(&Token::RParen)?;
+        }
+
+        Ok(Statement::AlterPolicy(AlterPolicy {
+            name,
+            table,
+            roles,
+            using,
+            with_check,
+        }))
+    }
+
+    /// `DROP POLICY [IF EXISTS] name ON table`.
+    fn parse_drop_policy(&mut self) -> Result<Statement, String> {
+        let if_exists = self.parse_if_exists();
+        let name = self.parse_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.parse_object_name()?;
+        self.eat_keyword("cascade");
+        self.eat_keyword("restrict");
+        Ok(Statement::DropPolicy(DropPolicy {
+            name,
+            table,
+            if_exists,
+        }))
+    }
+
+    /// The command of a policy `FOR` clause (`ALL`/`SELECT`/`INSERT`/`UPDATE`/`DELETE`).
+    fn parse_policy_command(&mut self) -> Result<String, String> {
+        for kw in ["all", "select", "insert", "update", "delete"] {
+            if self.eat_keyword(kw) {
+                return Ok(kw.to_string());
+            }
+        }
+        Err("expected ALL/SELECT/INSERT/UPDATE/DELETE after FOR".into())
+    }
+
+    /// A comma-separated role list following `TO`. `public` collapses to an
+    /// empty list (meaning PUBLIC).
+    fn parse_policy_roles(&mut self) -> Result<Vec<String>, String> {
+        let mut roles = Vec::new();
+        loop {
+            if self.eat_keyword("public") {
+                // PUBLIC: represented as an empty role list.
+            } else if self.eat_keyword("current_user") || self.eat_keyword("session_user") {
+                roles.push("current_user".to_string());
+            } else {
+                roles.push(self.parse_ident()?);
+            }
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(roles)
+    }
+
     fn parse_table_constraint(&mut self, table: &str) -> Result<TableConstraint, String> {
         let explicit_name = if self.eat_keyword("constraint") {
             Some(self.parse_ident()?)
         } else {
             None
         };
+        if self.is_keyword("exclude") {
+            // Capture `EXCLUDE [USING m] (...)` verbatim; not enforced.
+            let definition = self.collect_balanced_until_comma_or_rparen();
+            self.parse_deferrable_tail();
+            let name = explicit_name.unwrap_or_else(|| format!("{table}_exclusion"));
+            return Ok(TableConstraint::Exclude { name, definition });
+        }
         if self.eat_keyword("check") {
             self.expect(&Token::LParen)?;
             let expr = self.parse_expr()?;
             self.expect(&Token::RParen)?;
             let validated = !self.parse_not_valid();
+            self.parse_deferrable_tail();
             let name = explicit_name.unwrap_or_else(|| format!("{table}_check"));
             return Ok(TableConstraint::Check {
                 name,
@@ -1317,7 +1707,10 @@ impl Parser {
                 return Err("multi-column foreign keys are not supported yet".into());
             }
             self.expect(&Token::RParen)?;
+            // Accept and ignore ON DELETE/UPDATE actions and MATCH.
+            self.parse_fk_actions_tail();
             let validated = !self.parse_not_valid();
+            self.parse_deferrable_tail();
             let name = explicit_name.unwrap_or_else(|| format!("{table}_{column}_fkey"));
             return Ok(TableConstraint::ForeignKey {
                 name,
@@ -1346,6 +1739,7 @@ impl Parser {
         }
         self.expect(&Token::RParen)?;
         let _ = self.parse_not_valid();
+        self.parse_deferrable_tail();
         let suffix = if primary_key { "pkey" } else { "key" };
         let name =
             explicit_name.unwrap_or_else(|| format!("{}_{}_{}", table, columns.join("_"), suffix));
@@ -1362,6 +1756,75 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    /// Accept and ignore a trailing `[NOT] DEFERRABLE` and/or `INITIALLY
+    /// {DEFERRED|IMMEDIATE}` on a constraint. No deferral semantics are applied.
+    fn parse_deferrable_tail(&mut self) {
+        loop {
+            if self.eat_keyword("not") {
+                self.eat_keyword("deferrable");
+            } else if self.eat_keyword("deferrable") {
+                continue;
+            } else if self.eat_keyword("initially") {
+                let _ = self.eat_keyword("deferred") || self.eat_keyword("immediate");
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Accept and ignore foreign-key `MATCH` and `ON DELETE/UPDATE` action
+    /// clauses. The referential actions are not enforced.
+    fn parse_fk_actions_tail(&mut self) {
+        if self.eat_keyword("match") {
+            let _ = self.eat_keyword("full")
+                || self.eat_keyword("partial")
+                || self.eat_keyword("simple");
+        }
+        while self.eat_keyword("on") {
+            let _ = self.eat_keyword("delete") || self.eat_keyword("update");
+            if self.eat_keyword("no") {
+                self.eat_keyword("action");
+            } else if self.eat_keyword("set") {
+                let _ = self.eat_keyword("null") || self.eat_keyword("default");
+            } else {
+                let _ = self.eat_keyword("restrict")
+                    || self.eat_keyword("cascade");
+            }
+        }
+    }
+
+    /// Skip tokens (balancing parens) until a top-level comma or `)`, returning
+    /// the rendered SQL text (for verbatim constraint round-tripping).
+    fn collect_balanced_until_comma_or_rparen(&mut self) -> String {
+        let mut out = String::new();
+        let mut prev_open_paren = false;
+        let mut depth = 0;
+        loop {
+            match self.peek() {
+                None => break,
+                Some(Token::LParen) => {
+                    depth += 1;
+                }
+                Some(Token::RParen) => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Some(Token::Comma) if depth == 0 => break,
+                _ => {}
+            }
+            let tok = self.advance().expect("peeked token exists");
+            let glue_left = matches!(tok, Token::Comma | Token::RParen | Token::Dot);
+            if !out.is_empty() && !glue_left && !prev_open_paren {
+                out.push(' ');
+            }
+            out.push_str(&token_text(&tok));
+            prev_open_paren = matches!(tok, Token::LParen | Token::Dot);
+        }
+        out
     }
 
     fn parse_collation_options(&mut self) -> Result<String, String> {
@@ -1604,6 +2067,7 @@ impl Parser {
         // in any order. Loop collecting them.
         let mut body: Option<String> = None;
         let mut language = "sql".to_string();
+        let mut security_definer = false;
         loop {
             if self.eat_keyword("as") {
                 body = Some(self.parse_function_body()?);
@@ -1646,8 +2110,20 @@ impl Parser {
                 self.eat_keyword("null");
                 self.eat_keyword("input");
             } else if self.eat_keyword("security") {
-                self.eat_keyword("definer");
-                self.eat_keyword("invoker");
+                if self.eat_keyword("definer") {
+                    security_definer = true;
+                } else if self.eat_keyword("invoker") {
+                    security_definer = false;
+                }
+            } else if self.eat_keyword("external") {
+                // `EXTERNAL SECURITY {DEFINER|INVOKER}` (SQL-standard spelling).
+                if self.eat_keyword("security") {
+                    if self.eat_keyword("definer") {
+                        security_definer = true;
+                    } else if self.eat_keyword("invoker") {
+                        security_definer = false;
+                    }
+                }
             } else if self.eat_keyword("set") {
                 // `SET config = value`: consume the assignment.
                 let _ = self.parse_object_name()?;
@@ -1668,6 +2144,7 @@ impl Parser {
             return_type_name,
             body,
             language,
+            security_definer,
         }))
     }
 
@@ -1882,6 +2359,113 @@ impl Parser {
         }))
     }
 
+    /// After `CREATE OPERATOR`: disambiguate `CREATE OPERATOR CLASS/FAMILY name`
+    /// from `CREATE OPERATOR symbol (...)`.
+    fn parse_create_operator_object(&mut self) -> Result<Statement, String> {
+        if self.eat_keyword("class") {
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::CreateCatalogObject(CatalogObject {
+                kind: CatalogObjectKind::OperatorClass,
+                name,
+                definition,
+            }));
+        }
+        if self.eat_keyword("family") {
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::CreateCatalogObject(CatalogObject {
+                kind: CatalogObjectKind::OperatorFamily,
+                name,
+                definition,
+            }));
+        }
+        // `CREATE OPERATOR symbol (LEFTARG=.., ...)`. The operator name is a
+        // symbol (or schema-qualified `schema.symbol`); grab everything up to
+        // the option-list `(`.
+        let name = self.parse_operator_symbol()?;
+        let definition = self.collect_statement_tail();
+        Ok(Statement::CreateCatalogObject(CatalogObject {
+            kind: CatalogObjectKind::Operator,
+            name,
+            definition,
+        }))
+    }
+
+    /// Read an operator symbol/name (used by user-defined operators), which may
+    /// be a word or a run of operator-symbol tokens, optionally schema-qualified.
+    /// Stops at the next `(`.
+    fn parse_operator_symbol(&mut self) -> Result<String, String> {
+        let mut name = String::new();
+        while let Some(tok) = self.peek() {
+            if matches!(tok, Token::LParen | Token::Semicolon) {
+                break;
+            }
+            let tok = self.advance().expect("peeked token exists");
+            name.push_str(&token_text(&tok));
+        }
+        if name.is_empty() {
+            return Err("expected operator name".into());
+        }
+        Ok(name)
+    }
+
+    /// After `CREATE FOREIGN`: either `DATA WRAPPER name` or `TABLE name (...)`.
+    fn parse_create_foreign(&mut self) -> Result<Statement, String> {
+        if self.eat_keyword("data") {
+            self.expect_keyword("wrapper")?;
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::CreateCatalogObject(CatalogObject {
+                kind: CatalogObjectKind::ForeignDataWrapper,
+                name,
+                definition,
+            }));
+        }
+        self.expect_keyword("table")?;
+        // `CREATE FOREIGN TABLE name (cols) SERVER s [OPTIONS(...)]`. Parse the
+        // column list like a regular table so it appears in catalogs, then
+        // swallow the `SERVER ...`/`OPTIONS(...)` tail.
+        let if_not_exists = self.parse_if_not_exists();
+        let name = self.parse_object_name()?;
+        self.expect(&Token::LParen)?;
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+        loop {
+            if self.is_keyword("primary")
+                || self.is_keyword("unique")
+                || self.is_keyword("constraint")
+                || self.is_keyword("check")
+                || self.is_keyword("foreign")
+            {
+                constraints.push(self.parse_table_constraint(&name)?);
+            } else {
+                columns.push(self.parse_column_def()?);
+            }
+            if self.eat(&Token::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RParen)?;
+        // Discard the `SERVER ... [OPTIONS (...)]` tail; the table itself is
+        // stored like an ordinary (empty) table.
+        self.discard_statement_tail();
+        if columns.is_empty() {
+            return Err("foreign table must have at least one column".to_string());
+        }
+        Ok(Statement::CreateTable(CreateTable {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+            persistence: TablePersistence::Permanent,
+            inherits: Vec::new(),
+            partition_by: None,
+            partition_of: None,
+        }))
+    }
+
     fn parse_drop_function(&mut self) -> Result<Statement, String> {
         let if_exists = self.parse_if_exists();
         let name = self.parse_object_name()?;
@@ -1974,12 +2558,121 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement, String> {
         self.expect_keyword("drop")?;
-        if self.eat_keyword("role") || self.eat_keyword("user") {
+        if self.eat_keyword("role") {
             let if_exists = self.parse_if_exists();
             let name = self.parse_ident()?;
             self.eat_keyword("cascade");
             self.eat_keyword("restrict");
             return Ok(Statement::DropRole(DropRole { name, if_exists }));
+        }
+        if self.eat_keyword("user") {
+            // `DROP USER MAPPING FOR role SERVER s` vs `DROP USER name`.
+            if self.eat_keyword("mapping") {
+                let if_exists = self.parse_if_exists();
+                self.expect_keyword("for")?;
+                let name = self.parse_object_name()?;
+                let definition = self.collect_statement_tail();
+                return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                    kind: CatalogObjectKind::UserMapping,
+                    name,
+                    if_exists,
+                    definition,
+                }));
+            }
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_ident()?;
+            self.eat_keyword("cascade");
+            self.eat_keyword("restrict");
+            return Ok(Statement::DropRole(DropRole { name, if_exists }));
+        }
+        if self.eat_keyword("operator") {
+            let kind = if self.eat_keyword("class") {
+                CatalogObjectKind::OperatorClass
+            } else if self.eat_keyword("family") {
+                CatalogObjectKind::OperatorFamily
+            } else {
+                CatalogObjectKind::Operator
+            };
+            let if_exists = self.parse_if_exists();
+            let name = if kind == CatalogObjectKind::Operator {
+                self.parse_operator_symbol()?
+            } else {
+                self.parse_object_name()?
+            };
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                kind,
+                name,
+                if_exists,
+                definition,
+            }));
+        }
+        if self.eat_keyword("event") {
+            self.expect_keyword("trigger")?;
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                kind: CatalogObjectKind::EventTrigger,
+                name,
+                if_exists,
+                definition,
+            }));
+        }
+        if self.eat_keyword("foreign") {
+            if self.eat_keyword("data") {
+                self.expect_keyword("wrapper")?;
+                let if_exists = self.parse_if_exists();
+                let name = self.parse_object_name()?;
+                let definition = self.collect_statement_tail();
+                return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                    kind: CatalogObjectKind::ForeignDataWrapper,
+                    name,
+                    if_exists,
+                    definition,
+                }));
+            }
+            // `DROP FOREIGN TABLE name` — a foreign table is stored as an
+            // ordinary table, so drop it as one.
+            self.expect_keyword("table")?;
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            self.eat_keyword("cascade");
+            self.eat_keyword("restrict");
+            return Ok(Statement::DropTable(DropTable { name, if_exists }));
+        }
+        if self.eat_keyword("server") {
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                kind: CatalogObjectKind::Server,
+                name,
+                if_exists,
+                definition,
+            }));
+        }
+        if self.eat_keyword("publication") {
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                kind: CatalogObjectKind::Publication,
+                name,
+                if_exists,
+                definition,
+            }));
+        }
+        if self.eat_keyword("subscription") {
+            let if_exists = self.parse_if_exists();
+            let name = self.parse_object_name()?;
+            let definition = self.collect_statement_tail();
+            return Ok(Statement::DropCatalogObject(DropCatalogObject {
+                kind: CatalogObjectKind::Subscription,
+                name,
+                if_exists,
+                definition,
+            }));
         }
         if self.eat_keyword("sequence") {
             let if_exists = self.parse_if_exists();
@@ -2076,6 +2769,9 @@ impl Parser {
         if self.eat_keyword("aggregate") {
             return self.parse_drop_aggregate();
         }
+        if self.eat_keyword("policy") {
+            return self.parse_drop_policy();
+        }
         self.expect_keyword("table")?;
         let if_exists = self.parse_if_exists();
         let name = self.parse_object_name()?;
@@ -2144,11 +2840,38 @@ impl Parser {
         }))
     }
 
+    /// When the current token is `(`, decide whether the parenthesized group is
+    /// a query source for `COPY (SELECT ...) TO ...` (begins with
+    /// SELECT/WITH/VALUES/TABLE) as opposed to a `COPY table (col, ...)` list.
+    fn peek_query_after_lparen(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Some(Token::Word(w))
+                if w.eq_ignore_ascii_case("select")
+                    || w.eq_ignore_ascii_case("with")
+                    || w.eq_ignore_ascii_case("values")
+                    || w.eq_ignore_ascii_case("table")
+        )
+    }
+
     fn parse_copy(&mut self) -> Result<Statement, String> {
         self.expect_keyword("copy")?;
-        let table = self.parse_object_name()?;
 
-        let columns = if self.peek() == Some(&Token::LParen) {
+        // `COPY (SELECT ...) TO <dst>`: a parenthesized query source. We must
+        // distinguish this from `COPY table (col, ...) ...` — the query form
+        // begins with SELECT/WITH/VALUES/TABLE inside the parens.
+        let mut query: Option<Box<Select>> = None;
+        let mut table = String::new();
+        if self.peek() == Some(&Token::LParen) && self.peek_query_after_lparen() {
+            self.advance();
+            let select = self.parse_select()?;
+            self.expect(&Token::RParen)?;
+            query = Some(Box::new(select));
+        } else {
+            table = self.parse_object_name()?;
+        }
+
+        let columns = if query.is_none() && self.peek() == Some(&Token::LParen) {
             self.advance();
             let mut cols = Vec::new();
             loop {
@@ -2172,17 +2895,31 @@ impl Parser {
             return Err("expected FROM or TO in COPY".into());
         };
 
-        // Only STDIN/STDOUT (the COPY sub-protocol) is supported.
-        match direction {
-            CopyDirection::From if self.eat_keyword("stdin") => {}
-            CopyDirection::To if self.eat_keyword("stdout") => {}
-            _ => return Err("COPY only supports STDIN/STDOUT, not file paths".into()),
+        if query.is_some() && direction == CopyDirection::From {
+            return Err("COPY FROM not supported with a query source".into());
         }
+
+        // The endpoint: STDIN/STDOUT (COPY sub-protocol) or a single-quoted
+        // server-side file path.
+        let target = match direction {
+            CopyDirection::From if self.eat_keyword("stdin") => CopyTarget::Stdin,
+            CopyDirection::To if self.eat_keyword("stdout") => CopyTarget::Stdout,
+            _ => match self.advance() {
+                Some(Token::StringLit(path)) => CopyTarget::File(path),
+                other => {
+                    return Err(format!(
+                        "expected STDIN/STDOUT or a file path in COPY, got {other:?}"
+                    ))
+                }
+            },
+        };
 
         let mut copy = Copy {
             table,
+            query,
             columns,
             direction,
+            target,
             format: CopyFormat::Text,
             delimiter: None,
             header: false,
@@ -2201,6 +2938,7 @@ impl Parser {
             loop {
                 if self.is_keyword("delimiter")
                     || self.is_keyword("csv")
+                    || self.is_keyword("binary")
                     || self.is_keyword("header")
                     || self.is_keyword("null")
                     || self.is_keyword("format")
@@ -2221,10 +2959,13 @@ impl Parser {
             copy.format = match fmt.to_ascii_lowercase().as_str() {
                 "text" => CopyFormat::Text,
                 "csv" => CopyFormat::Csv,
+                "binary" => CopyFormat::Binary,
                 other => return Err(format!("unsupported COPY format: {other}")),
             };
         } else if self.eat_keyword("csv") {
             copy.format = CopyFormat::Csv;
+        } else if self.eat_keyword("binary") {
+            copy.format = CopyFormat::Binary;
         } else if self.eat_keyword("delimiter") {
             match self.advance() {
                 Some(Token::StringLit(s)) if s.chars().count() == 1 => {
@@ -2491,6 +3232,41 @@ impl Parser {
     }
 
     fn parse_select_core(&mut self) -> Result<Select, String> {
+        // `VALUES (...), (...)` as a query operand. Each tuple becomes a
+        // FROM-less SELECT projection (column names `column1`, `column2`, ...);
+        // multiple tuples are folded into a `UNION ALL` chain.
+        if self.is_keyword("values") {
+            self.advance();
+            let tuples = self.parse_values_tuples()?;
+            let mut iter = tuples.into_iter();
+            let first = iter.next().unwrap_or_default();
+            let mut select = Select {
+                projection: first
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, e)| SelectItem::Expr {
+                        expr: e,
+                        alias: Some(format!("column{}", i + 1)),
+                    })
+                    .collect(),
+                ..Select::default()
+            };
+            for tuple in iter {
+                let rhs = Select {
+                    projection: tuple
+                        .into_iter()
+                        .map(|e| SelectItem::Expr { expr: e, alias: None })
+                        .collect(),
+                    ..Select::default()
+                };
+                select.set_ops.push(SetOperation {
+                    op: SetOperator::Union,
+                    all: true,
+                    select: Box::new(rhs),
+                });
+            }
+            return Ok(select);
+        }
         self.expect_keyword("select")?;
         // `ALL` is the default; `DISTINCT` deduplicates.
         self.eat_keyword("all");
@@ -2802,17 +3578,39 @@ impl Parser {
                     alias,
                     subquery: Some(Box::new(sub)),
                     lateral,
+                    only: false,
                 });
             }
         }
 
+        // `ONLY t` restricts a scan to the named table's own rows (no
+        // inheritance children / partitions).
+        let only = self.eat_keyword("only");
         let (schema, name) = self.parse_qualified_name()?;
         let args = if self.eat(&Token::LParen) {
             self.parse_call_args()?
         } else {
             Vec::new()
         };
+        // `WITH ORDINALITY` on a set-returning function: accepted, no extra
+        // ordinality column is materialised (the relations psql uses it on are
+        // empty in this engine).
+        if self.is_keyword("with") && self.is_keyword_at(1, "ordinality") {
+            self.advance();
+            self.advance();
+        }
         let alias = self.parse_optional_table_alias()?;
+        // Optional column-alias list: `AS a(c1, c2)` / `a(c1, c2)`.
+        if self.eat(&Token::LParen) {
+            loop {
+                let _ = self.parse_ident()?;
+                if self.eat(&Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+            self.expect(&Token::RParen)?;
+        }
         Ok(TableRef {
             schema,
             name,
@@ -2820,6 +3618,7 @@ impl Parser {
             alias,
             subquery: None,
             lateral,
+            only,
         })
     }
 
@@ -3121,15 +3920,138 @@ impl Parser {
         }
     }
 
+    /// Parse a comma-separated list of transaction modes following `BEGIN`,
+    /// `START TRANSACTION`, or `SET TRANSACTION`: `ISOLATION LEVEL <lvl>`,
+    /// `READ ONLY`, `READ WRITE`, `[NOT] DEFERRABLE` (the last accepted as a
+    /// no-op). Returns the isolation level and read-only flag if specified.
+    fn parse_transaction_modes(
+        &mut self,
+    ) -> Result<(Option<IsolationLevel>, Option<bool>), String> {
+        let mut isolation = None;
+        let mut read_only = None;
+        loop {
+            if self.eat_keyword("isolation") {
+                self.expect_keyword("level")?;
+                isolation = Some(self.parse_isolation_level()?);
+            } else if self.eat_keyword("read") {
+                if self.eat_keyword("only") {
+                    read_only = Some(true);
+                } else if self.eat_keyword("write") {
+                    read_only = Some(false);
+                } else {
+                    return Err("expected ONLY or WRITE after READ".into());
+                }
+            } else if self.eat_keyword("deferrable") {
+                // accepted no-op
+            } else if self.eat_keyword("not") {
+                self.expect_keyword("deferrable")?;
+            } else {
+                break;
+            }
+            // Modes may be separated by an optional comma.
+            self.eat(&Token::Comma);
+        }
+        Ok((isolation, read_only))
+    }
+
+    /// Parse an isolation level name (`READ COMMITTED`, `READ UNCOMMITTED`,
+    /// `REPEATABLE READ`, `SERIALIZABLE`).
+    fn parse_isolation_level(&mut self) -> Result<IsolationLevel, String> {
+        if self.eat_keyword("serializable") {
+            Ok(IsolationLevel::Serializable)
+        } else if self.eat_keyword("repeatable") {
+            self.expect_keyword("read")?;
+            Ok(IsolationLevel::RepeatableRead)
+        } else if self.eat_keyword("read") {
+            if self.eat_keyword("committed") {
+                Ok(IsolationLevel::ReadCommitted)
+            } else if self.eat_keyword("uncommitted") {
+                Ok(IsolationLevel::ReadUncommitted)
+            } else {
+                Err("expected COMMITTED or UNCOMMITTED after READ".into())
+            }
+        } else {
+            Err("expected a transaction isolation level".into())
+        }
+    }
+
     fn parse_set(&mut self) -> Result<Statement, String> {
         self.expect_keyword("set")?;
-        // `SET [SESSION|LOCAL] name {=|TO} value`.
-        self.eat_keyword("session");
-        self.eat_keyword("local");
-        let name = self.parse_object_name()?;
+        // `SET CONSTRAINTS { ALL | name[,...] } { DEFERRED | IMMEDIATE }` —
+        // accepted as a no-op (no deferred-constraint machinery).
+        if self.eat_keyword("constraints") {
+            self.discard_statement_tail();
+            return Ok(Statement::SetConstraints);
+        }
+        // `SET SESSION CHARACTERISTICS AS TRANSACTION <modes>` sets the session
+        // default; `SET [SESSION|LOCAL] TRANSACTION <modes>` sets the current
+        // transaction.
+        if self.eat_keyword("session") {
+            if self.eat_keyword("characteristics") {
+                self.expect_keyword("as")?;
+                self.expect_keyword("transaction")?;
+                let (isolation, read_only) = self.parse_transaction_modes()?;
+                return Ok(Statement::SetTransaction {
+                    isolation,
+                    read_only,
+                    session: true,
+                });
+            }
+            if self.eat_keyword("transaction") {
+                let (isolation, read_only) = self.parse_transaction_modes()?;
+                return Ok(Statement::SetTransaction {
+                    isolation,
+                    read_only,
+                    session: false,
+                });
+            }
+            // `SET SESSION name = value` — fall through to the generic GUC path.
+            let name = self.parse_guc_name()?;
+            return self.finish_set_guc(name, false);
+        }
+        if self.eat_keyword("transaction") {
+            let (isolation, read_only) = self.parse_transaction_modes()?;
+            return Ok(Statement::SetTransaction {
+                isolation,
+                read_only,
+                session: false,
+            });
+        }
+        // `SET [LOCAL] name {=|TO} value`.
+        let local = self.eat_keyword("local");
+        if self.eat_keyword("transaction") {
+            let (isolation, read_only) = self.parse_transaction_modes()?;
+            return Ok(Statement::SetTransaction {
+                isolation,
+                read_only,
+                session: false,
+            });
+        }
+        let name = self.parse_guc_name()?;
+        self.finish_set_guc(name, local)
+    }
+
+    /// Finish parsing a generic `SET name {=|TO} value` after the name.
+    fn finish_set_guc(&mut self, name: String, local: bool) -> Result<Statement, String> {
         let _ = self.eat(&Token::Eq) || self.eat_keyword("to");
+        // `SET name TO DEFAULT` / `SET name = DEFAULT` resets the parameter.
+        if self.eat_keyword("default") {
+            return Ok(Statement::ResetConfig { name: Some(name) });
+        }
         let value = self.parse_setting_value();
-        Ok(Statement::Set { name, value })
+        Ok(Statement::Set { name, value, local })
+    }
+
+    /// Parse a (possibly dotted, e.g. `myapp.setting`) GUC parameter name,
+    /// preserving every segment joined by `.` (unlike [`parse_object_name`],
+    /// which keeps only the trailing identifier).
+    fn parse_guc_name(&mut self) -> Result<String, String> {
+        let mut name = self.parse_ident()?;
+        while self.eat(&Token::Dot) {
+            name.push('.');
+            name.push_str(&self.parse_ident()?);
+        }
+        Ok(name)
     }
 
     fn parse_refresh(&mut self) -> Result<Statement, String> {
@@ -3257,32 +4179,6 @@ impl Parser {
             true
         } else {
             false
-        }
-    }
-
-    /// Skip tokens (balancing parens) until a top-level comma or `)`.
-    /// Used to ignore table-level constraints we don't model yet.
-    fn skip_balanced_until_comma_or_rparen(&mut self) {
-        let mut depth = 0;
-        loop {
-            match self.peek() {
-                None => break,
-                Some(Token::LParen) => {
-                    depth += 1;
-                    self.advance();
-                }
-                Some(Token::RParen) => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                    self.advance();
-                }
-                Some(Token::Comma) if depth == 0 => break,
-                _ => {
-                    self.advance();
-                }
-            }
         }
     }
 
@@ -3436,10 +4332,43 @@ impl Parser {
         let mut e = self.parse_atom_inner()?;
         loop {
             if self.eat(&Token::DoubleColon) {
-                let target = self.parse_data_type()?;
-                e = Expr::Cast {
-                    expr: Box::new(e),
-                    target,
+                let (target, raw) = self.parse_data_type_named()?;
+                // `reg*` casts (regclass/regtype/regnamespace/regproc/regrole)
+                // are object-name <-> OID conversions. Model them as function
+                // calls the executor resolves against the catalog, since the
+                // plain `DataType` cast would lose the distinction.
+                e = match raw.as_deref() {
+                    Some(
+                        name @ ("regclass" | "regtype" | "regnamespace" | "regproc"
+                        | "regrole" | "regprocedure" | "regoper" | "regoperator"
+                        | "regconfig" | "regdictionary"),
+                    ) => Expr::Function {
+                        name: format!("__cast_{name}"),
+                        args: vec![e],
+                        star: false,
+                        distinct: false,
+                        filter: None,
+                        over: None,
+                    },
+                    _ => Expr::Cast {
+                        expr: Box::new(e),
+                        target,
+                    },
+                };
+            } else if self.peek() == Some(&Token::LBracket) {
+                // Array element subscript `expr[idx]` (1-based). Modelled as a
+                // call to the internal `__subscript` function so all expression
+                // traversal/serialisation paths handle it via the Function arm.
+                self.advance();
+                let idx = self.parse_expr()?;
+                self.expect(&Token::RBracket)?;
+                e = Expr::Function {
+                    name: "__subscript".to_string(),
+                    args: vec![e, idx],
+                    star: false,
+                    distinct: false,
+                    filter: None,
+                    over: None,
                 };
             } else if self.eat_keyword("collate") {
                 // Collation is accepted and ignored.
@@ -3558,6 +4487,17 @@ impl Parser {
                         }
                         self.expect(&Token::RBracket)?;
                         Ok(Expr::Array(items))
+                    }
+                    // `ARRAY(SELECT ...)`: array constructor over a subquery.
+                    // Modeled as a scalar (uncorrelated) subquery. In this engine
+                    // such constructs only appear in psql catalog probes that
+                    // return no rows (e.g. RLS policy role lists), so collapsing
+                    // to a scalar subquery is sufficient for compatibility.
+                    "array" if self.peek() == Some(&Token::LParen) => {
+                        self.advance();
+                        let sub = self.parse_select()?;
+                        self.expect(&Token::RParen)?;
+                        Ok(Expr::ScalarSubquery(Box::new(sub)))
                     }
                     "extract" => {
                         // EXTRACT(field FROM source) → date_part('field', source)

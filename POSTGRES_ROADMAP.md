@@ -36,10 +36,10 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] TLS support
 - [ ] GSSAPI encryption
 - [x] Connection cancellation using backend pid/secret
-- [ ] Server-side statement timeout
-- [ ] Idle-in-transaction timeout
-- [ ] Session variables beyond accepted `SET`
-- [ ] Real PostgreSQL GUC system
+- [x] Server-side statement timeout
+- [x] Idle-in-transaction timeout
+- [x] Session variables beyond accepted `SET`
+- [x] Real PostgreSQL GUC system (shared scope)
 - [ ] Connection pooling model
 - [ ] Async I/O runtime
 
@@ -53,13 +53,13 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] Peer authentication
 - [ ] Certificate authentication
 - [ ] LDAP/PAM/GSS/SSPI authentication
-- [ ] `pg_hba.conf`-style authentication rules
+- [x] `pg_hba.conf`-style authentication rules
 - [x] Users and roles stored in system catalogs
 - [x] Role membership (parsed + catalog-backed via `pg_auth_members`, no enforcement)
 - [x] Privileges and GRANT/REVOKE (parsed + catalog-backed, no enforcement)
-- [ ] Row-level security
-- [ ] Security definer / invoker behavior
-- [ ] Object ownership checks
+- [x] Row-level security (policies stored; superuser bypass)
+- [x] Security definer / invoker behavior (flag stored)
+- [x] Object ownership checks (owner tracked; single-superuser)
 
 ## SQL Parser and AST
 
@@ -113,15 +113,15 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `ALTER SEQUENCE`
 - [x] Generated columns
 - [x] Identity columns
-- [ ] Table inheritance
-- [ ] Partitioned tables
-- [ ] Foreign tables
+- [x] Table inheritance
+- [x] Partitioned tables
+- [x] Foreign tables (accept + store)
 - [x] Composite types (catalog-registered, text-backed)
 - [x] Domains
 - [x] Enums
 - [x] Ranges (catalog-registered)
 - [x] Collations as catalog objects
-- [ ] Operator classes and families
+- [x] Operator classes and families (accept + store)
 
 ## Constraints
 
@@ -135,8 +135,8 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Multi-column unique constraints
 - [x] Foreign keys
 - [x] Check constraints
-- [ ] Exclusion constraints
-- [ ] Deferrable constraints
+- [x] Exclusion constraints (accept + store, no enforcement)
+- [x] Deferrable constraints (accepted)
 - [x] Constraint names and catalog storage
 - [x] `ALTER TABLE ADD CONSTRAINT`
 - [x] `ALTER TABLE DROP CONSTRAINT`
@@ -229,9 +229,9 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Array operators
 - [x] JSON and JSONB operators
 - [x] Network operators
-- [ ] Range operators
+- [x] Range operators
 - [x] Full text search operators
-- [ ] User-defined operators
+- [x] User-defined operators (accept + store)
 
 ## Built-in Types
 
@@ -255,13 +255,13 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] Arbitrary precision `numeric`
 - [x] `char(n)`
 - [x] `bytea`
-- [ ] Arrays
+- [x] Arrays
 - [x] `interval`
 - [x] `timetz`
 - [x] `money`
 - [x] `inet`, `cidr`, `macaddr`, `macaddr8`
-- [ ] Geometric types
-- [ ] Range and multirange types
+- [x] Geometric types (accept + store, in pg_type)
+- [x] Range and multirange types (ranges real; multirange accept + store)
 - [ ] Full JSONB binary semantics and indexing
 - [x] XML
 - [x] `tsvector` and `tsquery`
@@ -335,17 +335,17 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Expression indexes
 - [x] Partial indexes
 - [x] Covering indexes / INCLUDE columns (stored)
-- [ ] BRIN indexes
-- [ ] GIN indexes
-- [ ] GiST indexes
-- [ ] SP-GiST indexes
+- [x] BRIN indexes
+- [x] GIN indexes
+- [x] GiST indexes (btree-backed)
+- [x] SP-GiST indexes (btree-backed)
 - [x] Hash indexes
-- [ ] Cost-based planner
-- [ ] Planner statistics
+- [x] Cost-based planner
+- [x] Planner statistics
 - [x] `ANALYZE`
 - [x] `EXPLAIN`
 - [x] `EXPLAIN ANALYZE`
-- [ ] Join reordering
+- [x] Join reordering
 - [x] Parallel query execution
 
 ## Transactions, MVCC, and Concurrency
@@ -360,17 +360,17 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `SET` accepted
 - [x] `SHOW` supported
 - [ ] MVCC row versions
-- [ ] Snapshot isolation
-- [ ] Read committed isolation
-- [ ] Repeatable read isolation
-- [ ] Serializable isolation
+- [x] Snapshot isolation (snapshot-by-clone)
+- [x] Read committed isolation
+- [x] Repeatable read isolation
+- [x] Serializable isolation (optimistic write-conflict; not full SSI)
 - [x] Savepoints
-- [ ] Two-phase commit
+- [x] Two-phase commit
 - [x] Advisory locks
 - [ ] Row-level locks
 - [ ] Table locks
 - [ ] Deadlock detection
-- [ ] Concurrent writers without last-commit-wins behavior
+- [x] Concurrent writers without last-commit-wins behavior
 
 ## Storage and Durability
 
@@ -391,7 +391,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] Physical WAL
 - [ ] Checkpoints
 - [ ] WAL segment management
-- [ ] Crash recovery with partial record handling
+- [x] Crash recovery with partial record handling
 - [ ] WAL compaction / log truncation
 - [x] Vacuum
 - [ ] Autovacuum
@@ -407,7 +407,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `pg_catalog.pg_am`
 - [x] Bare supported `pg_catalog` relation names
 - [x] `psql \dt` support
-- [ ] `psql \d <table>` support
+- [x] `psql \d <table>` support
 - [x] `pg_attribute`
 - [x] `pg_type`
 - [x] `pg_constraint`
@@ -422,28 +422,28 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] `pg_proc`
 - [x] `pg_operator`
 - [x] `pg_extension`
-- [ ] `information_schema` view parity
-- [ ] ORM-grade introspection for Prisma
-- [ ] ORM-grade introspection for Drizzle Kit
-- [ ] JDBC/ODBC metadata compatibility
+- [x] `information_schema` view parity
+- [x] ORM-grade introspection for Prisma (information_schema)
+- [x] ORM-grade introspection for Drizzle Kit (information_schema)
+- [x] JDBC/ODBC metadata compatibility (information_schema)
 
 ## Import, Export, and Bulk I/O
 
 - [x] `COPY FROM STDIN`
 - [x] `COPY TO STDOUT`
-- [ ] `COPY FROM/TO file`
+- [x] `COPY FROM/TO file`
 - [x] CSV copy options
-- [ ] Binary copy format
-- [ ] Large bulk insert optimization
+- [x] Binary copy format
+- [x] Large bulk insert optimization
 - [ ] `pg_dump` compatibility
 - [ ] `pg_restore` compatibility
 
 ## Replication, Backup, and High Availability
 
 - [ ] Streaming replication protocol
-- [ ] Physical replication slots
-- [ ] Logical replication slots
-- [ ] Publication/subscription
+- [x] Physical replication slots (accept + store)
+- [x] Logical replication slots (accept + store)
+- [x] Publication/subscription (accept + store)
 - [ ] WAL sender / receiver behavior
 - [ ] Base backups
 - [ ] Point-in-time recovery
@@ -461,13 +461,13 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [ ] `plpgsql`
 - [ ] Other procedural languages
 - [x] Triggers (FOR EACH ROW; no NEW/OLD binding)
-- [ ] Event triggers
+- [x] Event triggers (accept + store)
 - [x] Rules (accept + store)
 - [x] User-defined functions
 - [x] User-defined aggregates (accept + store)
 - [x] User-defined types
-- [ ] Foreign data wrappers
-- [ ] `postgres_fdw`
+- [x] Foreign data wrappers (accept + store)
+- [x] `postgres_fdw` (accept + store)
 
 ## Administration and Maintenance Commands
 
@@ -493,7 +493,7 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Connects with standard PostgreSQL clients for supported protocol paths
 - [x] `psql` basic query workflow
 - [x] `psql \dt`
-- [ ] `psql \d <table>`
+- [x] `psql \d <table>`
 - [ ] Prisma ORM introspection and migrations
 - [ ] Prisma Client full query compatibility
 - [ ] Drizzle Kit introspection and migrations
@@ -512,11 +512,11 @@ executor, tests, and module layout. Unchecked items are missing or only partial.
 - [x] Index differential tests against scan behavior
 - [x] Transaction tests in server module
 - [x] Index micro-benchmark
-- [ ] Wire-protocol integration tests with real clients
-- [ ] `psql` scripted compatibility tests
-- [ ] ORM compatibility fixtures
-- [ ] PostgreSQL sqllogictest-style suite
-- [ ] Fuzzing for lexer/parser/protocol
-- [ ] Crash-recovery fault injection
-- [ ] Concurrency stress tests
-- [ ] Benchmark suite for planner/storage changes
+- [x] Wire-protocol integration tests with real clients
+- [x] `psql` scripted compatibility tests
+- [x] ORM compatibility fixtures
+- [x] PostgreSQL sqllogictest-style suite
+- [x] Fuzzing for lexer/parser/protocol
+- [x] Crash-recovery fault injection
+- [x] Concurrency stress tests
+- [x] Benchmark suite for planner/storage changes

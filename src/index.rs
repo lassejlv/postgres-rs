@@ -38,7 +38,39 @@ pub enum IndexMethod {
     Btree,
     /// Hash table: supports equality lookups only (no range scans).
     Hash,
+    /// GiST (generalized search tree). In this engine it is functionally
+    /// B-tree-backed (an ordered store over a scalar key): it supports
+    /// equality and range scans exactly like a B-tree. There is no R-tree /
+    /// geometric specialization.
+    Gist,
+    /// SP-GiST (space-partitioned GiST). Like [`IndexMethod::Gist`], it is
+    /// B-tree-backed here (ordered scalar key, equality + range).
+    SpGist,
+    /// BRIN (block-range index): a summary index storing the min/max of the
+    /// indexed column per fixed-size range of consecutive rows. Used to skip
+    /// block ranges that cannot satisfy a range/equality predicate; survivors
+    /// are re-checked by the executor.
+    Brin,
+    /// GIN (generalized inverted index): an inverted map from each *element* of
+    /// a multi-valued (array) column to the row ids that contain it. Used to
+    /// accelerate array containment (`@>`) and membership.
+    Gin,
 }
+
+impl IndexMethod {
+    /// Whether this method is backed by an ordered (B-tree) store and therefore
+    /// supports range scans and ordered prefix lookups. True for `btree`,
+    /// `gist`, and `spgist`.
+    pub fn is_ordered(self) -> bool {
+        matches!(
+            self,
+            IndexMethod::Btree | IndexMethod::Gist | IndexMethod::SpGist
+        )
+    }
+}
+
+/// The number of consecutive rows summarised by one BRIN "block range".
+const BRIN_RANGE_SIZE: usize = 16;
 
 /// A `Value` wrapped so it can serve as a totally-ordered `BTreeMap` key.
 ///
@@ -177,11 +209,54 @@ fn key_has_null(values: &[Value]) -> bool {
     values.iter().any(|v| v.is_null())
 }
 
-/// The backing store of an index: either a sorted B-tree or a hash table.
+/// A BRIN per-range summary: the min and max indexed value over the (live) rows
+/// whose ids fall in this range, plus the live `(row_id, value)` members so the
+/// summary can be recomputed when a row leaves the range.
+#[derive(Debug, Clone, Default)]
+struct BrinRange {
+    members: Vec<(RowId, Value)>,
+}
+
+impl BrinRange {
+    /// The [min, max] of the non-NULL member values, or `None` if the range
+    /// holds only NULLs / is empty.
+    fn min_max(&self) -> Option<(Value, Value)> {
+        let mut it = self
+            .members
+            .iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(_, v)| v);
+        let first = it.next()?;
+        let mut lo = first.clone();
+        let mut hi = first.clone();
+        for v in it {
+            if IndexKey::cmp_value(v, &lo) == Ordering::Less {
+                lo = v.clone();
+            }
+            if IndexKey::cmp_value(v, &hi) == Ordering::Greater {
+                hi = v.clone();
+            }
+        }
+        Some((lo, hi))
+    }
+}
+
+/// The backing store of an index.
 #[derive(Debug, Clone)]
 enum Store {
+    /// Sorted B-tree (also used for `gist`/`spgist`, which are ordered).
     Btree(BTreeMap<KeyVec, Vec<RowId>>),
+    /// Hash table: equality only.
     Hash(HashMap<String, Vec<RowId>>),
+    /// BRIN: block range id (`row_id / BRIN_RANGE_SIZE`) → summary.
+    Brin(BTreeMap<u64, BrinRange>),
+    /// GIN: array element string → row ids containing that element. A row may
+    /// appear under several elements; `empties` tracks rows with an empty array
+    /// (which `@> '{}'` matches).
+    Gin {
+        postings: HashMap<String, Vec<RowId>>,
+        all: Vec<RowId>,
+    },
 }
 
 /// A secondary index over one or more columns (or an expression) of a table.
@@ -256,6 +331,23 @@ impl Index {
                 }
                 map.entry(hash_key(&key)).or_default().push(row_id);
             }
+            Store::Brin(ranges) => {
+                // BRIN summarises a single scalar key column.
+                let v = key.into_iter().next().unwrap_or(Value::Null);
+                let block = row_id / BRIN_RANGE_SIZE as u64;
+                ranges.entry(block).or_default().members.push((row_id, v));
+            }
+            Store::Gin { postings, all } => {
+                all.push(row_id);
+                // GIN indexes a single multi-valued key column.
+                let v = key.into_iter().next().unwrap_or(Value::Null);
+                let mut tokens = gin_tokens(&v);
+                tokens.sort();
+                tokens.dedup();
+                for tok in tokens {
+                    postings.entry(tok).or_default().push(row_id);
+                }
+            }
         }
     }
 
@@ -287,6 +379,36 @@ impl Index {
                     }
                 }
             }
+            Store::Brin(ranges) => {
+                let block = row_id / BRIN_RANGE_SIZE as u64;
+                if let Some(range) = ranges.get_mut(&block) {
+                    if let Some(pos) = range.members.iter().position(|(r, _)| *r == row_id) {
+                        range.members.swap_remove(pos);
+                    }
+                    if range.members.is_empty() {
+                        ranges.remove(&block);
+                    }
+                }
+            }
+            Store::Gin { postings, all } => {
+                if let Some(pos) = all.iter().position(|&r| r == row_id) {
+                    all.swap_remove(pos);
+                }
+                let v = key.into_iter().next().unwrap_or(Value::Null);
+                let mut tokens = gin_tokens(&v);
+                tokens.sort();
+                tokens.dedup();
+                for tok in tokens {
+                    if let Some(ids) = postings.get_mut(&tok) {
+                        if let Some(pos) = ids.iter().position(|&r| r == row_id) {
+                            ids.swap_remove(pos);
+                        }
+                        if ids.is_empty() {
+                            postings.remove(&tok);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -308,7 +430,52 @@ impl Index {
                 }
                 map.get(&hash_key(key)).cloned().unwrap_or_default()
             }
+            // BRIN: equality is a degenerate range [v, v]. Return the members of
+            // every block range whose summary [min,max] straddles `v`; the
+            // executor re-checks the real predicate.
+            Store::Brin(_) => {
+                let Some(v) = key.first() else {
+                    return Vec::new();
+                };
+                if v.is_null() {
+                    return Vec::new();
+                }
+                let b = Bound {
+                    value: v.clone(),
+                    inclusive: true,
+                };
+                self.lookup_range(Some(b.clone()), Some(b))
+            }
+            // GIN: a whole-array equality is not what GIN accelerates; return
+            // every indexed row as a (safe) superset for the executor to filter.
+            Store::Gin { all, .. } => all.clone(),
         }
+    }
+
+    /// GIN containment probe: row ids whose indexed array contains *every*
+    /// element in `needles` (the `col @> ARRAY[...]` semantics). An empty
+    /// `needles` matches every indexed row. Only valid on a GIN index; other
+    /// methods return `None` so the planner falls back to a scan.
+    pub fn lookup_gin_contains(&self, needles: &[String]) -> Option<Vec<RowId>> {
+        let Store::Gin { postings, all } = &self.store else {
+            return None;
+        };
+        if needles.is_empty() {
+            return Some(all.clone());
+        }
+        // Intersect the posting lists of the required elements.
+        let mut result: Option<Vec<RowId>> = None;
+        for needle in needles {
+            let Some(ids) = postings.get(needle) else {
+                return Some(Vec::new()); // a required element is absent everywhere
+            };
+            let set: std::collections::HashSet<RowId> = ids.iter().copied().collect();
+            result = Some(match result {
+                None => ids.clone(),
+                Some(prev) => prev.into_iter().filter(|r| set.contains(r)).collect(),
+            });
+        }
+        Some(result.unwrap_or_default())
     }
 
     /// All row ids currently held by this index (used to scan a partial index
@@ -326,6 +493,12 @@ impl Index {
                     out.extend_from_slice(ids);
                 }
             }
+            Store::Brin(ranges) => {
+                for range in ranges.values() {
+                    out.extend(range.members.iter().map(|(r, _)| *r));
+                }
+            }
+            Store::Gin { all, .. } => out.extend_from_slice(all),
         }
         out
     }
@@ -357,6 +530,27 @@ impl Index {
     /// returned. Returns ids in ascending key order.
     pub fn lookup_range(&self, lo: Option<Bound>, hi: Option<Bound>) -> Vec<RowId> {
         use std::ops::Bound as B;
+        // BRIN: keep the members of every block range whose summary [min,max]
+        // overlaps the query range. The executor re-checks the real predicate,
+        // so returning a range's whole membership is correct (just a superset).
+        if let Store::Brin(ranges) = &self.store {
+            let mut out = Vec::new();
+            for range in ranges.values() {
+                let Some((rmin, rmax)) = range.min_max() else {
+                    continue; // all-NULL range can't satisfy a range predicate
+                };
+                if brin_range_overlaps(&rmin, &rmax, lo.as_ref(), hi.as_ref()) {
+                    out.extend(
+                        range
+                            .members
+                            .iter()
+                            .filter(|(_, v)| !v.is_null())
+                            .map(|(r, _)| *r),
+                    );
+                }
+            }
+            return out;
+        }
         let Store::Btree(tree) = &self.store else {
             return Vec::new();
         };
@@ -384,11 +578,107 @@ impl Index {
     }
 }
 
+/// Whether a BRIN block range with values in `[rmin, rmax]` could contain a row
+/// satisfying the query range bounded by `lo`/`hi`. Conservative: when in doubt
+/// it returns `true` (the executor re-checks), never a false negative.
+fn brin_range_overlaps(
+    rmin: &Value,
+    rmax: &Value,
+    lo: Option<&Bound>,
+    hi: Option<&Bound>,
+) -> bool {
+    // Below the low bound: rmax < lo (or <= lo when exclusive) → no overlap.
+    if let Some(b) = lo {
+        match IndexKey::cmp_value(rmax, &b.value) {
+            Ordering::Less => return false,
+            Ordering::Equal if !b.inclusive => return false,
+            _ => {}
+        }
+    }
+    // Above the high bound: rmin > hi (or >= hi when exclusive) → no overlap.
+    if let Some(b) = hi {
+        match IndexKey::cmp_value(rmin, &b.value) {
+            Ordering::Greater => return false,
+            Ordering::Equal if !b.inclusive => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 fn empty_store(method: IndexMethod) -> Store {
     match method {
-        IndexMethod::Btree => Store::Btree(BTreeMap::new()),
+        // `gist`/`spgist` are ordered, B-tree-backed in this engine.
+        IndexMethod::Btree | IndexMethod::Gist | IndexMethod::SpGist => {
+            Store::Btree(BTreeMap::new())
+        }
         IndexMethod::Hash => Store::Hash(HashMap::new()),
+        IndexMethod::Brin => Store::Brin(BTreeMap::new()),
+        IndexMethod::Gin => Store::Gin {
+            postings: HashMap::new(),
+            all: Vec::new(),
+        },
     }
+}
+
+/// Tokenise a PostgreSQL array text literal (`{a,b,"c d"}`) into its element
+/// strings for GIN posting lists. NULL elements are dropped (they never match a
+/// containment probe). A non-array value yields a single token (its text), so a
+/// scalar GIN column still behaves sensibly. This mirrors the executor's
+/// `parse_array_text` closely enough that GIN returns a superset of true
+/// matches — the executor always re-checks the real predicate, so any
+/// over-inclusion is filtered out and the result stays scan-identical.
+fn gin_tokens(value: &Value) -> Vec<String> {
+    let Some(text) = value.to_text() else {
+        return Vec::new();
+    };
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
+        // Not an array literal: treat the whole text as one token.
+        return vec![text];
+    }
+    if text.len() == 2 {
+        return Vec::new(); // empty array `{}`
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut was_quoted = false;
+    let mut escape = false;
+    let push = |cur: &mut String, was_quoted: &mut bool, out: &mut Vec<String>| {
+        if !*was_quoted && cur.eq_ignore_ascii_case("NULL") {
+            // NULL element: never matches containment, skip it.
+        } else {
+            out.push(std::mem::take(cur));
+        }
+        cur.clear();
+        *was_quoted = false;
+    };
+    for ch in text[1..text.len() - 1].chars() {
+        if escape {
+            cur.push(ch);
+            escape = false;
+            continue;
+        }
+        if quoted {
+            match ch {
+                '\\' => escape = true,
+                '"' => quoted = false,
+                _ => cur.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                quoted = true;
+                was_quoted = true;
+            }
+            ',' => push(&mut cur, &mut was_quoted, &mut out),
+            _ => cur.push(ch),
+        }
+    }
+    push(&mut cur, &mut was_quoted, &mut out);
+    out
 }
 
 /// One end of a range scan: the bound value and whether it is inclusive.

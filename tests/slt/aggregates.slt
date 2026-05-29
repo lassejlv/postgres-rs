@@ -1,0 +1,40 @@
+# Aggregates and GROUP BY.
+
+statement ok
+CREATE TABLE sales (id integer PRIMARY KEY, region text, amount integer)
+
+statement ok
+INSERT INTO sales VALUES (1,'east',100),(2,'east',200),(3,'west',50),(4,'west',150),(5,'west',300)
+
+query TI
+SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY region
+----
+east
+300
+west
+500
+
+query TI
+SELECT region, count(*) FROM sales GROUP BY region ORDER BY region
+----
+east
+2
+west
+3
+
+query I
+SELECT max(amount) FROM sales
+----
+300
+
+query I
+SELECT min(amount) FROM sales
+----
+50
+
+# HAVING filters groups.
+query TI
+SELECT region, sum(amount) FROM sales GROUP BY region HAVING sum(amount) > 400 ORDER BY region
+----
+west
+500

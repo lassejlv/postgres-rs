@@ -5,21 +5,25 @@
 //! iteration dependency-free; a later iteration can move to async I/O and
 //! finer-grained locking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::ScramServer;
 use crate::bind;
+use crate::hba::{HbaConfig, HbaMethod};
 use crate::executor::{self, ExecResult, FieldDescription};
 use crate::protocol::{FrontendMessage, MessageBuilder, Startup, read_message, read_startup};
 use crate::sql::Parser;
-use crate::sql::ast::{Copy as CopyStmt, CopyDirection, CopyFormat, Expr, Insert, Statement};
+use crate::sql::ast::{
+    Copy as CopyStmt, CopyDirection, CopyFormat, CopyTarget, Expr, Insert, IsolationLevel,
+    Statement,
+};
 use crate::sql::serialize;
 use crate::storage::Database;
 use crate::types::{DataType, Value};
@@ -79,6 +83,18 @@ fn server_version() -> String {
 /// If `data_dir` is `Some`, the WAL there is replayed to restore state and all
 /// subsequent mutations are persisted; otherwise the database is in-memory.
 pub fn run(addr: &str, data_dir: Option<String>) -> io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    println!("postgres-rs listening on {addr}");
+    serve_on(listener, data_dir)
+}
+
+/// Serve connections on an already-bound `listener` until it stops yielding.
+///
+/// This is the startable entry point used both by [`run`] (which binds the
+/// listener for you) and by integration tests, which bind an ephemeral
+/// `127.0.0.1:0` listener and pass it in so they can discover the port and run
+/// the server in a background thread without racing on a fixed address.
+pub fn serve_on(listener: TcpListener, data_dir: Option<String>) -> io::Result<()> {
     let mut db = Database::new();
 
     let wal = match data_dir {
@@ -97,8 +113,6 @@ pub fn run(addr: &str, data_dir: Option<String>) -> io::Result<()> {
         backends: Mutex::new(HashMap::new()),
         listeners: Mutex::new(HashMap::new()),
     });
-    let listener = TcpListener::bind(addr)?;
-    println!("postgres-rs listening on {addr}");
 
     for stream in listener.incoming() {
         match stream {
@@ -106,7 +120,8 @@ pub fn run(addr: &str, data_dir: Option<String>) -> io::Result<()> {
                 let shared = Arc::clone(&shared);
                 thread::spawn(move || {
                     let peer = stream.peer_addr().ok();
-                    if let Err(e) = handle_connection(stream, shared) {
+                    let peer_ip = peer.map(|p| p.ip().to_string()).unwrap_or_default();
+                    if let Err(e) = handle_connection(stream, shared, peer_ip) {
                         // A clean disconnect surfaces as UnexpectedEof; don't
                         // log those as errors.
                         if e.kind() != io::ErrorKind::UnexpectedEof {
@@ -146,12 +161,25 @@ struct Transaction {
     /// Set once a statement in the block errors; further statements are
     /// rejected until COMMIT/ROLLBACK (matching PostgreSQL).
     failed: bool,
+    /// The transaction's isolation level (resolved at BEGIN from the explicit
+    /// clause, else the session default).
+    isolation: IsolationLevel,
+    /// READ ONLY mode (rejects mutations). Defaults to the session default.
+    read_only: bool,
+    /// The shared `commit_version` observed at BEGIN: the read snapshot used for
+    /// optimistic write-write conflict detection.
+    snapshot_version: u64,
+    /// Names of tables this transaction has mutated (its write set), used to
+    /// detect conflicting concurrent commits under REPEATABLE READ /
+    /// SERIALIZABLE.
+    write_set: HashSet<String>,
 }
 
 struct Savepoint {
     name: String,
     db: Database,
     buffered_len: usize,
+    write_set: HashSet<String>,
 }
 
 /// Per-connection session state.
@@ -173,10 +201,28 @@ struct Session {
     notifications: Arc<Mutex<Vec<Notification>>>,
     /// Notices accumulated by the current statement, flushed before its result.
     notices: Vec<Notice>,
+    /// Global transaction ids prepared via `PREPARE TRANSACTION 'gid'` and not
+    /// yet finished by `COMMIT PREPARED`/`ROLLBACK PREPARED`. The work itself is
+    /// already committed at PREPARE time (simplest correct 2PC); these names
+    /// just let the finishing commands validate the gid.
+    prepared_gids: HashSet<String>,
+    /// Wall-clock time the connection last finished processing a message, used
+    /// to enforce `idle_in_transaction_session_timeout` at message boundaries.
+    last_activity: Instant,
+    /// Default isolation level for new transactions, settable via `SET SESSION
+    /// CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`. PostgreSQL's default
+    /// is READ COMMITTED.
+    default_isolation: IsolationLevel,
+    /// Default read-only mode for new transactions.
+    default_read_only: bool,
 }
 
 impl Session {
-    fn new(pid: i32, cancel: Arc<AtomicBool>, notifications: Arc<Mutex<Vec<Notification>>>) -> Self {
+    fn new(
+        pid: i32,
+        cancel: Arc<AtomicBool>,
+        notifications: Arc<Mutex<Vec<Notification>>>,
+    ) -> Self {
         Session {
             tx_status: b'I',
             tx: None,
@@ -187,11 +233,26 @@ impl Session {
             cancel,
             notifications,
             notices: Vec::new(),
+            prepared_gids: HashSet::new(),
+            last_activity: Instant::now(),
+            default_isolation: IsolationLevel::ReadCommitted,
+            default_read_only: false,
         }
+    }
+
+    /// Abort the in-progress transaction (used when the idle-in-transaction
+    /// timeout fires). Discards the working copy and resets to idle.
+    fn abort_idle_transaction(&mut self) {
+        self.tx = None;
+        self.tx_status = b'I';
     }
 }
 
-fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+fn handle_connection(
+    stream: TcpStream,
+    shared: Arc<Shared>,
+    peer_ip: String,
+) -> io::Result<()> {
     stream.set_nodelay(true).ok();
     let read_half = stream.try_clone()?;
     let mut reader = BufReader::new(read_half);
@@ -227,11 +288,31 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         .find(|(k, _)| k == "user")
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| "postgres".to_string());
+    // The `database` startup parameter defaults to the username if omitted.
+    let database = params
+        .iter()
+        .find(|(k, _)| k == "database")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| username.clone());
 
-    if !authenticate(&mut reader, &mut writer, &username)? {
-        send_error(&mut writer, "28P01", "password authentication failed")?;
-        writer.flush()?;
-        return Ok(());
+    match authenticate(&mut reader, &mut writer, &username, &database, &peer_ip)? {
+        AuthOutcome::Ok => {}
+        AuthOutcome::Failed => {
+            send_error(&mut writer, "28P01", "password authentication failed")?;
+            writer.flush()?;
+            return Ok(());
+        }
+        AuthOutcome::Rejected => {
+            send_error(
+                &mut writer,
+                "28000",
+                &format!(
+                    "pg_hba.conf rejects connection for host \"{peer_ip}\", user \"{username}\", database \"{database}\""
+                ),
+            )?;
+            writer.flush()?;
+            return Ok(());
+        }
     }
 
     let pid = NEXT_BACKEND_PID.fetch_add(1, Ordering::Relaxed);
@@ -265,6 +346,28 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
         let Some(msg) = read_message(&mut reader)? else {
             break;
         };
+
+        // Idle-in-transaction timeout. The synchronous model can only check this
+        // at message boundaries (we regain control when the next message
+        // arrives, not while genuinely blocked on the socket): if a transaction
+        // has been open and idle longer than the configured timeout, abort it
+        // and report the error before processing the new message. See report:
+        // this is a boundary-granularity approximation, not a mid-idle interrupt.
+        if session.tx.is_some() && !matches!(msg, FrontendMessage::Terminate) {
+            let idle_ms = current_guc_ms(&shared, &session, "idle_in_transaction_session_timeout");
+            if idle_ms > 0 && session.last_activity.elapsed() >= Duration::from_millis(idle_ms) {
+                session.abort_idle_transaction();
+                send_error(
+                    &mut writer,
+                    "25P03",
+                    "terminating connection due to idle-in-transaction timeout",
+                )?;
+                send_ready_for_query(&mut writer, session.tx_status)?;
+                writer.flush()?;
+                session.last_activity = Instant::now();
+                continue;
+            }
+        }
 
         // While recovering from an extended-protocol error, swallow everything
         // until Sync.
@@ -342,6 +445,9 @@ fn handle_connection(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
             }
         }
         writer.flush()?;
+        // Mark the boundary so the idle-in-transaction timeout measures the gap
+        // until the next message.
+        session.last_activity = Instant::now();
     }
     Ok(())
 }
@@ -445,16 +551,20 @@ fn handle_simple_query<R: Read, W: Write>(
         }
         // `COPY ... FROM STDIN`/`TO STDOUT` switch to the COPY sub-protocol,
         // which needs the connection's reader, so they're driven separately.
+        // `COPY ... FROM/TO '<file>'` runs entirely server-side and goes through
+        // the ordinary statement path below.
         if let Statement::Copy(copy) = &stmt {
-            if let Err(e) = run_copy(reader, w, shared, session, copy)? {
-                flush_notices(w, session)?;
-                send_error(w, sqlstate_for(&e), &e)?;
-                mark_error(session);
-                return ready_for_query(w, session);
+            if matches!(copy.target, CopyTarget::Stdin | CopyTarget::Stdout) {
+                if let Err(e) = run_copy(reader, w, shared, session, copy)? {
+                    flush_notices(w, session)?;
+                    send_error(w, sqlstate_for(&e), &e)?;
+                    mark_error(session);
+                    return ready_for_query(w, session);
+                }
+                continue;
             }
-            continue;
         }
-        match run_statement(shared, session, &stmt) {
+        match run_statement_timed(shared, session, &stmt) {
             Ok(res) => {
                 flush_notices(w, session)?;
                 send_result(w, res, &[])?;
@@ -497,21 +607,40 @@ fn run_copy<R: Read, W: Write>(
         Ok(c) => c,
         Err(e) => return Ok(Err(e)),
     };
-    let delimiter = copy.delimiter.unwrap_or(match copy.format {
-        CopyFormat::Csv => ',',
-        CopyFormat::Text => '\t',
-    });
-    let null_marker = copy.null.clone().unwrap_or_else(|| match copy.format {
-        CopyFormat::Csv => String::new(),
-        CopyFormat::Text => "\\N".to_string(),
-    });
+    let delimiter = copy_delimiter(copy);
+    let null_marker = copy_null_marker(copy);
 
     match copy.direction {
-        CopyDirection::To => copy_to_stdout(w, shared, session, copy, &columns, delimiter, &null_marker),
-        CopyDirection::From => {
-            copy_from_stdin(reader, w, shared, session, copy, &columns, delimiter, &null_marker)
+        CopyDirection::To => {
+            copy_to_stdout(w, shared, session, copy, &columns, delimiter, &null_marker)
         }
+        CopyDirection::From => copy_from_stdin(
+            reader,
+            w,
+            shared,
+            session,
+            copy,
+            &columns,
+            delimiter,
+            &null_marker,
+        ),
     }
+}
+
+/// The effective field delimiter for a COPY (binary ignores it).
+fn copy_delimiter(copy: &CopyStmt) -> char {
+    copy.delimiter.unwrap_or(match copy.format {
+        CopyFormat::Csv => ',',
+        CopyFormat::Text | CopyFormat::Binary => '\t',
+    })
+}
+
+/// The effective NULL marker for a COPY (binary ignores it).
+fn copy_null_marker(copy: &CopyStmt) -> String {
+    copy.null.clone().unwrap_or_else(|| match copy.format {
+        CopyFormat::Csv => String::new(),
+        CopyFormat::Text | CopyFormat::Binary => "\\N".to_string(),
+    })
 }
 
 /// Resolve the effective column list for a COPY: the explicit list if given,
@@ -524,6 +653,11 @@ fn copy_columns(
 ) -> Result<Vec<String>, String> {
     if let Some(cols) = explicit {
         return Ok(cols.clone());
+    }
+    // A query-source COPY (`COPY (SELECT ...) TO ...`) has no named table; the
+    // output columns come from the query result instead.
+    if table.is_empty() {
+        return Ok(Vec::new());
     }
     let names = |db: &Database| {
         db.table(table)
@@ -546,43 +680,86 @@ fn copy_to_stdout<W: Write>(
     delimiter: char,
     null_marker: &str,
 ) -> io::Result<Result<(), String>> {
-    // Reuse the SELECT path so transaction visibility and projection are exact.
-    let col_list = columns
-        .iter()
-        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("SELECT {col_list} FROM {}", copy.table);
-    let stmt = match Parser::parse_sql(&sql) {
-        Ok(mut s) if !s.is_empty() => s.remove(0),
-        Ok(_) => return Ok(Err("COPY TO produced no query".into())),
+    let (fields, rows) = match copy_to_rows(shared, session, copy, columns) {
+        Ok(v) => v,
         Err(e) => return Ok(Err(e)),
     };
-    let rows = match run_statement(shared, session, &stmt) {
-        Ok(ExecResult::Rows { rows, .. }) => rows,
-        Ok(_) => return Ok(Err("COPY TO source did not return rows".into())),
-        Err(e) => return Ok(Err(e)),
-    };
+    let binary = copy.format == CopyFormat::Binary;
 
-    // CopyOutResponse: text format (0), one format code per column.
+    // CopyOutResponse: overall format (0 text, 1 binary), one code per column.
     let mut hdr = MessageBuilder::new(b'H');
-    hdr.put_u8(0);
-    hdr.put_i16(columns.len() as i16);
-    for _ in columns {
-        hdr.put_i16(0);
+    hdr.put_u8(if binary { 1 } else { 0 });
+    hdr.put_i16(fields.len() as i16);
+    for _ in &fields {
+        hdr.put_i16(if binary { 1 } else { 0 });
     }
     w.write_all(&hdr.finish())?;
 
-    let csv = copy.format == CopyFormat::Csv;
-    if copy.header && csv {
-        let line = columns
+    let payload = encode_copy_payload(&fields, &rows, copy, delimiter, null_marker);
+    // Stream the formatted bytes as a single CopyData message.
+    let mut d = MessageBuilder::new(b'd');
+    d.put_bytes(&payload);
+    w.write_all(&d.finish())?;
+
+    send_simple(w, b'c')?; // CopyDone
+    send_command_complete(w, &format!("COPY {}", rows.len()))?;
+    Ok(Ok(()))
+}
+
+/// Run the source query of a `COPY ... TO` (a table scan or an explicit
+/// `(SELECT ...)`), returning the result fields (with types, for binary
+/// encoding) and rows. Reuses the SELECT path for exact transaction visibility.
+fn copy_to_rows(
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+    columns: &[String],
+) -> Result<(Vec<FieldDescription>, Vec<Vec<Value>>), String> {
+    let stmt = if let Some(query) = &copy.query {
+        Statement::Select((**query).clone())
+    } else {
+        let col_list = columns
             .iter()
-            .map(|c| encode_copy_field(Some(c), delimiter, null_marker, csv))
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {col_list} FROM {}", copy.table);
+        match Parser::parse_sql(&sql) {
+            Ok(mut s) if !s.is_empty() => s.remove(0),
+            Ok(_) => return Err("COPY TO produced no query".into()),
+            Err(e) => return Err(e),
+        }
+    };
+    match run_statement(shared, session, &stmt) {
+        Ok(ExecResult::Rows { fields, rows, .. }) => Ok((fields, rows)),
+        Ok(_) => Err("COPY TO source did not return rows".into()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Format COPY output rows into the wire payload bytes for the chosen format.
+fn encode_copy_payload(
+    fields: &[FieldDescription],
+    rows: &[Vec<Value>],
+    copy: &CopyStmt,
+    delimiter: char,
+    null_marker: &str,
+) -> Vec<u8> {
+    if copy.format == CopyFormat::Binary {
+        return encode_copy_binary(fields, rows);
+    }
+    let csv = copy.format == CopyFormat::Csv;
+    let mut out = String::new();
+    if copy.header && csv {
+        let line = fields
+            .iter()
+            .map(|f| encode_copy_field(Some(&f.name), delimiter, null_marker, csv))
             .collect::<Vec<_>>()
             .join(&delimiter.to_string());
-        send_copy_data(w, &format!("{line}\n"))?;
+        out.push_str(&line);
+        out.push('\n');
     }
-    for row in &rows {
+    for row in rows {
         let line = row
             .iter()
             .map(|v| {
@@ -591,11 +768,10 @@ fn copy_to_stdout<W: Write>(
             })
             .collect::<Vec<_>>()
             .join(&delimiter.to_string());
-        send_copy_data(w, &format!("{line}\n"))?;
+        out.push_str(&line);
+        out.push('\n');
     }
-    send_simple(w, b'c')?; // CopyDone
-    send_command_complete(w, &format!("COPY {}", rows.len()))?;
-    Ok(Ok(()))
+    out.into_bytes()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -631,7 +807,10 @@ fn copy_from_stdin<R: Read, W: Write>(
             Some(FrontendMessage::Flush) => {}
             // A clean EOF or Terminate mid-COPY ends the connection.
             None | Some(FrontendMessage::Terminate) => {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "COPY interrupted"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "COPY interrupted",
+                ));
             }
             Some(_) => {
                 return Ok(Err("unexpected message during COPY FROM STDIN".into()));
@@ -639,37 +818,66 @@ fn copy_from_stdin<R: Read, W: Write>(
         }
     }
 
-    let text = String::from_utf8_lossy(&buf);
-    let csv = copy.format == CopyFormat::Csv;
-    let mut count: usize = 0;
-    let mut first = true;
-    for raw_line in text.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        // Text-format end-of-data marker.
-        if !csv && line == "\\." {
-            break;
-        }
-        // A trailing newline yields one empty final segment; skip it.
-        if line.is_empty() && raw_line.is_empty() {
-            continue;
-        }
-        if first && copy.header {
-            first = false;
-            continue;
-        }
-        first = false;
+    let count = match copy_from_bytes(shared, session, copy, columns, delimiter, null_marker, &buf) {
+        Ok(n) => n,
+        Err(e) => return Ok(Err(e)),
+    };
 
-        let fields = if csv {
-            parse_csv_line(line, delimiter, null_marker)
-        } else {
-            parse_text_line(line, delimiter, null_marker)
-        };
-        let stmt = Statement::Insert(Insert {
-            table: copy.table.clone(),
-            columns: copy.columns.clone(),
-            default_values: false,
-            overriding_system_value: false,
-            rows: vec![
+    send_command_complete(w, &format!("COPY {count}"))?;
+    Ok(Ok(()))
+}
+
+/// Parse a complete COPY-FROM payload (text/CSV/binary) and bulk-insert the
+/// rows, returning the row count.
+///
+/// Bulk optimization: all rows are parsed into one tuple list and inserted via a
+/// single multi-row `INSERT` statement. The executor's insert path reserves
+/// capacity and appends in one loop (see `exec_insert`), so the whole batch is
+/// planned once rather than re-parsing/re-planning per row, and it is WAL-logged
+/// as one statement carrying the literal data (durable independent of the
+/// source file).
+fn copy_from_bytes(
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+    columns: &[String],
+    delimiter: char,
+    null_marker: &str,
+    buf: &[u8],
+) -> Result<usize, String> {
+    let rows: Vec<Vec<Expr>> = if copy.format == CopyFormat::Binary {
+        let types = copy_column_types(shared, session, &copy.table, columns)?;
+        decode_copy_binary(buf, &types)?
+            .into_iter()
+            .map(|row| row.into_iter().map(value_to_expr).collect())
+            .collect()
+    } else {
+        let csv = copy.format == CopyFormat::Csv;
+        let text = String::from_utf8_lossy(buf);
+        let mut rows = Vec::new();
+        let mut first = true;
+        for raw_line in text.split('\n') {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            // Text-format end-of-data marker.
+            if !csv && line == "\\." {
+                break;
+            }
+            // A trailing newline yields one empty final segment; skip it.
+            if line.is_empty() && raw_line.is_empty() {
+                continue;
+            }
+            if first && copy.header {
+                first = false;
+                continue;
+            }
+            first = false;
+
+            let fields = if csv {
+                parse_csv_line(line, delimiter, null_marker)
+            } else {
+                parse_text_line(line, delimiter, null_marker)
+            };
+            rows.push(
                 fields
                     .into_iter()
                     .map(|f| match f {
@@ -677,26 +885,38 @@ fn copy_from_stdin<R: Read, W: Write>(
                         None => Expr::Null,
                     })
                     .collect(),
-            ],
-            select: None,
-            on_conflict: None,
-            returning: Vec::new(),
-        });
-        if let Err(e) = run_statement(shared, session, &stmt) {
-            return Ok(Err(e));
+            );
         }
-        count += 1;
-    }
+        rows
+    };
 
-    send_command_complete(w, &format!("COPY {count}"))?;
-    Ok(Ok(()))
+    let count = rows.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let stmt = Statement::Insert(Insert {
+        table: copy.table.clone(),
+        columns: copy.columns.clone(),
+        default_values: false,
+        overriding_system_value: false,
+        rows,
+        select: None,
+        on_conflict: None,
+        returning: Vec::new(),
+    });
+    run_statement(shared, session, &stmt)?;
+    Ok(count)
 }
 
-/// Send one CopyData (`'d'`) message carrying a formatted row.
-fn send_copy_data<W: Write>(w: &mut W, line: &str) -> io::Result<()> {
-    let mut b = MessageBuilder::new(b'd');
-    b.put_bytes(line.as_bytes());
-    w.write_all(&b.finish())
+/// Turn a decoded [`Value`] into a literal [`Expr`] for the insert path.
+fn value_to_expr(v: Value) -> Expr {
+    match v {
+        Value::Null => Expr::Null,
+        Value::Int(i) => Expr::Int(i),
+        Value::Float(f) => Expr::Float(f),
+        Value::Text(s) => Expr::Str(s),
+        Value::Bool(b) => Expr::Bool(b),
+    }
 }
 
 /// Format one output field for COPY (text or CSV).
@@ -792,6 +1012,192 @@ fn finish_csv_field(value: &str, was_quoted: bool, null_marker: &str) -> Option<
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+// --- COPY binary format -------------------------------------------------------
+
+/// The 11-byte PostgreSQL COPY binary signature.
+const COPY_BINARY_SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
+
+/// Encode COPY rows into the PostgreSQL binary format. Per-field encoding
+/// matches the wire DataRow binary encoding (`encode_value` with format=1).
+fn encode_copy_binary(fields: &[FieldDescription], rows: &[Vec<Value>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(19 + rows.len() * (2 + fields.len() * 8));
+    out.extend_from_slice(COPY_BINARY_SIGNATURE);
+    out.extend_from_slice(&0i32.to_be_bytes()); // flags
+    out.extend_from_slice(&0i32.to_be_bytes()); // header extension length
+    for row in rows {
+        out.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        for (i, val) in row.iter().enumerate() {
+            let dt = fields.get(i).map(|f| f.data_type).unwrap_or(DataType::Text);
+            match encode_value(val, dt, 1) {
+                Some(bytes) => {
+                    out.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()), // NULL
+            }
+        }
+    }
+    out.extend_from_slice(&(-1i16).to_be_bytes()); // trailer
+    out
+}
+
+/// Decode a PostgreSQL binary COPY stream into rows of [`Value`], interpreting
+/// each field per the target column's [`DataType`] (the inverse of
+/// [`encode_copy_binary`]; mirrors `bind::decode_binary`).
+fn decode_copy_binary(buf: &[u8], types: &[DataType]) -> Result<Vec<Vec<Value>>, String> {
+    let mut pos = 0usize;
+    let need = |pos: usize, n: usize| -> Result<(), String> {
+        if pos + n > buf.len() {
+            Err("malformed binary COPY data: unexpected end of stream".into())
+        } else {
+            Ok(())
+        }
+    };
+    need(pos, COPY_BINARY_SIGNATURE.len())?;
+    if &buf[..COPY_BINARY_SIGNATURE.len()] != COPY_BINARY_SIGNATURE {
+        return Err("invalid binary COPY signature".into());
+    }
+    pos += COPY_BINARY_SIGNATURE.len();
+    need(pos, 8)?; // flags + header extension length
+    let ext_len = i32::from_be_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
+    pos += 8;
+    if ext_len < 0 {
+        return Err("invalid binary COPY header extension length".into());
+    }
+    pos += ext_len as usize;
+
+    let mut rows = Vec::new();
+    loop {
+        need(pos, 2)?;
+        let field_count = i16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
+        pos += 2;
+        if field_count == -1 {
+            break; // trailer
+        }
+        let field_count = field_count as usize;
+        let mut row = Vec::with_capacity(field_count);
+        for i in 0..field_count {
+            need(pos, 4)?;
+            let len = i32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            if len == -1 {
+                row.push(Value::Null);
+                continue;
+            }
+            let len = len as usize;
+            need(pos, len)?;
+            let bytes = &buf[pos..pos + len];
+            pos += len;
+            let dt = types.get(i).copied().unwrap_or(DataType::Text);
+            row.push(decode_binary_value(bytes, dt)?);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Decode one COPY-binary field according to its column type (inverse of
+/// `encode_value` in binary mode).
+fn decode_binary_value(bytes: &[u8], dt: DataType) -> Result<Value, String> {
+    let bad = |t: &str| format!("invalid binary length for {t}");
+    Ok(match dt {
+        DataType::Bool => Value::Bool(bytes.first().copied().unwrap_or(0) != 0),
+        DataType::Int2 => {
+            let b: [u8; 2] = bytes.try_into().map_err(|_| bad("int2"))?;
+            Value::Int(i16::from_be_bytes(b) as i64)
+        }
+        DataType::Int4 => {
+            let b: [u8; 4] = bytes.try_into().map_err(|_| bad("int4"))?;
+            Value::Int(i32::from_be_bytes(b) as i64)
+        }
+        DataType::Int8 => {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| bad("int8"))?;
+            Value::Int(i64::from_be_bytes(b))
+        }
+        DataType::Float4 => {
+            let b: [u8; 4] = bytes.try_into().map_err(|_| bad("float4"))?;
+            Value::Float(f32::from_be_bytes(b) as f64)
+        }
+        DataType::Float8 => {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| bad("float8"))?;
+            Value::Float(f64::from_be_bytes(b))
+        }
+        // All other types are encoded as their UTF-8 text form.
+        _ => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
+    })
+}
+
+/// Resolve the [`DataType`] of each COPY column (in COPY order) for binary
+/// decoding. Honors the current transaction's working copy when present.
+fn copy_column_types(
+    shared: &Shared,
+    session: &Session,
+    table: &str,
+    columns: &[String],
+) -> Result<Vec<DataType>, String> {
+    let lookup = |db: &Database| -> Result<Vec<DataType>, String> {
+        let t = db
+            .table(table)
+            .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
+        columns
+            .iter()
+            .map(|name| {
+                t.columns
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .map(|c| c.data_type)
+                    .ok_or_else(|| {
+                        format!("column \"{name}\" of relation \"{table}\" does not exist")
+                    })
+            })
+            .collect()
+    };
+    match &session.tx {
+        Some(tx) => lookup(&tx.db),
+        None => lookup(&shared.db.lock().expect("db mutex poisoned")),
+    }
+}
+
+// --- COPY to/from a server-side file -----------------------------------------
+
+/// Execute a `COPY ... FROM/TO '<path>'` entirely server-side via `std::fs`.
+///
+/// `COPY TO file` is read-only: it runs the source query and writes the
+/// formatted bytes to the file. `COPY FROM file` reads + parses the file and
+/// bulk-inserts the rows through the ordinary insert path (so constraints,
+/// indexes, triggers, transaction visibility and WAL logging all apply — the
+/// WAL records the resulting INSERT, not the file path, so replay is durable
+/// even if the source file later changes or disappears).
+fn run_copy_file(
+    shared: &Shared,
+    session: &mut Session,
+    copy: &CopyStmt,
+) -> Result<ExecResult, String> {
+    let CopyTarget::File(path) = &copy.target else {
+        return Err("COPY STDIN/STDOUT must use the COPY sub-protocol".into());
+    };
+    let columns = copy_columns(shared, session, &copy.table, copy.columns.as_ref())?;
+    let delimiter = copy_delimiter(copy);
+    let null_marker = copy_null_marker(copy);
+
+    match copy.direction {
+        CopyDirection::To => {
+            let (fields, rows) = copy_to_rows(shared, session, copy, &columns)?;
+            let payload = encode_copy_payload(&fields, &rows, copy, delimiter, &null_marker);
+            std::fs::write(path, &payload)
+                .map_err(|e| format!("could not write COPY destination \"{path}\": {e}"))?;
+            Ok(ExecResult::Command(format!("COPY {}", rows.len())))
+        }
+        CopyDirection::From => {
+            let buf = std::fs::read(path)
+                .map_err(|e| format!("could not read COPY source \"{path}\": {e}"))?;
+            let count =
+                copy_from_bytes(shared, session, copy, &columns, delimiter, &null_marker, &buf)?;
+            Ok(ExecResult::Command(format!("COPY {count}")))
+        }
     }
 }
 
@@ -964,7 +1370,7 @@ fn handle_execute<W: Write>(
             session.skip_until_sync = true;
             return Ok(());
         }
-        let result = run_statement(shared, session, stmt);
+        let result = run_statement_timed(shared, session, stmt);
         match result {
             Ok(res) => {
                 flush_notices(w, session)?;
@@ -980,6 +1386,77 @@ fn handle_execute<W: Write>(
         }
     }
     Ok(())
+}
+
+/// Read an integer-valued GUC (e.g. `statement_timeout`) from the session's
+/// effective database (the transaction working copy when in a transaction, else
+/// the shared database). Returns `0` (disabled) when unset or unparsable.
+fn current_guc_ms(shared: &Shared, session: &Session, name: &str) -> u64 {
+    let value = match &session.tx {
+        Some(tx) => tx.db.guc(name),
+        None => shared.db.lock().expect("db mutex poisoned").guc(name),
+    };
+    value
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms as u64)
+        .unwrap_or(0)
+}
+
+/// Run a statement, enforcing `statement_timeout` (in ms) if set.
+///
+/// Because this engine executes statements synchronously while holding the data
+/// lock, there is no way to interrupt arbitrary work mid-execution. We
+/// approximate the timeout with a watchdog thread that, after the deadline, sets
+/// the connection's cancel flag; the executor's cooperative `check_canceled`
+/// points then abort the work. Statements that never poll cancellation (most of
+/// ours run to completion quickly) are therefore checked at completion: if the
+/// watchdog fired, the result is discarded and a `57014` timeout error is
+/// returned. The watchdog is always torn down before this function returns, so
+/// it can never affect a later statement.
+fn run_statement_timed(
+    shared: &Shared,
+    session: &mut Session,
+    stmt: &Statement,
+) -> Result<ExecResult, String> {
+    let timeout_ms = current_guc_ms(shared, session, "statement_timeout");
+    if timeout_ms == 0 {
+        return run_statement(shared, session, stmt);
+    }
+
+    // `done` lets us stop the watchdog promptly once the statement finishes.
+    let done = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::clone(&session.cancel);
+    let watch_done = Arc::clone(&done);
+    let watch_fired = Arc::clone(&fired);
+    let watchdog = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        // Poll the done flag so we wake up soon after the statement finishes
+        // instead of always sleeping the full timeout.
+        while Instant::now() < deadline {
+            if watch_done.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5).min(deadline - Instant::now()));
+        }
+        if !watch_done.load(Ordering::SeqCst) {
+            watch_fired.store(true, Ordering::SeqCst);
+            cancel.store(true, Ordering::SeqCst);
+        }
+    });
+
+    let result = run_statement(shared, session, stmt);
+
+    // Tear down the watchdog and clear any cancel flag it may have set so a
+    // later statement is not spuriously canceled.
+    done.store(true, Ordering::SeqCst);
+    let _ = watchdog.join();
+    if fired.load(Ordering::SeqCst) {
+        session.cancel.store(false, Ordering::SeqCst);
+        return Err("canceling statement due to statement timeout".to_string());
+    }
+    result
 }
 
 // --- execution + transactions + durability -----------------------------------
@@ -998,14 +1475,38 @@ fn run_statement(
     stmt: &Statement,
 ) -> Result<ExecResult, String> {
     match stmt {
-        Statement::Begin => {
+        Statement::Begin {
+            isolation,
+            read_only,
+        } => {
             if session.tx.is_none() {
-                let snapshot = shared.db.lock().expect("db mutex poisoned").clone();
+                // Snapshot the shared db AND its commit version atomically under
+                // the same lock so the recorded snapshot version always matches
+                // the cloned state (no commit can slip in between).
+                let (snapshot, snapshot_version) = {
+                    let db = shared.db.lock().expect("db mutex poisoned");
+                    (db.clone(), db.commit_version())
+                };
+                let level = isolation.unwrap_or(session.default_isolation);
+                let ro = read_only.unwrap_or(session.default_read_only);
+                // Reflect the resolved level in the working copy's GUC so
+                // `SHOW transaction_isolation` inside the tx is accurate.
+                let mut snapshot = snapshot;
+                snapshot
+                    .set_system_setting("transaction_isolation".into(), level.guc_value().into());
+                snapshot.set_system_setting(
+                    "transaction_read_only".into(),
+                    if ro { "on".into() } else { "off".into() },
+                );
                 session.tx = Some(Transaction {
                     db: snapshot,
                     buffered: Vec::new(),
                     savepoints: Vec::new(),
                     failed: false,
+                    isolation: level,
+                    read_only: ro,
+                    snapshot_version,
+                    write_set: HashSet::new(),
                 });
                 session.tx_status = b'T';
             } else {
@@ -1017,6 +1518,47 @@ fn run_statement(
                 });
             }
             Ok(ExecResult::Command("BEGIN".into()))
+        }
+        Statement::SetTransaction {
+            isolation,
+            read_only,
+            session: is_session,
+        } => {
+            if *is_session {
+                // Change the session default for subsequent transactions.
+                if let Some(level) = isolation {
+                    session.default_isolation = *level;
+                }
+                if let Some(ro) = read_only {
+                    session.default_read_only = *ro;
+                }
+            } else if let Some(tx) = session.tx.as_mut() {
+                // `SET TRANSACTION` adjusts the current transaction.
+                if let Some(level) = isolation {
+                    tx.isolation = *level;
+                    tx.db.set_system_setting(
+                        "transaction_isolation".into(),
+                        level.guc_value().into(),
+                    );
+                }
+                if let Some(ro) = read_only {
+                    tx.read_only = *ro;
+                    tx.db.set_system_setting(
+                        "transaction_read_only".into(),
+                        if *ro { "on".into() } else { "off".into() },
+                    );
+                }
+            } else {
+                // `SET TRANSACTION` outside a transaction block is an error in
+                // PostgreSQL, but be lenient: treat as setting the next tx.
+                if let Some(level) = isolation {
+                    session.default_isolation = *level;
+                }
+                if let Some(ro) = read_only {
+                    session.default_read_only = *ro;
+                }
+            }
+            Ok(ExecResult::Command("SET".into()))
         }
         Statement::Listen { channel } => {
             let mut listeners = shared.listeners.lock().expect("listeners mutex");
@@ -1068,8 +1610,30 @@ fn run_statement(
                 Ok(ExecResult::Command("ROLLBACK".into()))
             }
             Some(tx) => {
-                // Publish the working copy, then durably log the mutations.
-                *shared.db.lock().expect("db mutex poisoned") = tx.db;
+                let mut shared_db = shared.db.lock().expect("db mutex poisoned");
+                // Optimistic write-write conflict detection. Under REPEATABLE
+                // READ / SERIALIZABLE, abort if any table this transaction wrote
+                // was modified by another committed transaction after our
+                // snapshot. Under READ (UN)COMMITTED we keep last-write-wins.
+                let serializing = matches!(
+                    tx.isolation,
+                    IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+                );
+                if serializing
+                    && shared_db.has_conflicting_commit(&tx.write_set, tx.snapshot_version)
+                {
+                    drop(shared_db);
+                    session.tx_status = b'I';
+                    return Err("could not serialize access due to concurrent update".to_string());
+                }
+                // Carry forward the new commit version + table stamps into the
+                // working copy before it becomes the shared database (clone
+                // dropped that bookkeeping field's prior shared state otherwise).
+                let mut working = tx.db;
+                working.adopt_commit_state(&shared_db);
+                working.record_commit(&tx.write_set);
+                *shared_db = working;
+                drop(shared_db);
                 if let Some(wal) = shared.wal.lock().expect("wal mutex poisoned").as_mut() {
                     for sql in &tx.buffered {
                         if let Err(e) = wal.append(sql) {
@@ -1100,6 +1664,62 @@ fn run_statement(
             session.tx_status = b'I';
             Ok(ExecResult::Command("ROLLBACK".into()))
         }
+        Statement::PrepareTransaction { gid } => match session.tx.take() {
+            Some(tx) if tx.failed => {
+                session.tx_status = b'I';
+                Err("current transaction is aborted, commands ignored until end of transaction block".into())
+            }
+            Some(tx) => {
+                // Simplest correct 2PC: commit the buffered work now (publish +
+                // WAL), and remember the gid so COMMIT/ROLLBACK PREPARED accept it.
+                let mut shared_db = shared.db.lock().expect("db mutex poisoned");
+                let serializing = matches!(
+                    tx.isolation,
+                    IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+                );
+                if serializing
+                    && shared_db.has_conflicting_commit(&tx.write_set, tx.snapshot_version)
+                {
+                    drop(shared_db);
+                    session.tx_status = b'I';
+                    return Err("could not serialize access due to concurrent update".to_string());
+                }
+                let mut working = tx.db;
+                working.adopt_commit_state(&shared_db);
+                working.record_commit(&tx.write_set);
+                *shared_db = working;
+                drop(shared_db);
+                if let Some(wal) = shared.wal.lock().expect("wal mutex poisoned").as_mut() {
+                    for sql in &tx.buffered {
+                        if let Err(e) = wal.append(sql) {
+                            eprintln!("warning: WAL append failed: {e}");
+                        }
+                    }
+                }
+                session.prepared_gids.insert(gid.clone());
+                session.tx_status = b'I';
+                Ok(ExecResult::Command("PREPARE TRANSACTION".into()))
+            }
+            None => Err("PREPARE TRANSACTION can only be used in transaction blocks".into()),
+        },
+        Statement::CommitPrepared { gid } => {
+            if session.prepared_gids.remove(gid) {
+                Ok(ExecResult::Command("COMMIT PREPARED".into()))
+            } else {
+                Err(format!(
+                    "prepared transaction with identifier \"{gid}\" does not exist"
+                ))
+            }
+        }
+        Statement::RollbackPrepared { gid } => {
+            if session.prepared_gids.remove(gid) {
+                Ok(ExecResult::Command("ROLLBACK PREPARED".into()))
+            } else {
+                Err(format!(
+                    "prepared transaction with identifier \"{gid}\" does not exist"
+                ))
+            }
+        }
         Statement::Savepoint { name } => {
             let tx = session
                 .tx
@@ -1110,6 +1730,7 @@ fn run_statement(
                 name: name.clone(),
                 db: tx.db.clone(),
                 buffered_len: tx.buffered.len(),
+                write_set: tx.write_set.clone(),
             });
             Ok(ExecResult::Command("SAVEPOINT".into()))
         }
@@ -1137,11 +1758,15 @@ fn run_statement(
             let sp = &tx.savepoints[pos];
             tx.db = sp.db.clone();
             tx.buffered.truncate(sp.buffered_len);
+            tx.write_set = sp.write_set.clone();
             tx.savepoints.truncate(pos + 1);
             tx.failed = false;
             session.tx_status = b'T';
             Ok(ExecResult::Command("ROLLBACK".into()))
         }
+        // Server-side file COPY (`FROM/TO '<path>'`). STDIN/STDOUT forms are
+        // handled by the COPY sub-protocol before reaching here.
+        Statement::Copy(copy) => run_copy_file(shared, session, copy),
         _ if session.tx.is_some() => {
             // Run against the transaction's working copy.
             let res = {
@@ -1151,10 +1776,21 @@ fn run_statement(
                         "current transaction is aborted, commands ignored until end of transaction block".into(),
                     );
                 }
+                // A READ ONLY transaction rejects data-changing statements.
+                if tx.read_only && is_data_mutation(stmt) {
+                    tx.failed = true;
+                    session.tx_status = b'E';
+                    return Err("cannot execute statement in a read-only transaction".into());
+                }
                 let res = executor::execute(&mut tx.db, stmt.clone());
                 match &res {
                     Ok(_) if is_mutation(stmt) => {
                         tx.buffered.push(serialize::statement_to_sql(stmt));
+                        // Record the mutated table(s) into the write set for
+                        // optimistic conflict detection at COMMIT.
+                        for table in mutated_tables(stmt) {
+                            tx.write_set.insert(table);
+                        }
                     }
                     Err(_) => tx.failed = true,
                     _ => {}
@@ -1223,6 +1859,41 @@ fn replay(db: &mut Database, contents: &str) -> usize {
     applied
 }
 
+/// Whether a statement changes table *data* (DML), used both for write-set
+/// tracking and to reject writes in a READ ONLY transaction. DDL is excluded
+/// (PostgreSQL also rejects DDL in read-only transactions, but our optimistic
+/// conflict model only meaningfully tracks data tables).
+fn is_data_mutation(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_)
+            | Statement::Truncate(_)
+    )
+}
+
+/// The table name(s) a mutating statement writes, for the transaction write set.
+/// DDL that targets a specific table is included so e.g. a concurrent
+/// `ALTER TABLE`/`DROP TABLE` of a written table is also caught.
+fn mutated_tables(stmt: &Statement) -> Vec<String> {
+    match stmt {
+        Statement::Insert(i) => vec![i.table.clone()],
+        Statement::Update(u) => vec![u.table.clone()],
+        Statement::Delete(d) => vec![d.table.clone()],
+        Statement::Merge(m) => vec![m.target.clone()],
+        Statement::Truncate(t) => t.tables.clone(),
+        Statement::AlterTable(a) => vec![a.table.clone()],
+        Statement::CreatePolicy(c) => vec![c.table.clone()],
+        Statement::AlterPolicy(a) => vec![a.table.clone()],
+        Statement::DropPolicy(d) => vec![d.table.clone()],
+        Statement::DropTable(d) => vec![d.name.clone()],
+        Statement::Explain(e) if e.analyze => mutated_tables(&e.statement),
+        _ => Vec::new(),
+    }
+}
+
 /// Whether a statement changes persistent state and must be logged.
 fn is_mutation(stmt: &Statement) -> bool {
     match stmt {
@@ -1260,6 +1931,9 @@ fn is_mutation(stmt: &Statement) -> bool {
         | Statement::DropMaterializedView(_)
         | Statement::RefreshMaterializedView(_)
         | Statement::AlterTable(_)
+        | Statement::CreatePolicy(_)
+        | Statement::AlterPolicy(_)
+        | Statement::DropPolicy(_)
         | Statement::AlterRole(_)
         | Statement::AlterSequence(_)
         | Statement::SecurityLabel(_)
@@ -1274,6 +1948,8 @@ fn is_mutation(stmt: &Statement) -> bool {
         | Statement::AlterDatabase(_)
         | Statement::Update(_)
         | Statement::Delete(_)
+        | Statement::CreateCatalogObject(_)
+        | Statement::DropCatalogObject(_)
         | Statement::Merge(_) => true,
         Statement::Explain(e) if e.analyze => is_mutation(&e.statement),
         _ => false,
@@ -1415,32 +2091,87 @@ fn send_authentication_ok<W: Write>(w: &mut W) -> io::Result<()> {
 /// - `password`: AuthenticationCleartextPassword, compare to `PGRS_PASSWORD`.
 /// - `md5`:      AuthenticationMD5Password, compare the salted MD5 digest.
 /// - `scram`:    SCRAM-SHA-256 against `PGRS_PASSWORD`.
+/// The result of authenticating a connection.
+enum AuthOutcome {
+    /// The client is authenticated (or trusted).
+    Ok,
+    /// The client failed the password challenge.
+    Failed,
+    /// An HBA `reject` rule (or no matching rule) refused the connection.
+    Rejected,
+}
+
 fn authenticate<R: io::Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     username: &str,
-) -> io::Result<bool> {
+    database: &str,
+    peer_ip: &str,
+) -> io::Result<AuthOutcome> {
+    let password = std::env::var("PGRS_PASSWORD").ok().unwrap_or_default();
+
+    // pg_hba.conf-style rules take precedence when configured. The first rule
+    // matching (database, user, address) selects the method.
+    if let Some(config) = load_hba_config() {
+        return match config.match_method(database, username, peer_ip) {
+            Some(HbaMethod::Trust) => Ok(AuthOutcome::Ok),
+            Some(HbaMethod::Reject) | None => Ok(AuthOutcome::Rejected),
+            Some(HbaMethod::Password) => {
+                Ok(bool_outcome(cleartext_authenticate(reader, writer, &password)?))
+            }
+            Some(HbaMethod::Md5) => {
+                Ok(bool_outcome(md5_authenticate(reader, writer, &password, username)?))
+            }
+            Some(HbaMethod::ScramSha256) => {
+                Ok(bool_outcome(scram_authenticate(reader, writer, &password)?))
+            }
+        };
+    }
+
     let method = std::env::var("PGRS_AUTH_METHOD")
         .ok()
         .filter(|m| !m.is_empty());
-    let password = std::env::var("PGRS_PASSWORD").ok().unwrap_or_default();
 
-    match method.as_deref() {
+    let ok = match method.as_deref() {
         // Legacy default: SCRAM when a password is configured, else trust.
         None => {
             if !password.is_empty() {
-                scram_authenticate(reader, writer, &password)
+                scram_authenticate(reader, writer, &password)?
             } else {
-                Ok(true)
+                true
             }
         }
-        Some("trust") => Ok(true),
-        Some("password") => cleartext_authenticate(reader, writer, &password),
-        Some("md5") => md5_authenticate(reader, writer, &password, username),
-        Some("scram") => scram_authenticate(reader, writer, &password),
+        Some("trust") => true,
+        Some("password") => cleartext_authenticate(reader, writer, &password)?,
+        Some("md5") => md5_authenticate(reader, writer, &password, username)?,
+        Some("scram") => scram_authenticate(reader, writer, &password)?,
         // An unrecognized value is treated as trust rather than locking out.
-        Some(_) => Ok(true),
+        Some(_) => true,
+    };
+    Ok(bool_outcome(ok))
+}
+
+fn bool_outcome(ok: bool) -> AuthOutcome {
+    if ok {
+        AuthOutcome::Ok
+    } else {
+        AuthOutcome::Failed
     }
+}
+
+/// Load HBA rules from `PGRS_HBA` (a file path) or `PGRS_HBA_RULES` (inline
+/// rules), or `None` when neither is set (keep the legacy auth behavior).
+fn load_hba_config() -> Option<HbaConfig> {
+    if let Some(path) = std::env::var("PGRS_HBA").ok().filter(|p| !p.is_empty()) {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        return Some(HbaConfig::parse(&text));
+    }
+    if let Some(rules) = std::env::var("PGRS_HBA_RULES").ok().filter(|r| !r.is_empty()) {
+        // Allow `;`-separated inline rules in addition to newlines.
+        let normalized = rules.replace(';', "\n");
+        return Some(HbaConfig::parse(&normalized));
+    }
+    None
 }
 
 /// Run a cleartext password exchange (AuthenticationCleartextPassword, code 3).
@@ -1655,6 +2386,10 @@ fn sqlstate_for(msg: &str) -> &'static str {
         "22P02"
     } else if msg.contains("canceling statement") {
         "57014" // query_canceled
+    } else if msg.contains("could not serialize access") {
+        "40001" // serialization_failure
+    } else if msg.contains("read-only transaction") {
+        "25006" // read_only_sql_transaction
     } else {
         "XX000" // internal_error
     }
@@ -1685,7 +2420,11 @@ mod tests {
 
     /// A bare session with dummy cancellation/notification handles.
     fn new_session() -> Session {
-        Session::new(1, Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())))
+        Session::new(
+            1,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
     }
 
     fn run(shared: &Shared, session: &mut Session, sql: &str) -> Result<(), String> {
@@ -1707,6 +2446,121 @@ mod tests {
             .table("t")
             .map(|t| t.rows.len())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn statement_timeout_guc_is_read_from_db() {
+        let s = shared();
+        let mut sess = new_session();
+        // Unset -> disabled (0).
+        assert_eq!(current_guc_ms(&s, &sess, "statement_timeout"), 0);
+        // Set on the shared (autocommit) database.
+        run(&s, &mut sess, "SET statement_timeout = '2500'").unwrap();
+        assert_eq!(current_guc_ms(&s, &sess, "statement_timeout"), 2500);
+        // RESET disables it again.
+        run(&s, &mut sess, "RESET statement_timeout").unwrap();
+        assert_eq!(current_guc_ms(&s, &sess, "statement_timeout"), 0);
+    }
+
+    #[test]
+    fn statement_timeout_read_from_transaction_copy() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        // Set inside the transaction's working copy.
+        run(&s, &mut sess, "SET statement_timeout = '1000'").unwrap();
+        assert_eq!(current_guc_ms(&s, &sess, "statement_timeout"), 1000);
+        run(&s, &mut sess, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn run_statement_timed_passthrough_when_disabled() {
+        // With the timeout disabled, the timed wrapper behaves like run_statement.
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        let stmt = Parser::parse_sql("INSERT INTO t VALUES (1)")
+            .unwrap()
+            .remove(0);
+        assert!(run_statement_timed(&s, &mut sess, &stmt).is_ok());
+        // The cancel flag must remain clear (no watchdog ran).
+        assert!(!sess.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn statement_timeout_fires_and_reports_57014() {
+        // Deterministic firing without sleeping inside the statement itself: set
+        // a 1ms timeout *inside a transaction* (so the timeout is read from the
+        // transaction's working copy, taking no shared lock), then time a COMMIT
+        // while another thread holds the shared db lock past the deadline. COMMIT
+        // blocks on that lock, the watchdog fires, and the timed wrapper returns
+        // the timeout error mapped to 57014.
+        let s = Arc::new(shared());
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
+        // Stored in the transaction's working copy, readable without a lock.
+        run(&s, &mut sess, "SET statement_timeout = '1'").unwrap();
+        assert_eq!(current_guc_ms(&s, &sess, "statement_timeout"), 1);
+
+        let guard_shared = Arc::clone(&s);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hold = thread::spawn(move || {
+            let _db = guard_shared.db.lock().expect("db mutex");
+            tx.send(()).unwrap(); // signal: lock acquired
+            thread::sleep(Duration::from_millis(120));
+        });
+        // Wait until the holder actually owns the lock before timing the COMMIT.
+        rx.recv().unwrap();
+
+        let stmt = Parser::parse_sql("COMMIT").unwrap().remove(0);
+        let res = run_statement_timed(&s, &mut sess, &stmt);
+        hold.join().unwrap();
+
+        let err = match res {
+            Err(e) => e,
+            Ok(_) => panic!("statement should time out"),
+        };
+        assert_eq!(sqlstate_for(&err), "57014");
+        // The watchdog's cancel flag was consumed, not left set.
+        assert!(!sess.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn idle_transaction_abort_resets_session() {
+        // Plumbing for idle_in_transaction_session_timeout: opening a transaction
+        // then aborting it (as the loop does when the timeout elapses) returns the
+        // session to idle and discards the working copy.
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(sess.tx_status, b'T');
+        sess.abort_idle_transaction();
+        assert_eq!(sess.tx_status, b'I');
+        assert!(sess.tx.is_none());
+        // The uncommitted row never reached the shared database.
+        assert_eq!(committed_rows(&s), 0);
+    }
+
+    #[test]
+    fn idle_in_transaction_timeout_guc_is_read() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "BEGIN").unwrap();
+        run(
+            &s,
+            &mut sess,
+            "SET idle_in_transaction_session_timeout = '500'",
+        )
+        .unwrap();
+        assert_eq!(
+            current_guc_ms(&s, &sess, "idle_in_transaction_session_timeout"),
+            500
+        );
+        run(&s, &mut sess, "ROLLBACK").unwrap();
     }
 
     #[test]
@@ -1769,6 +2623,171 @@ mod tests {
             }
         };
         assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+    }
+
+    /// Run a SELECT against the working copy of `sess`'s transaction (or the
+    /// shared db when idle) and return the integer rows of column 0.
+    fn select_ints(shared: &Shared, sess: &Session, sql: &str) -> Vec<i64> {
+        let stmt = Parser::parse_sql(sql).unwrap().remove(0);
+        let rows = match &sess.tx {
+            Some(tx) => {
+                let mut db = tx.db.clone();
+                executor::execute(&mut db, stmt).unwrap()
+            }
+            None => {
+                let mut db = shared.db.lock().unwrap();
+                executor::execute(&mut db, stmt).unwrap()
+            }
+        };
+        match rows {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Int(i) => i,
+                    _ => panic!("expected int"),
+                })
+                .collect(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    fn second_session() -> Session {
+        Session::new(
+            2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn repeatable_read_write_write_conflict_aborts_second_commit() {
+        // Two sessions both BEGIN REPEATABLE READ off the same snapshot and
+        // both update the same table. The first commit wins; the second commit
+        // must fail with a serialization error (no last-commit-wins for RR).
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut setup, "INSERT INTO t VALUES (1)").unwrap();
+
+        let mut a = new_session();
+        let mut b = second_session();
+        run(&s, &mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+        run(&s, &mut b, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+        run(&s, &mut a, "UPDATE t SET id = 10").unwrap();
+        run(&s, &mut b, "UPDATE t SET id = 20").unwrap();
+
+        run(&s, &mut a, "COMMIT").unwrap();
+        let commit_b = run_statement(&s, &mut b, &Parser::parse_sql("COMMIT").unwrap().remove(0));
+        let err = match commit_b {
+            Err(e) => e,
+            Ok(_) => panic!("second RR commit must conflict"),
+        };
+        assert_eq!(sqlstate_for(&err), "40001");
+        // b is rolled back; a's value stands.
+        assert_eq!(select_ints(&s, &b, "SELECT id FROM t"), vec![10]);
+    }
+
+    #[test]
+    fn read_committed_write_write_allows_second_commit() {
+        // Same scenario under READ COMMITTED: last-commit-wins is acceptable, so
+        // the second commit succeeds.
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut setup, "INSERT INTO t VALUES (1)").unwrap();
+
+        let mut a = new_session();
+        let mut b = second_session();
+        run(&s, &mut a, "BEGIN ISOLATION LEVEL READ COMMITTED").unwrap();
+        run(&s, &mut b, "BEGIN").unwrap(); // default is READ COMMITTED
+        run(&s, &mut a, "UPDATE t SET id = 10").unwrap();
+        run(&s, &mut b, "UPDATE t SET id = 20").unwrap();
+        run(&s, &mut a, "COMMIT").unwrap();
+        run(&s, &mut b, "COMMIT").unwrap();
+        // Last commit wins.
+        assert_eq!(
+            select_ints(&s, &new_session(), "SELECT id FROM t"),
+            vec![20]
+        );
+    }
+
+    #[test]
+    fn repeatable_read_reader_does_not_see_concurrent_commit() {
+        // A REPEATABLE READ transaction reads a stable snapshot: a concurrent
+        // committed INSERT from another session is invisible inside it.
+        let s = shared();
+        let mut setup = new_session();
+        run(&s, &mut setup, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut setup, "INSERT INTO t VALUES (1)").unwrap();
+
+        let mut reader = new_session();
+        run(&s, &mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap();
+        // Reader sees the one pre-existing row.
+        assert_eq!(
+            select_ints(&s, &reader, "SELECT id FROM t ORDER BY id"),
+            vec![1]
+        );
+
+        // Another session commits an insert.
+        let mut writer = second_session();
+        run(&s, &mut writer, "INSERT INTO t VALUES (2)").unwrap();
+        // It is visible in the shared db now...
+        assert_eq!(
+            select_ints(&s, &new_session(), "SELECT id FROM t ORDER BY id"),
+            vec![1, 2]
+        );
+        // ...but NOT inside the already-open repeatable-read transaction.
+        assert_eq!(
+            select_ints(&s, &reader, "SELECT id FROM t ORDER BY id"),
+            vec![1]
+        );
+        run(&s, &mut reader, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn show_transaction_isolation_reflects_level() {
+        let s = shared();
+        let mut sess = new_session();
+        // Inside a SERIALIZABLE transaction, SHOW reports it.
+        run(&s, &mut sess, "BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap();
+        let show = |sess: &Session| {
+            let stmt = Parser::parse_sql("SHOW transaction_isolation")
+                .unwrap()
+                .remove(0);
+            let db = sess.tx.as_ref().unwrap().db.clone();
+            let mut db = db;
+            match executor::execute(&mut db, stmt).unwrap() {
+                ExecResult::Rows { rows, .. } => match &rows[0][0] {
+                    Value::Text(t) => t.clone(),
+                    _ => panic!("expected text"),
+                },
+                _ => panic!("expected rows"),
+            }
+        };
+        assert_eq!(show(&sess), "serializable");
+        run(&s, &mut sess, "ROLLBACK").unwrap();
+
+        // READ UNCOMMITTED collapses to read committed.
+        run(&s, &mut sess, "BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap();
+        assert_eq!(show(&sess), "read committed");
+        run(&s, &mut sess, "ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn read_only_transaction_rejects_writes() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        run(&s, &mut sess, "BEGIN READ ONLY").unwrap();
+        let stmt = Parser::parse_sql("INSERT INTO t VALUES (1)")
+            .unwrap()
+            .remove(0);
+        let err = match run_statement(&s, &mut sess, &stmt) {
+            Err(e) => e,
+            Ok(_) => panic!("write must be rejected"),
+        };
+        assert_eq!(sqlstate_for(&err), "25006");
+        run(&s, &mut sess, "ROLLBACK").unwrap();
     }
 
     #[test]
@@ -1895,7 +2914,12 @@ mod tests {
         let s = shared();
         let mut sess = new_session();
         run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
-        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        run(
+            &s,
+            &mut sess,
+            "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob')",
+        )
+        .unwrap();
 
         let mut reader = std::io::Cursor::new(Vec::new());
         let mut out = Vec::new();
@@ -1908,6 +2932,234 @@ mod tests {
         assert!(window_contains(&out, b"1\tAlice"));
         assert!(window_contains(&out, b"2\tBob"));
         assert!(window_contains(&out, b"COPY 2"));
+    }
+
+    /// A unique temp path under the OS temp dir for file-COPY tests.
+    fn temp_copy_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::AtomicU64;
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("pgrs_copy_{tag}_{pid}_{n}.dat"))
+    }
+
+    /// Read back `t(id, name)` as (int, text) rows in id order.
+    fn select_id_name(shared: &Shared) -> Vec<(i64, Option<String>)> {
+        let mut db = shared.db.lock().unwrap();
+        let stmt = Parser::parse_sql("SELECT id, name FROM t ORDER BY id")
+            .unwrap()
+            .remove(0);
+        match executor::execute(&mut db, stmt).unwrap() {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| {
+                    let id = match r[0] {
+                        Value::Int(i) => i,
+                        _ => panic!("expected int id"),
+                    };
+                    let name = match &r[1] {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => panic!("expected text name, got {other:?}"),
+                    };
+                    (id, name)
+                })
+                .collect(),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn copy_to_file_then_from_file_round_trips() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, NULL)").unwrap();
+
+        let path = temp_copy_path("text");
+        let p = path.to_str().unwrap();
+
+        // COPY TO file (server-side, runs through the ordinary statement path).
+        run(&s, &mut sess, &format!("COPY t TO '{p}'")).unwrap();
+        assert!(path.exists(), "COPY TO did not create the file");
+
+        // Reload into a fresh table from the file.
+        run(&s, &mut sess, "DROP TABLE t").unwrap();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+        run(&s, &mut sess, &format!("COPY t FROM '{p}'")).unwrap();
+
+        assert_eq!(
+            select_id_name(&s),
+            vec![
+                (1, Some("Alice".into())),
+                (2, Some("Bob".into())),
+                (3, None),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copy_query_to_file_csv() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+
+        let path = temp_copy_path("query");
+        let p = path.to_str().unwrap();
+        // COPY (SELECT ...) TO file.
+        run(
+            &s,
+            &mut sess,
+            &format!("COPY (SELECT id, name FROM t WHERE id > 1 ORDER BY id) TO '{p}' WITH (FORMAT csv)"),
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "2,b\n3,c\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copy_binary_file_round_trips() {
+        let s = shared();
+        let mut sess = new_session();
+        run(
+            &s,
+            &mut sess,
+            "CREATE TABLE t (id integer, name text, score double precision, ok boolean)",
+        )
+        .unwrap();
+        run(
+            &s,
+            &mut sess,
+            "INSERT INTO t VALUES (1, 'Alice', 9.5, true), (2, NULL, -1.25, false)",
+        )
+        .unwrap();
+        let want = {
+            let mut db = s.db.lock().unwrap();
+            let stmt = Parser::parse_sql("SELECT id, name, score, ok FROM t ORDER BY id")
+                .unwrap()
+                .remove(0);
+            match executor::execute(&mut db, stmt).unwrap() {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => panic!("rows"),
+            }
+        };
+
+        let path = temp_copy_path("bin");
+        let p = path.to_str().unwrap();
+        run(&s, &mut sess, &format!("COPY t TO '{p}' WITH (FORMAT binary)")).unwrap();
+
+        run(&s, &mut sess, "DELETE FROM t").unwrap();
+        run(&s, &mut sess, &format!("COPY t FROM '{p}' WITH (FORMAT binary)")).unwrap();
+
+        let got = {
+            let mut db = s.db.lock().unwrap();
+            let stmt = Parser::parse_sql("SELECT id, name, score, ok FROM t ORDER BY id")
+                .unwrap()
+                .remove(0);
+            match executor::execute(&mut db, stmt).unwrap() {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => panic!("rows"),
+            }
+        };
+        assert_eq!(got, want, "binary COPY did not round-trip");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn copy_binary_stdin_stdout_round_trips() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+        run(&s, &mut sess, "INSERT INTO t VALUES (1, 'x'), (2, 'y')").unwrap();
+
+        // COPY TO STDOUT (binary) — capture the CopyData payload.
+        let mut reader = std::io::Cursor::new(Vec::new());
+        let mut out = Vec::new();
+        let copy = parse_copy("COPY t TO STDOUT WITH (FORMAT binary)");
+        run_copy(&mut reader, &mut out, &s, &mut sess, &copy)
+            .unwrap()
+            .unwrap();
+        // Extract the single CopyData ('d') message body.
+        assert_eq!(out[0], b'H');
+        let mut i = 0usize;
+        let mut payload = Vec::new();
+        while i < out.len() {
+            let tag = out[i];
+            let len = i32::from_be_bytes(out[i + 1..i + 5].try_into().unwrap()) as usize;
+            // `len` counts itself (4 bytes) plus the body, but not the tag byte.
+            let body = &out[i + 5..i + 1 + len];
+            if tag == b'd' {
+                payload = body.to_vec();
+            }
+            i += 1 + len;
+        }
+        assert_eq!(&payload[..COPY_BINARY_SIGNATURE.len()], COPY_BINARY_SIGNATURE);
+
+        // Feed it back via COPY FROM STDIN (binary).
+        run(&s, &mut sess, "DELETE FROM t").unwrap();
+        let mut input = Vec::new();
+        input.extend(frame(b'd', &payload));
+        input.extend(frame(b'c', b""));
+        let mut reader = std::io::Cursor::new(input);
+        let mut out = Vec::new();
+        let copy = parse_copy("COPY t FROM STDIN WITH (FORMAT binary)");
+        run_copy(&mut reader, &mut out, &s, &mut sess, &copy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            select_id_name(&s),
+            vec![(1, Some("x".into())), (2, Some("y".into()))]
+        );
+    }
+
+    #[test]
+    fn copy_from_stdin_bulk_loads_many_rows() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer, name text)").unwrap();
+
+        // Build a few thousand text-format rows in one CopyData payload.
+        const N: usize = 5000;
+        let mut data = String::with_capacity(N * 12);
+        for i in 0..N {
+            data.push_str(&format!("{i}\trow{i}\n"));
+        }
+        let mut input = Vec::new();
+        input.extend(frame(b'd', data.as_bytes()));
+        input.extend(frame(b'c', b""));
+        let mut reader = std::io::Cursor::new(input);
+        let mut out = Vec::new();
+
+        let copy = parse_copy("COPY t FROM STDIN");
+        run_copy(&mut reader, &mut out, &s, &mut sess, &copy)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(committed_rows(&s), N);
+        assert!(window_contains(&out, format!("COPY {N}").as_bytes()));
+        // Spot-check first and last rows survived the bulk path intact.
+        assert_eq!(
+            select_ints(&s, &sess, "SELECT id FROM t ORDER BY id LIMIT 1"),
+            vec![0]
+        );
+        assert_eq!(
+            select_ints(&s, &sess, "SELECT id FROM t ORDER BY id DESC LIMIT 1"),
+            vec![(N - 1) as i64]
+        );
+    }
+
+    #[test]
+    fn copy_from_missing_file_errors_without_panic() {
+        let s = shared();
+        let mut sess = new_session();
+        run(&s, &mut sess, "CREATE TABLE t (id integer)").unwrap();
+        let missing = temp_copy_path("missing");
+        let p = missing.to_str().unwrap();
+        let err = run(&s, &mut sess, &format!("COPY t FROM '{p}'")).unwrap_err();
+        assert!(err.contains("could not read COPY source"), "got: {err}");
     }
 
     #[test]

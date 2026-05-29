@@ -8,8 +8,31 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::index::{Bound, Index, IndexMethod, RowId};
-use crate::sql::ast::{CommentObject, Expr, RoleOptions, Select, TablePersistence};
+use crate::sql::ast::{
+    CommentObject, Expr, PartitionStrategy, RoleOptions, Select, TablePersistence,
+};
 use crate::types::{DataType, Value};
+
+/// The partitioning metadata of a partitioned parent table: how rows are routed
+/// to partitions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionScheme {
+    pub strategy: PartitionStrategy,
+    /// Partition-key column position within this table.
+    pub column: usize,
+}
+
+/// The bound of a partition (resolved values), used to route inserted rows and
+/// to round-trip the declaration through the WAL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionBoundSpec {
+    /// `lo <= v < hi`.
+    Range { from: Value, to: Value },
+    /// `v IN set`.
+    List(Vec<Value>),
+    /// `hash(v) % modulus == remainder`.
+    Hash { modulus: i64, remainder: i64 },
+}
 
 /// A user-defined type created via `CREATE TYPE`.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +84,40 @@ pub struct Column {
     pub generated: Option<Expr>,
 }
 
+/// Per-column statistics collected by `ANALYZE`, used by the cost-based planner
+/// to estimate selectivity. Mirrors the salient fields of `pg_statistic`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    /// Number of distinct non-null values observed.
+    pub ndistinct: usize,
+    /// Fraction of rows whose value is NULL, in `[0.0, 1.0]`.
+    pub null_frac: f64,
+}
+
+/// Table-level statistics collected by `ANALYZE`. Absent until the first
+/// `ANALYZE`; the planner falls back to live row counts / heuristics when so.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableStats {
+    /// Estimated live tuple count at the time of `ANALYZE` (`pg_class.reltuples`).
+    pub reltuples: usize,
+    /// Estimated heap page count at the time of `ANALYZE` (`pg_class.relpages`).
+    pub relpages: usize,
+    /// Per-column stats, parallel to `Table::columns`.
+    pub columns: Vec<ColumnStats>,
+}
+
+/// A hashable key uniquely identifying a non-null value for distinct-counting.
+/// Prefixed by a type tag so that, e.g., `1` (int) and `'1'` (text) are distinct.
+fn value_stat_key(v: &Value) -> String {
+    match v {
+        Value::Null => "n".to_string(),
+        Value::Int(i) => format!("i{i}"),
+        Value::Float(f) => format!("f{}", f.to_bits()),
+        Value::Text(s) => format!("t{s}"),
+        Value::Bool(b) => format!("b{b}"),
+    }
+}
+
 /// A stored table: schema, its rows, and any secondary indexes.
 ///
 /// Rows live in `rows`. Each row also has a *stable* [`RowId`] in the parallel
@@ -84,6 +141,9 @@ pub struct Table {
     unique_constraints: Vec<UniqueConstraint>,
     check_constraints: Vec<CheckConstraint>,
     foreign_key_constraints: Vec<ForeignKeyConstraint>,
+    /// Exclusion constraints (`EXCLUDE ...`): accepted and stored by name, never
+    /// enforced. The `definition` is the verbatim `EXCLUDE ...` text.
+    exclusion_constraints: Vec<ExclusionConstraint>,
     persistence: TablePersistence,
     /// Lightweight heap-page accounting. This is still in-memory storage, but
     /// gives future disk pages, FSM, VM, and vacuum logic a concrete boundary.
@@ -93,6 +153,49 @@ pub struct Table {
     row_storage_bytes: HashMap<RowId, usize>,
     vacuum_count: usize,
     compaction_count: usize,
+    /// Planner statistics, populated by `ANALYZE`. `None` until first analyzed.
+    stats: Option<TableStats>,
+    /// Direct parent tables this table inherits from (`INHERITS (...)`), or the
+    /// partitioned parent when this is a partition. Empty for a plain table.
+    inherits: Vec<String>,
+    /// When this is a partitioned parent (`PARTITION BY ...`): the scheme used
+    /// to route inserted rows to partitions.
+    partition_scheme: Option<PartitionScheme>,
+    /// When this is a partition (`PARTITION OF ...`): the bound that gates which
+    /// rows route to it.
+    partition_bound: Option<PartitionBoundSpec>,
+    /// Names of this table's declared partitions (only set on a partitioned
+    /// parent), in declaration order.
+    partitions: Vec<String>,
+    /// The role name that owns this table. Set to `current_user` ('postgres')
+    /// at creation; changed by `ALTER TABLE ... OWNER TO role`.
+    owner: String,
+    /// Whether row-level security is enabled (`ENABLE ROW LEVEL SECURITY`).
+    row_security: bool,
+    /// Whether row-level security is forced for the table owner too
+    /// (`FORCE ROW LEVEL SECURITY`).
+    force_row_security: bool,
+    /// Row-level security policies (`CREATE POLICY`), in declaration order.
+    policies: Vec<Policy>,
+}
+
+/// A row-level security policy (`CREATE POLICY`). Stored and introspectable via
+/// `pg_policy`; enforcement is largely moot here (the single connected user is
+/// always the superuser/owner, who BYPASSES RLS unless FORCE is set).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    pub name: String,
+    /// `true` for `AS PERMISSIVE` (default), `false` for `AS RESTRICTIVE`.
+    pub permissive: bool,
+    /// The command the policy applies to: `"all"`, `"select"`, `"insert"`,
+    /// `"update"`, or `"delete"`.
+    pub command: String,
+    /// Roles the policy applies `TO`; empty means `PUBLIC`.
+    pub roles: Vec<String>,
+    /// `USING (expr)` visibility predicate.
+    pub using: Option<Expr>,
+    /// `WITH CHECK (expr)` write predicate.
+    pub with_check: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +335,14 @@ pub struct UniqueConstraint {
     pub primary_key: bool,
 }
 
+/// An exclusion constraint (`EXCLUDE ...`): accepted and stored by name but
+/// never enforced. `definition` is the verbatim `EXCLUDE ...` clause text.
+#[derive(Debug, Clone)]
+pub struct ExclusionConstraint {
+    pub name: String,
+    pub definition: String,
+}
+
 impl Table {
     /// Create an empty table with the given schema and no indexes.
     pub fn new(name: String, columns: Vec<Column>) -> Self {
@@ -254,6 +365,7 @@ impl Table {
             unique_constraints: Vec::new(),
             check_constraints: Vec::new(),
             foreign_key_constraints: Vec::new(),
+            exclusion_constraints: Vec::new(),
             persistence,
             storage_page_size: DEFAULT_PAGE_SIZE,
             storage_pages: Vec::new(),
@@ -261,7 +373,176 @@ impl Table {
             row_storage_bytes: HashMap::new(),
             vacuum_count: 0,
             compaction_count: 0,
+            stats: None,
+            inherits: Vec::new(),
+            partition_scheme: None,
+            partition_bound: None,
+            partitions: Vec::new(),
+            owner: "postgres".to_string(),
+            row_security: false,
+            force_row_security: false,
+            policies: Vec::new(),
         }
+    }
+
+    // --- ownership / row-level security --------------------------------------
+
+    /// The role name that owns this table.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn set_owner(&mut self, owner: String) {
+        self.owner = owner;
+    }
+
+    /// Whether row-level security is enabled on this table.
+    pub fn row_security(&self) -> bool {
+        self.row_security
+    }
+
+    pub fn set_row_security(&mut self, enabled: bool) {
+        self.row_security = enabled;
+    }
+
+    /// Whether row-level security is forced (applies to the owner too).
+    pub fn force_row_security(&self) -> bool {
+        self.force_row_security
+    }
+
+    pub fn set_force_row_security(&mut self, forced: bool) {
+        self.force_row_security = forced;
+    }
+
+    /// Policies defined on this table, in declaration order.
+    pub fn policies(&self) -> &[Policy] {
+        &self.policies
+    }
+
+    pub fn add_policy(&mut self, policy: Policy) -> Result<(), String> {
+        if self.policies.iter().any(|p| p.name == policy.name) {
+            return Err(format!(
+                "policy \"{}\" for table \"{}\" already exists",
+                policy.name, self.name
+            ));
+        }
+        self.policies.push(policy);
+        Ok(())
+    }
+
+    pub fn drop_policy(&mut self, name: &str, if_exists: bool) -> Result<(), String> {
+        let before = self.policies.len();
+        self.policies.retain(|p| p.name != name);
+        if self.policies.len() == before && !if_exists {
+            return Err(format!(
+                "policy \"{name}\" for table \"{}\" does not exist",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn policy_mut(&mut self, name: &str) -> Option<&mut Policy> {
+        self.policies.iter_mut().find(|p| p.name == name)
+    }
+
+    // --- inheritance / partitioning ------------------------------------------
+
+    /// Direct parents (`INHERITS (...)` parents or the partitioned parent).
+    pub fn inherits(&self) -> &[String] {
+        &self.inherits
+    }
+
+    pub fn set_inherits(&mut self, parents: Vec<String>) {
+        self.inherits = parents;
+    }
+
+    pub fn partition_scheme(&self) -> Option<&PartitionScheme> {
+        self.partition_scheme.as_ref()
+    }
+
+    pub fn set_partition_scheme(&mut self, scheme: PartitionScheme) {
+        self.partition_scheme = Some(scheme);
+    }
+
+    pub fn partition_bound(&self) -> Option<&PartitionBoundSpec> {
+        self.partition_bound.as_ref()
+    }
+
+    pub fn set_partition_bound(&mut self, bound: PartitionBoundSpec) {
+        self.partition_bound = Some(bound);
+    }
+
+    /// Declared partitions of a partitioned parent, in declaration order.
+    pub fn partitions(&self) -> &[String] {
+        &self.partitions
+    }
+
+    pub fn add_partition(&mut self, name: String) {
+        self.partitions.push(name);
+    }
+
+    // --- planner statistics --------------------------------------------------
+
+    /// Collected planner statistics, or `None` if this table has never been
+    /// `ANALYZE`d.
+    pub fn stats(&self) -> Option<&TableStats> {
+        self.stats.as_ref()
+    }
+
+    /// Per-column stats for `column`, if available from the last `ANALYZE`.
+    pub fn column_stats(&self, column: usize) -> Option<&ColumnStats> {
+        self.stats.as_ref()?.columns.get(column)
+    }
+
+    /// `reltuples` to surface in `pg_class`: the analyzed estimate when present,
+    /// otherwise the current live row count.
+    pub fn reltuples(&self) -> usize {
+        self.stats.as_ref().map(|s| s.reltuples).unwrap_or(self.rows.len())
+    }
+
+    /// `relpages` to surface in `pg_class`: the analyzed estimate when present,
+    /// otherwise the current heap-page count.
+    pub fn relpages(&self) -> usize {
+        self.stats
+            .as_ref()
+            .map(|s| s.relpages)
+            .unwrap_or_else(|| self.storage_pages.len())
+    }
+
+    /// Recompute and store planner statistics by sampling every current row.
+    /// (We scan the whole table — the dataset is in memory — so the estimates
+    /// are exact for the current contents rather than sampled.)
+    pub fn analyze_stats(&mut self) {
+        let ncols = self.columns.len();
+        let nrows = self.rows.len();
+        let mut distinct: Vec<std::collections::HashSet<String>> = vec![Default::default(); ncols];
+        let mut nulls = vec![0usize; ncols];
+        for row in &self.rows {
+            for (c, cell) in row.iter().enumerate().take(ncols) {
+                if cell.is_null() {
+                    nulls[c] += 1;
+                } else {
+                    // Text-format the value for a hashable, type-stable key.
+                    distinct[c].insert(value_stat_key(cell));
+                }
+            }
+        }
+        let columns = (0..ncols)
+            .map(|c| ColumnStats {
+                ndistinct: distinct[c].len(),
+                null_frac: if nrows == 0 {
+                    0.0
+                } else {
+                    nulls[c] as f64 / nrows as f64
+                },
+            })
+            .collect();
+        self.stats = Some(TableStats {
+            reltuples: nrows,
+            relpages: self.storage_pages.len(),
+            columns,
+        });
     }
 
     /// Index of a column by name (case-sensitive, matching how it was created).
@@ -473,16 +754,20 @@ impl Table {
 
     // --- index management ----------------------------------------------------
 
-    /// Find a single-column, non-partial, non-expression index over `column`,
-    /// preferring a unique one when both exist. Used for the simple equality /
-    /// range / join probe paths (which all assume a one-column key).
+    /// Find a single-column, non-partial, non-expression index over `column`
+    /// that can answer a *range* scan, preferring a unique one when both exist.
+    /// Used for the simple range / join probe paths (which assume a one-column
+    /// key). Hash indexes are excluded (they have no order); ordered methods
+    /// (btree/gist/spgist) and BRIN qualify.
     pub fn index_on(&self, column: usize) -> Option<&Index> {
         let mut chosen: Option<&Index> = None;
         for idx in &self.indexes {
+            let range_capable =
+                idx.method.is_ordered() || idx.method == IndexMethod::Brin;
             if idx.columns == [column]
                 && idx.expr.is_none()
                 && idx.predicate.is_none()
-                && idx.method == IndexMethod::Btree
+                && range_capable
             {
                 match chosen {
                     Some(c) if c.unique => {}
@@ -519,6 +804,7 @@ impl Table {
             || self.unique_constraints.iter().any(|c| c.name == name)
             || self.check_constraints.iter().any(|c| c.name == name)
             || self.foreign_key_constraints.iter().any(|c| c.name == name)
+            || self.exclusion_constraints.iter().any(|c| c.name == name)
     }
 
     /// Indexes defined on this table, in creation order.
@@ -698,6 +984,20 @@ impl Table {
         self.foreign_key_constraints.len() != before
     }
 
+    pub fn exclusion_constraints(&self) -> &[ExclusionConstraint] {
+        &self.exclusion_constraints
+    }
+
+    pub fn add_exclusion_constraint(&mut self, constraint: ExclusionConstraint) {
+        self.exclusion_constraints.push(constraint);
+    }
+
+    pub fn drop_exclusion_constraint(&mut self, name: &str) -> bool {
+        let before = self.exclusion_constraints.len();
+        self.exclusion_constraints.retain(|c| c.name != name);
+        self.exclusion_constraints.len() != before
+    }
+
     /// Columns covered by a unique index (for batch duplicate checks).
     pub fn unique_key_columns(&self) -> Vec<Vec<usize>> {
         let mut columns: Vec<Vec<usize>> = self
@@ -753,6 +1053,24 @@ impl Table {
     /// Row positions matching `key` via expression index `idx_pos`.
     pub fn index_eq_expr(&self, idx_pos: usize, key: &Value) -> Vec<usize> {
         self.ids_to_positions(&self.indexes[idx_pos].lookup_eq(std::slice::from_ref(key)))
+    }
+
+    /// Find a single-column, non-partial, non-expression GIN index over
+    /// `column`, returning its position and reference.
+    pub fn gin_index_on(&self, column: usize) -> Option<(usize, &Index)> {
+        self.indexes.iter().enumerate().find(|(_, idx)| {
+            idx.columns == [column]
+                && idx.expr.is_none()
+                && idx.predicate.is_none()
+                && idx.method == IndexMethod::Gin
+        })
+    }
+
+    /// Row positions whose indexed array (via GIN index `idx_pos`) contains all
+    /// of `needles`. `None` if the index is not a GIN index.
+    pub fn gin_contains_positions(&self, idx_pos: usize, needles: &[String]) -> Option<Vec<usize>> {
+        let ids = self.indexes[idx_pos].lookup_gin_contains(needles)?;
+        Some(self.ids_to_positions(&ids))
     }
 
     /// Row positions whose `column` falls in the given range, via an index.
@@ -928,6 +1246,50 @@ fn same_unique_key(left: &[Value], right: &[Value], columns: &[usize]) -> bool {
         .all(|&column| left[column].to_text() == right[column].to_text())
 }
 
+/// Built-in GUC (runtime configuration) parameters: `(name, default, description)`.
+///
+/// These provide sane defaults so `SHOW`/`current_setting`/`pg_settings` return
+/// something meaningful even when the parameter was never `SET`. `search_path`
+/// and `server_version` are handled specially (live value / env override) and so
+/// are intentionally absent here. The list is the union of the standard GUCs the
+/// roadmap calls out plus the timeout knobs.
+pub const GUC_DEFAULTS: &[(&str, &str, &str)] = &[
+    ("server_encoding", "UTF8", "Sets the server (database) character set encoding."),
+    ("client_encoding", "UTF8", "Sets the client's character set encoding."),
+    ("standard_conforming_strings", "on", "Causes '...' strings to treat backslashes literally."),
+    ("DateStyle", "ISO, MDY", "Sets the display format for date and time values."),
+    ("TimeZone", "UTC", "Sets the time zone for displaying and interpreting time stamps."),
+    ("IntervalStyle", "postgres", "Sets the display format for interval values."),
+    ("integer_datetimes", "on", "Datetimes are integer based."),
+    ("transaction_isolation", "read committed", "Sets the current transaction's isolation level."),
+    ("transaction_read_only", "off", "Sets the current transaction's read-only status."),
+    ("application_name", "", "Sets the application name to be reported in statistics and logs."),
+    ("statement_timeout", "0", "Sets the maximum allowed duration of any statement (ms; 0 disables)."),
+    ("idle_in_transaction_session_timeout", "0", "Sets the maximum allowed idle time between queries, when in a transaction (ms; 0 disables)."),
+    ("lock_timeout", "0", "Sets the maximum allowed duration of any wait for a lock (ms; 0 disables)."),
+    ("bytea_output", "hex", "Sets the output format for bytea."),
+    ("extra_float_digits", "1", "Sets the number of digits displayed for floating-point values."),
+];
+
+/// Default value for a built-in GUC, keyed by lowercased name. Returns `None`
+/// for parameters that have no built-in default (custom `x.y` settings).
+pub fn guc_default(name: &str) -> Option<&'static str> {
+    GUC_DEFAULTS
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v, _)| *v)
+}
+
+/// Short description for a GUC (built-in description, or a generic one for
+/// custom settings).
+pub fn guc_description(name: &str) -> String {
+    GUC_DEFAULTS
+        .iter()
+        .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, _, d)| d.to_string())
+        .unwrap_or_else(|| "Custom configuration parameter.".to_string())
+}
+
 /// The whole database: a flat namespace of tables.
 ///
 /// `Clone` is used to snapshot the database when a transaction begins, so a
@@ -974,6 +1336,20 @@ pub struct Database {
     /// User-defined aggregates (`CREATE AGGREGATE`), keyed by lowercased name.
     /// Accepted and stored but never used during aggregation.
     aggregates: HashMap<String, Aggregate>,
+    /// Extended catalog objects accepted and stored by name but not otherwise
+    /// interpreted (operator classes/families, operators, event triggers, FDWs,
+    /// servers, user mappings, publications, subscriptions, replication slots).
+    /// Keyed by `(kind keyword, lowercased name)`.
+    catalog_objects: HashMap<(String, String), CatalogObjectEntry>,
+    /// Monotonic counter bumped once per successful commit. A transaction
+    /// records the value seen at BEGIN as its snapshot; optimistic write-write
+    /// conflict detection compares per-table versions against it. (Not cloned
+    /// into transaction working copies — it is shared-database bookkeeping.)
+    commit_version: u64,
+    /// The `commit_version` at which each table was last modified by a committed
+    /// transaction, keyed by table name. Absent => never modified post-startup
+    /// (treated as version 0).
+    table_versions: HashMap<String, u64>,
 }
 
 impl Default for Database {
@@ -1027,6 +1403,9 @@ impl Default for Database {
             triggers: HashMap::new(),
             rules: HashMap::new(),
             aggregates: HashMap::new(),
+            catalog_objects: HashMap::new(),
+            commit_version: 0,
+            table_versions: HashMap::new(),
         }
     }
 }
@@ -1046,6 +1425,8 @@ pub struct SqlFunction {
     pub return_type_name: Option<String>,
     pub body: String,
     pub language: String,
+    /// `SECURITY DEFINER` flag (`prosecdef`); false = SECURITY INVOKER (default).
+    pub security_definer: bool,
 }
 
 /// A stored trigger.
@@ -1068,6 +1449,14 @@ pub struct Rule {
     pub name: String,
     pub event: String,
     pub table: String,
+    pub definition: String,
+}
+
+/// An extended catalog object stored by name (accept-and-store; not interpreted).
+#[derive(Debug, Clone)]
+pub struct CatalogObjectEntry {
+    pub name: String,
+    /// Verbatim definition tail kept for WAL round-tripping.
     pub definition: String,
 }
 
@@ -1352,8 +1741,83 @@ impl Database {
         Database::default()
     }
 
+    // --- commit-version bookkeeping (optimistic concurrency) ----------------
+
+    /// The current global commit version, recorded by a transaction at BEGIN
+    /// as its read snapshot.
+    pub fn commit_version(&self) -> u64 {
+        self.commit_version
+    }
+
+    /// The commit version at which `table` was last modified (0 if never).
+    pub fn table_version(&self, table: &str) -> u64 {
+        self.table_versions.get(table).copied().unwrap_or(0)
+    }
+
+    /// Whether any table in `write_set` was modified by a committed transaction
+    /// strictly after `snapshot` — i.e. a write-write conflict for a
+    /// REPEATABLE READ / SERIALIZABLE transaction that started at `snapshot`.
+    pub fn has_conflicting_commit(&self, write_set: &HashSet<String>, snapshot: u64) -> bool {
+        write_set
+            .iter()
+            .any(|table| self.table_version(table) > snapshot)
+    }
+
+    /// Copy the commit-version bookkeeping (global counter + per-table stamps)
+    /// from `source` into `self`. Used when a transaction's working copy (cloned
+    /// at BEGIN, so carrying stale version state) is about to become the shared
+    /// database: it must adopt the latest bookkeeping so other transactions'
+    /// commits since BEGIN are not lost.
+    pub fn adopt_commit_state(&mut self, source: &Database) {
+        self.commit_version = source.commit_version;
+        self.table_versions = source.table_versions.clone();
+    }
+
+    /// Bump the global commit version and stamp every table in `write_set` with
+    /// the new version. Returns the new version. Called on a successful commit.
+    pub fn record_commit(&mut self, write_set: &HashSet<String>) -> u64 {
+        self.commit_version += 1;
+        for table in write_set {
+            self.table_versions.insert(table.clone(), self.commit_version);
+        }
+        self.commit_version
+    }
+
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(name)
+    }
+
+    /// Direct children of `parent`: tables that list `parent` among their
+    /// inheritance parents (covers both `INHERITS` and `PARTITION OF`). Returned
+    /// in name-sorted order for deterministic scans.
+    pub fn child_tables(&self, parent: &str) -> Vec<String> {
+        let mut children: Vec<String> = self
+            .tables
+            .values()
+            .filter(|t| t.inherits().iter().any(|p| p == parent))
+            .map(|t| t.name.clone())
+            .collect();
+        children.sort();
+        children
+    }
+
+    /// All descendants of `parent` (children, grandchildren, ...), excluding
+    /// `parent` itself. Deterministic order: a breadth-first walk over
+    /// name-sorted children. Cycles (which the catalog forbids) are guarded.
+    pub fn descendant_tables(&self, parent: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut queue: std::collections::VecDeque<String> =
+            self.child_tables(parent).into_iter().collect();
+        while let Some(name) = queue.pop_front() {
+            if out.contains(&name) || name == parent {
+                continue;
+            }
+            for grandchild in self.child_tables(&name) {
+                queue.push_back(grandchild);
+            }
+            out.push(name);
+        }
+        out
     }
 
     pub fn table_mut(&mut self, name: &str) -> Option<&mut Table> {
@@ -1537,20 +2001,67 @@ impl Database {
     }
 
     pub fn set_system_setting(&mut self, name: String, value: String) {
-        self.system_settings
-            .insert(name.to_ascii_lowercase(), value);
+        let key = name.to_ascii_lowercase();
+        if key == "search_path" {
+            // search_path has dedicated machinery (it feeds name resolution); keep
+            // it as the source of truth rather than the generic GUC map.
+            self.set_search_path(&value);
+            return;
+        }
+        self.system_settings.insert(key, value);
     }
 
     pub fn reset_system_setting(&mut self, name: Option<&str>) {
-        if let Some(name) = name {
-            self.system_settings.remove(&name.to_ascii_lowercase());
-        } else {
-            self.system_settings.clear();
+        match name {
+            Some(name) => {
+                let key = name.to_ascii_lowercase();
+                if key == "search_path" {
+                    self.search_path = vec!["$user".into(), "public".into()];
+                } else {
+                    self.system_settings.remove(&key);
+                }
+            }
+            None => {
+                self.system_settings.clear();
+                self.search_path = vec!["$user".into(), "public".into()];
+            }
         }
     }
 
     pub fn system_setting(&self, name: &str) -> Option<&String> {
         self.system_settings.get(&name.to_ascii_lowercase())
+    }
+
+    /// Effective value of a GUC: an explicitly-set value, else search_path's live
+    /// value, else the built-in default. `None` for an unknown setting.
+    pub fn guc(&self, name: &str) -> Option<String> {
+        let key = name.to_ascii_lowercase();
+        if key == "search_path" {
+            return Some(self.search_path());
+        }
+        if let Some(v) = self.system_settings.get(&key) {
+            return Some(v.clone());
+        }
+        guc_default(&key).map(str::to_string)
+    }
+
+    /// All effective GUCs (built-in defaults overlaid with explicit settings),
+    /// sorted by name. Used by `SHOW ALL` and `pg_settings`.
+    pub fn all_gucs(&self) -> Vec<(String, String)> {
+        let mut map: std::collections::BTreeMap<String, String> = GUC_DEFAULTS
+            .iter()
+            .map(|(n, v, _)| (n.to_string(), v.to_string()))
+            .collect();
+        map.insert("search_path".into(), self.search_path());
+        if let Ok(v) = std::env::var("PGRS_SERVER_VERSION") {
+            if !v.is_empty() {
+                map.insert("server_version".into(), v);
+            }
+        }
+        for (name, value) in &self.system_settings {
+            map.insert(name.clone(), value.clone());
+        }
+        map.into_iter().collect()
     }
 
     pub fn system_settings(&self) -> Vec<(String, String)> {
@@ -2032,6 +2543,56 @@ impl Database {
             Ok(false)
         } else {
             Err(format!("aggregate {name} does not exist"))
+        }
+    }
+
+    // --- extended catalog objects --------------------------------------------
+
+    /// All stored extended catalog objects of the given kind keyword, sorted by
+    /// name (for introspection/testing).
+    pub fn catalog_objects(&self, kind: &str) -> Vec<CatalogObjectEntry> {
+        let mut out: Vec<CatalogObjectEntry> = self
+            .catalog_objects
+            .iter()
+            .filter(|((k, _), _)| k == kind)
+            .map(|(_, v)| v.clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Store an extended catalog object. Errors if one of the same kind+name
+    /// already exists.
+    pub fn create_catalog_object(
+        &mut self,
+        kind: &str,
+        name: String,
+        definition: String,
+    ) -> Result<(), String> {
+        let key = (kind.to_string(), name.to_ascii_lowercase());
+        if self.catalog_objects.contains_key(&key) {
+            return Err(format!("{} \"{name}\" already exists", kind.to_lowercase()));
+        }
+        self.catalog_objects
+            .insert(key, CatalogObjectEntry { name, definition });
+        Ok(())
+    }
+
+    /// Drop an extended catalog object. Returns whether one was removed; errors
+    /// if it is missing and `if_exists` is false.
+    pub fn drop_catalog_object(
+        &mut self,
+        kind: &str,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<bool, String> {
+        let key = (kind.to_string(), name.to_ascii_lowercase());
+        if self.catalog_objects.remove(&key).is_some() {
+            Ok(true)
+        } else if if_exists {
+            Ok(false)
+        } else {
+            Err(format!("{} \"{name}\" does not exist", kind.to_lowercase()))
         }
     }
 

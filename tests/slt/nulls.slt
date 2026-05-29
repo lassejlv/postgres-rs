@@ -1,0 +1,50 @@
+# NULL handling and three-valued logic.
+
+statement ok
+CREATE TABLE n (id integer PRIMARY KEY, v integer)
+
+statement ok
+INSERT INTO n VALUES (1, 10), (2, NULL), (3, 30)
+
+# IS NULL / IS NOT NULL.
+query I
+SELECT id FROM n WHERE v IS NULL
+----
+2
+
+query I
+SELECT id FROM n WHERE v IS NOT NULL ORDER BY id
+----
+1
+3
+
+# A comparison against NULL is unknown, so the row is excluded.
+query I
+SELECT count(*) FROM n WHERE v > 5
+----
+2
+
+# COUNT(col) skips NULLs; COUNT(*) counts all rows.
+query I
+SELECT count(v) FROM n
+----
+2
+
+query I
+SELECT count(*) FROM n
+----
+3
+
+# SUM ignores NULLs.
+query I
+SELECT sum(v) FROM n
+----
+40
+
+# COALESCE substitutes NULLs.
+query I
+SELECT coalesce(v, 0) FROM n ORDER BY id
+----
+10
+0
+30

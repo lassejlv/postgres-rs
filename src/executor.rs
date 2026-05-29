@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::index::Bound;
 use crate::sql::ast::*;
-use crate::sql::serialize::expr_to_sql;
+use crate::sql::serialize::{expr_to_sql, select_to_sql};
 use crate::storage::{
-    Aggregate, CheckConstraint, Column, Database, ForeignKeyConstraint, MaterializedView, Rule,
-    SqlFunction, Table, Trigger, UniqueConstraint, View,
+    Aggregate, CheckConstraint, Column, Database, ExclusionConstraint, ForeignKeyConstraint,
+    MaterializedView, Policy, Rule, SqlFunction, Table, Trigger, UniqueConstraint, View,
 };
 use crate::types::{DataType, Value};
 
@@ -61,6 +61,50 @@ thread_local! {
     /// call to a user-defined scalar SQL function.
     static SCALAR_UDFS: std::cell::RefCell<HashMap<(String, usize), ScalarUdf>> =
         std::cell::RefCell::new(HashMap::new());
+
+    /// Rendered `CREATE INDEX ...` / constraint definitions keyed by catalog
+    /// OID, so `pg_get_indexdef(oid, ...)` and `pg_get_constraintdef(oid, ...)`
+    /// (which receive no `Database`) can resolve an OID to its definition text.
+    /// Populated once per top-level `execute`.
+    static CATALOG_DEFS: std::cell::RefCell<HashMap<i64, String>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// Relation name -> catalog OID, used to resolve `'name'::regclass`.
+    static REGCLASS_OIDS: std::cell::RefCell<HashMap<String, i64>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// Snapshot of effective GUCs (lowercased name -> value) for the currently
+    /// executing statement, so `current_setting(...)` (evaluated without a
+    /// `Database` handle) can read configuration parameters. Refreshed once per
+    /// top-level `execute`.
+    static GUC_SNAPSHOT: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// GUC writes requested by `set_config(name, value, is_local)` during
+    /// expression evaluation. `execute` drains these back into the `Database`
+    /// after running the statement (eval has no `&mut Database`).
+    static GUC_PENDING_WRITES: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Refresh the thread-local GUC snapshot from the live database so expression
+/// evaluation can read configuration parameters.
+fn refresh_guc_snapshot(db: &Database) {
+    let map: HashMap<String, String> = db
+        .all_gucs()
+        .into_iter()
+        .map(|(n, v)| (n.to_ascii_lowercase(), v))
+        .collect();
+    GUC_SNAPSHOT.with(|cell| *cell.borrow_mut() = map);
+    GUC_PENDING_WRITES.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Apply any `set_config(...)` writes captured during evaluation back to `db`.
+fn flush_guc_writes(db: &mut Database) {
+    let pending = GUC_PENDING_WRITES.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    for (name, value) in pending {
+        db.set_system_setting(name, value);
+    }
 }
 
 /// Rebuild the thread-local scalar-UDF registry from the database catalog.
@@ -91,6 +135,174 @@ fn refresh_scalar_udfs(db: &Database) {
         }
     }
     SCALAR_UDFS.with(|cell| *cell.borrow_mut() = map);
+}
+
+/// Quote an SQL identifier only when it needs quoting (mirrors psql output:
+/// bare identifiers stay unquoted; mixed-case or odd names get double quotes).
+fn quote_ident_if_needed(name: &str) -> String {
+    let needs = name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_lowercase())
+        || !name
+            .chars()
+            .all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit());
+    if needs {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    } else {
+        name.to_string()
+    }
+}
+
+/// Render the column list `(a, b)` for a set of 0-based column positions.
+fn render_column_list(table: &Table, columns: &[usize]) -> String {
+    columns
+        .iter()
+        .filter_map(|&c| table.columns.get(c))
+        .map(|c| quote_ident_if_needed(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Rebuild the per-statement catalog-definition and regclass-OID maps from the
+/// live schema. The OID assignment here mirrors `virtual_pg_catalog` exactly so
+/// that `pg_get_indexdef`/`pg_get_constraintdef` resolve the same OIDs psql
+/// reads from `pg_index`/`pg_constraint`.
+fn refresh_catalog_defs(db: &Database) {
+    let mut defs: HashMap<i64, String> = HashMap::new();
+    let mut regclass: HashMap<String, i64> = HashMap::new();
+    for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
+        let table_oid = user_table_oid(table_idx);
+        regclass.insert(table_name.clone(), table_oid);
+        let Some(table) = db.table(&table_name) else {
+            continue;
+        };
+        let qtable = quote_ident_if_needed(&table_name);
+        // Indexes (CREATE INDEX ...). Each index relation also gets a regclass
+        // entry by name.
+        for (index_idx, index) in table.indexes().iter().enumerate() {
+            let index_oid = user_index_oid(table_idx, index_idx);
+            regclass.insert(index.name.clone(), index_oid);
+            let method = match index.method {
+                crate::index::IndexMethod::Btree => "btree",
+                crate::index::IndexMethod::Hash => "hash",
+                crate::index::IndexMethod::Gist => "gist",
+                crate::index::IndexMethod::SpGist => "spgist",
+                crate::index::IndexMethod::Brin => "brin",
+                crate::index::IndexMethod::Gin => "gin",
+            };
+            let keys = if let Some(expr) = index.expr.as_ref() {
+                format!("({})", expr_to_sql(expr))
+            } else {
+                render_column_list(table, &index.columns)
+            };
+            let mut def = format!(
+                "CREATE {}INDEX {} ON public.{} USING {} ({})",
+                if index.unique { "UNIQUE " } else { "" },
+                quote_ident_if_needed(&index.name),
+                qtable,
+                method,
+                keys,
+            );
+            if !index.include.is_empty() {
+                def.push_str(&format!(
+                    " INCLUDE ({})",
+                    render_column_list(table, &index.include)
+                ));
+            }
+            if let Some(pred) = index.predicate.as_ref() {
+                def.push_str(&format!(" WHERE {}", expr_to_sql(pred)));
+            }
+            defs.insert(index_oid, def);
+        }
+        // Unique/primary-key constraints (and their backing index relations).
+        let unique_base = table.indexes().len();
+        for (constraint_idx, constraint) in table.unique_constraints().iter().enumerate() {
+            let catalog_idx = unique_base + constraint_idx;
+            let index_oid = user_index_oid(table_idx, catalog_idx);
+            regclass.insert(constraint.name.clone(), index_oid);
+            let con_oid = user_constraint_oid(table_idx, catalog_idx);
+            let cols = render_column_list(table, &constraint.columns);
+            let con_def = if constraint.primary_key {
+                format!("PRIMARY KEY ({cols})")
+            } else {
+                format!("UNIQUE ({cols})")
+            };
+            defs.insert(con_oid, con_def);
+            // Backing-index definition for pg_get_indexdef on the index oid.
+            defs.insert(
+                index_oid,
+                format!(
+                    "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+                    quote_ident_if_needed(&constraint.name),
+                    qtable,
+                    cols,
+                ),
+            );
+        }
+        // Single-column PRIMARY KEY/UNIQUE expressed as a unique index (the
+        // pg_constraint loop over table.indexes() emits these constraint oids).
+        for (index_idx, index) in table.indexes().iter().enumerate() {
+            if !index.unique {
+                continue;
+            }
+            let Some(col) = index.leading_column() else {
+                continue;
+            };
+            let con_oid = user_constraint_oid(table_idx, index_idx);
+            let cols = render_column_list(table, &index.columns);
+            let is_pk = table.columns.get(col).is_some_and(|c| c.primary_key);
+            let con_def = if is_pk {
+                format!("PRIMARY KEY ({cols})")
+            } else {
+                format!("UNIQUE ({cols})")
+            };
+            defs.insert(con_oid, con_def);
+        }
+        // Check constraints.
+        let check_base = table.indexes().len() + table.unique_constraints().len();
+        for (check_idx, constraint) in table.check_constraints().iter().enumerate() {
+            let con_oid = user_constraint_oid(table_idx, check_base + check_idx);
+            defs.insert(
+                con_oid,
+                format!("CHECK ({})", expr_to_sql(&constraint.expr)),
+            );
+        }
+        // Foreign keys.
+        let fk_base = check_base + table.check_constraints().len();
+        for (fk_idx, constraint) in table.foreign_key_constraints().iter().enumerate() {
+            let con_oid = user_constraint_oid(table_idx, fk_base + fk_idx);
+            let col_name = table
+                .columns
+                .get(constraint.column)
+                .map(|c| quote_ident_if_needed(&c.name))
+                .unwrap_or_default();
+            defs.insert(
+                con_oid,
+                format!(
+                    "FOREIGN KEY ({}) REFERENCES {}({})",
+                    col_name,
+                    quote_ident_if_needed(&constraint.ref_table),
+                    quote_ident_if_needed(&constraint.ref_column),
+                ),
+            );
+        }
+    }
+    // Views / materialized views / sequences resolve as relations for regclass.
+    let view_base = db.table_names().len();
+    for (view_idx, view_name) in db.view_names().into_iter().enumerate() {
+        regclass.insert(view_name, user_table_oid(view_base + view_idx));
+    }
+    let mat_base = view_base + db.view_names().len();
+    for (view_idx, view_name) in db.materialized_view_names().into_iter().enumerate() {
+        regclass.insert(view_name, user_table_oid(mat_base + view_idx));
+    }
+    for (seq_idx, sequence) in db.sequences().into_iter().enumerate() {
+        regclass.insert(sequence.name, user_sequence_oid(seq_idx));
+    }
+    CATALOG_DEFS.with(|cell| *cell.borrow_mut() = defs);
+    REGCLASS_OIDS.with(|cell| *cell.borrow_mut() = regclass);
 }
 
 /// Parse a SQL-function body that is a single `SELECT <expr>` (optionally
@@ -272,6 +484,18 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
     // Make user-defined scalar functions visible to expression evaluation,
     // which has no direct `Database` handle.
     refresh_scalar_udfs(db);
+    // Likewise expose index/constraint definitions and relation OIDs so the
+    // catalog helper functions can resolve them.
+    refresh_catalog_defs(db);
+    // Expose configuration parameters to `current_setting(...)`.
+    refresh_guc_snapshot(db);
+    let result = execute_dispatch(db, stmt);
+    // Apply any `set_config(...)` writes performed during evaluation.
+    flush_guc_writes(db);
+    result
+}
+
+fn execute_dispatch(db: &mut Database, stmt: Statement) -> Result<ExecResult, String> {
     match stmt {
         Statement::CreateTable(c) => exec_create_table(db, c),
         Statement::CreateExtension(c) => exec_create_extension(db, c),
@@ -306,6 +530,9 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
         Statement::DropView(d) => exec_drop_view(db, d),
         Statement::DropMaterializedView(d) => exec_drop_materialized_view(db, d),
         Statement::AlterTable(a) => exec_alter_table(db, a),
+        Statement::CreatePolicy(c) => exec_create_policy(db, c),
+        Statement::AlterPolicy(a) => exec_alter_policy(db, a),
+        Statement::DropPolicy(d) => exec_drop_policy(db, d),
         Statement::AlterRole(a) => exec_alter_role(db, a),
         Statement::AlterSequence(a) => exec_alter_sequence(db, a),
         Statement::CreateIndex(c) => exec_create_index(db, c),
@@ -339,16 +566,63 @@ pub fn execute(db: &mut Database, stmt: Statement) -> Result<ExecResult, String>
         Statement::Unlisten { .. } => Ok(ExecResult::Command("UNLISTEN".into())),
         Statement::LockTable(l) => exec_lock_table(db, l),
         Statement::RefreshMaterializedView(r) => exec_refresh_materialized_view(db, r),
-        Statement::Begin => Ok(ExecResult::Command("BEGIN".into())),
+        Statement::Begin { .. } => Ok(ExecResult::Command("BEGIN".into())),
         Statement::Commit => Ok(ExecResult::Command("COMMIT".into())),
         Statement::Rollback => Ok(ExecResult::Command("ROLLBACK".into())),
         Statement::Savepoint { .. } => Ok(ExecResult::Command("SAVEPOINT".into())),
         Statement::ReleaseSavepoint { .. } => Ok(ExecResult::Command("RELEASE".into())),
         Statement::RollbackToSavepoint { .. } => Ok(ExecResult::Command("ROLLBACK".into())),
-        Statement::Set { name, value } => exec_set(db, name, value),
+        Statement::Set { name, value, .. } => exec_set(db, name, value),
+        Statement::ResetConfig { name } => {
+            db.reset_system_setting(name.as_deref());
+            Ok(ExecResult::Command("RESET".into()))
+        }
         Statement::Show { name } => exec_show(db, name),
+        Statement::CreateCatalogObject(c) => exec_create_catalog_object(db, c),
+        Statement::DropCatalogObject(d) => exec_drop_catalog_object(db, d),
+        Statement::SetConstraints => Ok(ExecResult::Command("SET CONSTRAINTS".into())),
+        // Real isolation/read-only handling lives in the session layer
+        // (server.rs). When applied to the session default (`SET SESSION
+        // CHARACTERISTICS`), record the level in the GUC so `SHOW
+        // transaction_isolation` reflects it; otherwise acknowledge as a no-op.
+        Statement::SetTransaction {
+            isolation, session, ..
+        } => {
+            if session {
+                if let Some(level) = isolation {
+                    db.set_system_setting(
+                        "transaction_isolation".into(),
+                        level.guc_value().into(),
+                    );
+                }
+            }
+            Ok(ExecResult::Command("SET".into()))
+        }
+        // Two-phase commit. The session layer (server.rs) wires these into the
+        // real transaction machinery; executed directly (e.g. WAL replay,
+        // autocommit), they are acknowledged as no-ops.
+        Statement::PrepareTransaction { .. } => {
+            Ok(ExecResult::Command("PREPARE TRANSACTION".into()))
+        }
+        Statement::CommitPrepared { .. } => Ok(ExecResult::Command("COMMIT PREPARED".into())),
+        Statement::RollbackPrepared { .. } => {
+            Ok(ExecResult::Command("ROLLBACK PREPARED".into()))
+        }
         Statement::Empty => Ok(ExecResult::Empty),
     }
+}
+
+fn exec_create_catalog_object(db: &mut Database, c: CatalogObject) -> Result<ExecResult, String> {
+    db.create_catalog_object(c.kind.keyword(), c.name, c.definition)?;
+    Ok(ExecResult::Command(format!("CREATE {}", c.kind.keyword())))
+}
+
+fn exec_drop_catalog_object(
+    db: &mut Database,
+    d: DropCatalogObject,
+) -> Result<ExecResult, String> {
+    db.drop_catalog_object(d.kind.keyword(), &d.name, d.if_exists)?;
+    Ok(ExecResult::Command(format!("DROP {}", d.kind.keyword())))
 }
 
 fn exec_truncate(db: &mut Database, t: Truncate) -> Result<ExecResult, String> {
@@ -414,6 +688,20 @@ pub fn describe_statement(
                 .map(|(name, data_type)| FieldDescription { name, data_type })
                 .collect(),
         )),
+        Statement::Show { name } if name.eq_ignore_ascii_case("all") => Ok(Some(vec![
+            FieldDescription {
+                name: "name".into(),
+                data_type: DataType::Text,
+            },
+            FieldDescription {
+                name: "setting".into(),
+                data_type: DataType::Text,
+            },
+            FieldDescription {
+                name: "description".into(),
+                data_type: DataType::Text,
+            },
+        ])),
         Statement::Show { name } => Ok(Some(vec![FieldDescription {
             name: name.clone(),
             data_type: DataType::Text,
@@ -423,7 +711,7 @@ pub fn describe_statement(
 }
 
 fn exec_explain(db: &mut Database, explain: Explain) -> Result<ExecResult, String> {
-    let mut lines = explain_statement(&explain.statement);
+    let mut lines = explain_statement(db, &explain.statement);
     if explain.analyze {
         let result = execute(db, *explain.statement)?;
         let observed = match result {
@@ -449,9 +737,9 @@ fn exec_explain(db: &mut Database, explain: Explain) -> Result<ExecResult, Strin
     })
 }
 
-fn explain_statement(stmt: &Statement) -> Vec<String> {
+fn explain_statement(db: &Database, stmt: &Statement) -> Vec<String> {
     match stmt {
-        Statement::Select(sel) => explain_select(sel),
+        Statement::Select(sel) => explain_select(db, sel),
         Statement::Insert(i) => vec![format!("Insert on {}", i.table)],
         Statement::Copy(c) => vec![format!("Copy {}", c.table)],
         Statement::Update(u) => vec![format!("Update on {}", u.table)],
@@ -492,6 +780,9 @@ fn explain_statement(stmt: &Statement) -> Vec<String> {
         Statement::DropView(d) => vec![format!("Drop View {}", d.name)],
         Statement::DropMaterializedView(d) => vec![format!("Drop Materialized View {}", d.name)],
         Statement::AlterTable(a) => vec![format!("Alter Table {}", a.table)],
+        Statement::CreatePolicy(c) => vec![format!("Create Policy {} on {}", c.name, c.table)],
+        Statement::AlterPolicy(a) => vec![format!("Alter Policy {} on {}", a.name, a.table)],
+        Statement::DropPolicy(d) => vec![format!("Drop Policy {} on {}", d.name, d.table)],
         Statement::AlterRole(a) => vec![format!("Alter Role {}", a.name)],
         Statement::AlterSequence(a) => vec![format!("Alter Sequence {}", a.name)],
         Statement::CreateIndex(c) => vec![format!("Create Index on {}", c.table)],
@@ -500,7 +791,7 @@ fn explain_statement(stmt: &Statement) -> Vec<String> {
         Statement::DeclareCursor(d) => vec![format!("Declare Cursor {}", d.name)],
         Statement::Fetch(f) => vec![format!("Fetch {}", f.cursor)],
         Statement::AlterDatabase(a) => vec![format!("Alter Database {}", a.name)],
-        Statement::Explain(e) => explain_statement(&e.statement),
+        Statement::Explain(e) => explain_statement(db, &e.statement),
         Statement::Analyze(a) => match &a.table {
             Some(table) => vec![format!("Analyze {table}")],
             None => vec!["Analyze".into()],
@@ -531,22 +822,47 @@ fn explain_statement(stmt: &Statement) -> Vec<String> {
         }
         Statement::Show { name } => vec![format!("Show {name}")],
         Statement::Set { name, .. } => vec![format!("Set {name}")],
+        Statement::ResetConfig { name } => {
+            vec![format!("Reset {}", name.as_deref().unwrap_or("all"))]
+        }
         Statement::Grant(_) => vec!["Grant".into()],
         Statement::Revoke(_) => vec!["Revoke".into()],
-        Statement::Begin
+        Statement::CreateCatalogObject(c) => {
+            vec![format!("Create {} {}", c.kind.keyword(), c.name)]
+        }
+        Statement::DropCatalogObject(d) => {
+            vec![format!("Drop {} {}", d.kind.keyword(), d.name)]
+        }
+        Statement::PrepareTransaction { gid } => vec![format!("Prepare Transaction {gid}")],
+        Statement::CommitPrepared { gid } => vec![format!("Commit Prepared {gid}")],
+        Statement::RollbackPrepared { gid } => vec![format!("Rollback Prepared {gid}")],
+        Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. }
         | Statement::RollbackToSavepoint { .. }
+        | Statement::SetConstraints
+        | Statement::SetTransaction { .. }
         | Statement::Empty => vec!["Result".into()],
     }
 }
 
-fn exec_analyze(db: &Database, analyze: Analyze) -> Result<ExecResult, String> {
-    if let Some(table) = &analyze.table {
-        if !db.contains_table(table) {
-            return Err(format!("relation \"{table}\" does not exist"));
+fn exec_analyze(db: &mut Database, analyze: Analyze) -> Result<ExecResult, String> {
+    match &analyze.table {
+        Some(table) => {
+            let t = db
+                .table_mut(table)
+                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
+            t.analyze_stats();
+        }
+        // Bare `ANALYZE` refreshes statistics for every base table.
+        None => {
+            for name in db.table_names() {
+                if let Some(t) = db.table_mut(&name) {
+                    t.analyze_stats();
+                }
+            }
         }
     }
     Ok(ExecResult::Command("ANALYZE".into()))
@@ -732,22 +1048,30 @@ fn discard_tag(discard: &Discard) -> &'static str {
     }
 }
 
-fn explain_select(sel: &Select) -> Vec<String> {
+fn explain_select(db: &Database, sel: &Select) -> Vec<String> {
     let mut lines = Vec::new();
-    let root = if sel.from.is_none() {
-        "Result".to_string()
-    } else if sel.from.as_ref().is_some_and(|from| !from.joins.is_empty()) {
-        "Nested Loop".to_string()
-    } else if let Some(from) = &sel.from {
-        if !from.base.args.is_empty() {
-            format!("Function Scan on {}", from.base.name)
-        } else {
-            format!("Seq Scan on {}", from.base.name)
+    match &sel.from {
+        None => lines.push("Result".to_string()),
+        Some(from) if !from.joins.is_empty() => {
+            // Reorder contiguous inner/cross joins by estimated cardinality when
+            // it is safe; reflect the chosen drive order in the plan.
+            let planned = reorder_inner_joins(db, from);
+            let effective = planned.as_ref().unwrap_or(from);
+            lines.push("Nested Loop".to_string());
+            // List the scanned relations in join (drive) order, smallest first.
+            lines.push(format!("  -> {}", scan_line(db, &effective.base, None)));
+            for j in &effective.joins {
+                lines.push(format!("  -> {}", scan_line(db, &j.table, j.on.as_ref())));
+            }
         }
-    } else {
-        "Result".to_string()
-    };
-    lines.push(root);
+        Some(from) => {
+            if !from.base.args.is_empty() {
+                lines.push(format!("Function Scan on {}", from.base.name));
+            } else {
+                lines.push(scan_line(db, &from.base, sel.filter.as_ref()));
+            }
+        }
+    }
     if sel.filter.is_some() {
         lines.push("  Filter".into());
     }
@@ -764,6 +1088,30 @@ fn explain_select(sel: &Select) -> Vec<String> {
         lines.push("  Limit".into());
     }
     lines
+}
+
+/// Render a single relation's scan node for EXPLAIN: the cost-chosen access
+/// path (Index Scan vs Seq Scan) plus an estimated output row count. Non-table
+/// sources (subqueries, set-returning functions, catalog views) fall back to a
+/// plain "Seq Scan on <name>" without an estimate.
+fn scan_line(db: &Database, tref: &TableRef, filter: Option<&Expr>) -> String {
+    if !tref.args.is_empty() || tref.subquery.is_some() {
+        return format!("Scan on {}", tref.qualifier());
+    }
+    match db.table(&tref.name) {
+        Some(table) => match choose_access_path(table, filter) {
+            AccessPath::IndexScan { index, est_rows } => {
+                format!(
+                    "Index Scan using {index} on {} (rows={est_rows})",
+                    tref.qualifier()
+                )
+            }
+            AccessPath::SeqScan { est_rows } => {
+                format!("Seq Scan on {} (rows={est_rows})", tref.qualifier())
+            }
+        },
+        None => format!("Seq Scan on {}", tref.qualifier()),
+    }
 }
 
 /// Derive the output field list of a SELECT from the schema alone.
@@ -939,6 +1287,24 @@ fn build_source(
 }
 
 fn build_source_with_ctes(
+    db: &mut Database,
+    from: &FromClause,
+    filter: Option<&Expr>,
+    ctes: &CteMap,
+) -> Result<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>), String> {
+    // Cost-based join reordering: for a contiguous run of inner/cross joins over
+    // real base tables, drive from the smallest estimated relation. This only
+    // changes the order rows are produced *internally*; the SELECT applies its
+    // projection/ORDER BY afterward, so observable results are unchanged. Only
+    // applied when proven safe (see `reorder_inner_joins`); otherwise the
+    // written order is kept verbatim.
+    if let Some(reordered) = reorder_inner_joins(db, from) {
+        return build_source_ordered(db, &reordered, filter, ctes);
+    }
+    build_source_ordered(db, from, filter, ctes)
+}
+
+fn build_source_ordered(
     db: &mut Database,
     from: &FromClause,
     filter: Option<&Expr>,
@@ -1125,7 +1491,10 @@ fn resolve_base_source(
     let is_real = tref.schema.as_deref() != Some("information_schema")
         && tref.schema.as_deref() != Some("pg_catalog")
         && !is_pg_catalog_table(&tref.name);
-    if let (true, Some(pred)) = (is_real, filter) {
+    // The index-pruning shortcut returns only this table's own rows; skip it
+    // when the scan must also union inheritance children / partitions.
+    let has_descendants = !tref.only && !db.descendant_tables(&tref.name).is_empty();
+    if let (true, false, Some(pred)) = (is_real, has_descendants, filter) {
         if let Some(table) = db.table(&tref.name) {
             if let Some(positions) = index_candidate_positions(table, pred) {
                 let mut names = Vec::with_capacity(table.columns.len());
@@ -1289,7 +1658,35 @@ fn resolve_source_table(
         names.push(format!("{}.{}", tref.qualifier(), c.name));
         types.push(c.data_type);
     }
-    Ok((names, types, table.rows.clone()))
+    let mut rows = table.rows.clone();
+    // Inheritance / partitioning: unless `ONLY` was written, a scan of a parent
+    // also returns rows from every descendant table, projected onto the parent's
+    // column set (matched by column name; descendant-only columns dropped).
+    if !tref.only {
+        let parent_columns: Vec<String> = table.column_names();
+        let descendants = db.descendant_tables(&tref.name);
+        for child_name in descendants {
+            let Some(child) = db.table(&child_name) else {
+                continue;
+            };
+            // Map each parent column to the child's column of the same name.
+            let projection: Vec<Option<usize>> = parent_columns
+                .iter()
+                .map(|name| child.column_index(name))
+                .collect();
+            for child_row in &child.rows {
+                let projected: Vec<Value> = projection
+                    .iter()
+                    .map(|slot| match slot {
+                        Some(i) => child_row[*i].clone(),
+                        None => Value::Null,
+                    })
+                    .collect();
+                rows.push(projected);
+            }
+        }
+    }
+    Ok((names, types, rows))
 }
 
 /// Execute a derived-table subquery and return its rows with each output column
@@ -1321,6 +1718,34 @@ fn virtual_set_returning_function(
             let name = format!("{}.generate_series", tref.qualifier());
             let rows = values.into_iter().map(|v| vec![Value::Int(v)]).collect();
             Ok((vec![name], vec![DataType::Int8], rows))
+        }
+        "unnest" => {
+            let elems = eval_unnest(&tref.args)?;
+            let name = format!("{}.unnest", tref.qualifier());
+            let rows = elems.into_iter().map(|v| vec![v]).collect();
+            Ok((vec![name], vec![DataType::Text], rows))
+        }
+        // Partitioning is not implemented; a table is its own (only) ancestor /
+        // root. psql's `\d` referenced-by probe uses these as set-returning
+        // functions, expecting the relation's own OID back.
+        "pg_partition_ancestors" | "pg_partition_root" => {
+            let oid = tref
+                .args
+                .first()
+                .and_then(|a| eval_expr(a, &[], &[]).ok())
+                .map(|v| match v {
+                    Value::Int(i) => i,
+                    other => REGCLASS_OIDS
+                        .with(|cell| {
+                            cell.borrow()
+                                .get(other.to_text().unwrap_or_default().trim_matches('"'))
+                                .copied()
+                        })
+                        .unwrap_or(0),
+                })
+                .unwrap_or(0);
+            let name = format!("{}.{}", tref.qualifier(), tref.name.to_ascii_lowercase());
+            Ok((vec![name], vec![DataType::Int8], vec![vec![Value::Int(oid)]]))
         }
         other => Err(format!("set-returning function {other}() is not supported")),
     }
@@ -1600,6 +2025,15 @@ fn collect_eq_facts<'a>(conjuncts: &[&'a Expr], target: &Table) -> EqFacts<'a> {
 fn advanced_index_positions(table: &Table, filter: &Expr) -> Option<Vec<usize>> {
     let mut conjuncts = Vec::new();
     and_conjuncts(filter, &mut conjuncts);
+
+    // GIN containment: `col @> <const array>` over a column with a GIN index.
+    // Return the rows whose array holds every needle element; the executor
+    // re-checks the real predicate, so this is exact-or-superset (and thus
+    // scan-identical) regardless of tokenisation nuances.
+    if let Some(positions) = gin_index_positions(table, &conjuncts) {
+        return Some(positions);
+    }
+
     let facts = collect_eq_facts(&conjuncts, table);
 
     for (i, idx) in table.indexes().iter().enumerate() {
@@ -1663,8 +2097,9 @@ fn advanced_index_positions(table: &Table, filter: &Expr) -> Option<Vec<usize>> 
         if key.len() == idx.columns.len() {
             return Some(table.index_eq_multi(i, &key));
         }
-        // Leading-prefix match: use a prefix scan over the B-tree.
-        if idx.method == crate::index::IndexMethod::Btree {
+        // Leading-prefix match: use a prefix scan over an ordered (B-tree-style)
+        // store. Hash/BRIN/GIN have no ordered prefix lookup.
+        if idx.method.is_ordered() {
             return Some(table.index_prefix_multi(i, &key));
         }
     }
@@ -1675,6 +2110,676 @@ fn advanced_index_positions(table: &Table, filter: &Expr) -> Option<Vec<usize>> 
 /// against a predicate's operand. Relies on the AST's derived `PartialEq`.
 fn exprs_equal(a: &Expr, b: &Expr) -> bool {
     a == b
+}
+
+/// Try to satisfy a `col @> <const array>` conjunct with a GIN index on `col`.
+/// Returns candidate row positions (the rows whose array contains every needle
+/// element), or `None` when no such GIN-backed conjunct is present.
+fn gin_index_positions(table: &Table, conjuncts: &[&Expr]) -> Option<Vec<usize>> {
+    for c in conjuncts {
+        let Expr::Binary {
+            op: BinaryOp::ArrayContains,
+            left,
+            right,
+        } = c
+        else {
+            continue;
+        };
+        // `col @> const`: left is the indexed column, right a constant array.
+        let Some(col) = column_index_of(left, table) else {
+            continue;
+        };
+        let Some((i, _)) = table.gin_index_on(col) else {
+            continue;
+        };
+        // Evaluate the RHS to its array text and split into element needles.
+        let Ok(rhs) = eval_expr(right, &[], &[]) else {
+            continue;
+        };
+        let Some(text) = rhs.to_text() else { continue };
+        let Some(elems) = parse_array_text(&text) else {
+            continue;
+        };
+        // NULL needles never match containment; drop them.
+        let needles: Vec<String> = elems.into_iter().flatten().collect();
+        if let Some(positions) = table.gin_contains_positions(i, &needles) {
+            return Some(positions);
+        }
+    }
+    None
+}
+
+// --- cost-based planner ------------------------------------------------------
+
+/// Default selectivity for a range/inequality when no better estimate exists
+/// (PostgreSQL uses 1/3 for a bare inequality).
+const DEFAULT_RANGE_SELECTIVITY: f64 = 0.3333;
+/// Fallback selectivity for an equality when the column has no statistics.
+const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
+
+/// The access path the planner chose for a single base relation, used both to
+/// drive execution hints and to render EXPLAIN.
+#[derive(Debug, Clone, PartialEq)]
+enum AccessPath {
+    /// Sequential scan; estimated output row count.
+    SeqScan { est_rows: usize },
+    /// Index scan using the named index; estimated output row count.
+    IndexScan { index: String, est_rows: usize },
+}
+
+/// Base row count to plan against: the analyzed `reltuples` when present,
+/// otherwise the live row count.
+fn base_row_estimate(table: &Table) -> usize {
+    table
+        .stats()
+        .map(|s| s.reltuples)
+        .unwrap_or_else(|| table.rows.len())
+}
+
+/// Estimate the selectivity (fraction of rows kept, in `[0,1]`) of `filter`
+/// against `table`, using collected statistics where available. Conjunctions
+/// multiply selectivities (assuming independence); unrecognised shapes are
+/// treated as selectivity 1.0 (no estimate → assume nothing is filtered).
+fn estimate_selectivity(table: &Table, filter: &Expr) -> f64 {
+    let mut conjuncts = Vec::new();
+    and_conjuncts(filter, &mut conjuncts);
+    let mut sel = 1.0;
+    for c in &conjuncts {
+        sel *= conjunct_selectivity(table, c);
+    }
+    sel.clamp(0.0, 1.0)
+}
+
+/// Selectivity of a single (non-AND) predicate against `table`.
+fn conjunct_selectivity(table: &Table, c: &Expr) -> f64 {
+    match c {
+        // Equality: 1/ndistinct from stats, else a default.
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => {
+            let col = column_index_of(left, table)
+                .filter(|_| const_value(right).is_some())
+                .or_else(|| column_index_of(right, table).filter(|_| const_value(left).is_some()));
+            match col.and_then(|c| table.column_stats(c)) {
+                Some(stats) if stats.ndistinct > 0 => {
+                    (1.0 - stats.null_frac) / stats.ndistinct as f64
+                }
+                _ if col.is_some() => DEFAULT_EQ_SELECTIVITY,
+                _ => 1.0,
+            }
+        }
+        // Ranges / inequalities: a fixed fraction of non-null rows.
+        Expr::Binary {
+            op: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            left,
+            right,
+        } => {
+            let col = column_index_of(left, table)
+                .filter(|_| const_value(right).is_some())
+                .or_else(|| column_index_of(right, table).filter(|_| const_value(left).is_some()));
+            if col.is_some() {
+                DEFAULT_RANGE_SELECTIVITY
+            } else {
+                1.0
+            }
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            ..
+        } => {
+            if column_index_of(expr, table).is_some() {
+                DEFAULT_RANGE_SELECTIVITY
+            } else {
+                1.0
+            }
+        }
+        // IN list: k * eq-selectivity, capped at 1.
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => match column_index_of(expr, table) {
+            Some(col) => {
+                let each = match table.column_stats(col) {
+                    Some(stats) if stats.ndistinct > 0 => {
+                        (1.0 - stats.null_frac) / stats.ndistinct as f64
+                    }
+                    _ => DEFAULT_EQ_SELECTIVITY,
+                };
+                (each * list.len() as f64).min(1.0)
+            }
+            None => 1.0,
+        },
+        _ => 1.0,
+    }
+}
+
+/// Estimated number of rows a base relation contributes after `filter`.
+fn estimate_relation_rows(table: &Table, filter: Option<&Expr>) -> usize {
+    let base = base_row_estimate(table);
+    match filter {
+        // Clamp to >= 1 when the relation is non-empty (PostgreSQL never
+        // estimates a selective scan at 0 rows), and never above the base.
+        Some(pred) => {
+            let est = ((base as f64) * estimate_selectivity(table, pred)).round() as usize;
+            est.clamp(if base == 0 { 0 } else { 1 }, base)
+        }
+        None => base,
+    }
+}
+
+/// Choose between a sequential scan and an available index for `table` under
+/// `filter`, using a simple row-based cost model. The index wins only when it
+/// applies *and* its estimated output is cheaper than scanning every row; with
+/// no statistics this reduces to the existing rule (use the index whenever the
+/// predicate is index-eligible).
+fn choose_access_path(table: &Table, filter: Option<&Expr>) -> AccessPath {
+    let base = base_row_estimate(table);
+    let est_rows = estimate_relation_rows(table, filter);
+
+    if let Some(pred) = filter {
+        if let Some(index_name) = applicable_index_name(table, pred) {
+            // Cost model: a seq scan touches every row; an index scan touches
+            // roughly the matching rows plus a small descent constant. Prefer
+            // the index when it is expected to be cheaper. Without stats,
+            // `est_rows == base`, so the `<=` keeps the legacy "use the index"
+            // behaviour (ties go to the index, matching prior heuristics).
+            let seq_cost = base as f64;
+            let index_cost = est_rows as f64 + 1.0;
+            if index_cost <= seq_cost {
+                return AccessPath::IndexScan {
+                    index: index_name,
+                    est_rows,
+                };
+            }
+        }
+    }
+    AccessPath::SeqScan { est_rows }
+}
+
+// --- join reordering ---------------------------------------------------------
+
+/// Greedily reorder a FROM clause's relations to drive the join from the
+/// smallest estimated relation, when it is *provably safe* to do so. Returns a
+/// reordered `FromClause` or `None` to keep the written order.
+///
+/// Safety constraints (any violation → `None`, no reordering):
+///   * every join is INNER or CROSS (commutative/associative); a single
+///     LEFT/RIGHT/FULL outer join makes the whole list non-reorderable here;
+///   * no LATERAL / subquery / set-returning-function source (correlation or
+///     unknown cardinality);
+///   * every source is a real base table (so we can estimate its size and know
+///     its qualifier);
+///   * each relation's ON predicate references only relations placed before it
+///     in the chosen order, and every referenced column is *qualified* (so we
+///     can resolve which relation it belongs to). This preserves the executor's
+///     invariant that a join's ON predicate sees only the accumulated-left
+///     schema, guaranteeing identical results.
+fn reorder_inner_joins(db: &Database, from: &FromClause) -> Option<FromClause> {
+    if from.joins.is_empty() {
+        return None;
+    }
+    // Collect the relations as (qualifier, TableRef, ON-predicate). The base has
+    // no ON predicate.
+    let mut rels: Vec<(&TableRef, Option<&Expr>)> = vec![(&from.base, None)];
+    for j in &from.joins {
+        if !matches!(j.kind, JoinKind::Inner | JoinKind::Cross) {
+            return None;
+        }
+        rels.push((&j.table, j.on.as_ref()));
+    }
+    // Every source must be a plain real base table we can size.
+    for (tref, _) in &rels {
+        if tref.lateral || tref.subquery.is_some() || !tref.args.is_empty() {
+            return None;
+        }
+        if db.table(&tref.name).is_none() {
+            return None;
+        }
+    }
+    let n = rels.len();
+    let qualifiers: Vec<String> = rels.iter().map(|(t, _)| t.qualifier().to_string()).collect();
+
+    // The ON predicates form a *pool* of join conditions, each tagged with the
+    // set of qualifiers it references. They are not tied to a particular
+    // relation: when the relations they reference are all placed, the predicate
+    // can be attached to whichever join introduces the last of them. Every
+    // referenced column must be qualified and name a relation in this FROM.
+    struct Cond {
+        qs: Vec<String>,
+        expr: Expr,
+    }
+    let mut pool: Vec<Cond> = Vec::new();
+    for (_, on) in &rels {
+        if let Some(pred) = on {
+            let mut qs = Vec::new();
+            if !collect_qualifiers(pred, &mut qs) {
+                return None; // unqualified column → cannot prove safety
+            }
+            if qs.iter().any(|q| !qualifiers.contains(q)) {
+                return None; // references something outside this FROM
+            }
+            pool.push(Cond {
+                qs,
+                expr: (*pred).clone(),
+            });
+        }
+    }
+
+    // Per-relation filtered-size estimate (ignoring join conditions, which are
+    // applied later as part of the join — the greedy heuristic drives off base
+    // cardinality, classic minimum-selectivity-first).
+    let est: Vec<usize> = rels
+        .iter()
+        .map(|(t, _)| {
+            db.table(&t.name)
+                .map(|tbl| estimate_relation_rows(tbl, None))
+                .unwrap_or(usize::MAX)
+        })
+        .collect();
+
+    // Seed with the smallest base relation overall.
+    let seed = (0..n).min_by_key(|&i| (est[i], i))?;
+    let mut placed: Vec<usize> = vec![seed];
+    let mut placed_quals: std::collections::HashSet<String> =
+        std::collections::HashSet::from([qualifiers[seed].clone()]);
+
+    // Whether a relation is connected to the already-placed set by some pooled
+    // condition (all of that condition's *other* qualifiers already placed, so
+    // attaching it once this relation joins is sound).
+    let connected = |i: usize, placed_quals: &std::collections::HashSet<String>| -> bool {
+        pool.iter().any(|c| {
+            c.qs.contains(&qualifiers[i])
+                && c.qs
+                    .iter()
+                    .all(|q| *q == qualifiers[i] || placed_quals.contains(q))
+        })
+    };
+
+    while placed.len() < n {
+        // Prefer a relation that is connected by a join condition; among those,
+        // the smallest estimated cardinality. If none is connected (a cross
+        // product with no ON anywhere bridging it yet), fall back to the
+        // smallest remaining relation so we still produce a valid full order.
+        let mut best_connected: Option<usize> = None;
+        let mut best_any: Option<usize> = None;
+        for i in 0..n {
+            if placed.contains(&i) {
+                continue;
+            }
+            best_any = Some(match best_any {
+                Some(b) if (est[b], b) <= (est[i], i) => b,
+                _ => i,
+            });
+            if connected(i, &placed_quals) {
+                best_connected = Some(match best_connected {
+                    Some(b) if (est[b], b) <= (est[i], i) => b,
+                    _ => i,
+                });
+            }
+        }
+        let pick = best_connected.or(best_any)?;
+        placed.push(pick);
+        placed_quals.insert(qualifiers[pick].clone());
+    }
+
+    // If the order is unchanged, signal "no reordering" so EXPLAIN/exec stay on
+    // the original fast path.
+    if placed == (0..n).collect::<Vec<_>>() {
+        return None;
+    }
+
+    // Rebuild the FROM clause in the chosen order. Each newly placed relation
+    // takes every pooled condition that becomes fully satisfied at its
+    // placement (combined via AND); a relation with no condition yet is a CROSS
+    // join. Every condition is attached exactly once.
+    let new_base = rels[placed[0]].0.clone();
+    let mut new_joins = Vec::with_capacity(n - 1);
+    let mut attached = vec![false; pool.len()];
+    let mut have: std::collections::HashSet<String> =
+        std::collections::HashSet::from([qualifiers[placed[0]].clone()]);
+    for &idx in &placed[1..] {
+        have.insert(qualifiers[idx].clone());
+        let mut on: Option<Expr> = None;
+        for (ci, c) in pool.iter().enumerate() {
+            if attached[ci] {
+                continue;
+            }
+            if c.qs.iter().all(|q| have.contains(q)) {
+                attached[ci] = true;
+                on = Some(match on.take() {
+                    Some(prev) => Expr::Binary {
+                        op: BinaryOp::And,
+                        left: Box::new(prev),
+                        right: Box::new(c.expr.clone()),
+                    },
+                    None => c.expr.clone(),
+                });
+            }
+        }
+        let kind = if on.is_some() {
+            JoinKind::Inner
+        } else {
+            JoinKind::Cross
+        };
+        new_joins.push(Join {
+            kind,
+            table: rels[idx].0.clone(),
+            on,
+        });
+    }
+    // Sanity: every condition must have been attached. If not (shouldn't happen
+    // given the connectivity walk), refuse to reorder rather than drop a
+    // predicate and change results.
+    if attached.iter().any(|a| !a) {
+        return None;
+    }
+    Some(FromClause {
+        base: new_base,
+        joins: new_joins,
+    })
+}
+
+/// Collect the distinct column qualifiers referenced in `expr`. Returns `false`
+/// if any *unqualified* column reference is found (we cannot attribute it to a
+/// relation, so the caller must treat the predicate as non-reorderable).
+fn collect_qualifiers(expr: &Expr, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Column(_) => false,
+        Expr::QualifiedColumn { qualifier, .. } => {
+            if !out.contains(qualifier) {
+                out.push(qualifier.clone());
+            }
+            true
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_qualifiers(left, out) && collect_qualifiers(right, out)
+        }
+        Expr::Unary { expr, .. } => collect_qualifiers(expr, out),
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Param(_) => true,
+        Expr::Cast { expr, .. } => collect_qualifiers(expr, out),
+        // Any other shape (functions, subqueries, IN-lists, ...): be
+        // conservative and refuse to reorder.
+        _ => false,
+    }
+}
+
+/// Name of an index that could satisfy `filter` on `table`, mirroring the
+/// eligibility logic used by `index_candidate_positions` (advanced indexes
+/// first, then a plain single-column index).
+fn applicable_index_name(table: &Table, filter: &Expr) -> Option<String> {
+    let mut conjuncts = Vec::new();
+    and_conjuncts(filter, &mut conjuncts);
+    let facts = collect_eq_facts(&conjuncts, table);
+    // Advanced (multi-column / expression / partial) indexes.
+    for idx in table.indexes() {
+        if idx
+            .predicate
+            .as_ref()
+            .is_some_and(|pred| !conjuncts.contains(&pred))
+        {
+            continue;
+        }
+        if let Some(iexpr) = &idx.expr {
+            for (l, r) in &facts.pairs {
+                if (exprs_equal(l, iexpr) && const_value(r).is_some())
+                    || (exprs_equal(r, iexpr) && const_value(l).is_some())
+                {
+                    return Some(idx.name.clone());
+                }
+            }
+            continue;
+        }
+        if idx.columns.len() == 1 && idx.predicate.is_some() {
+            return Some(idx.name.clone());
+        }
+        if idx.columns.len() > 1 {
+            if let Some(&first) = idx.columns.first() {
+                if facts.by_column.contains_key(&first) {
+                    return Some(idx.name.clone());
+                }
+            }
+        }
+    }
+    // Plain single-column index via the simple planner.
+    if let Some((col, _plan)) = plan_index_access(filter, table) {
+        if let Some(idx) = table.index_on(col).or_else(|| table.eq_index_on(col)) {
+            return Some(idx.name.clone());
+        }
+    }
+    None
+}
+
+/// `information_schema.columns.numeric_precision` for a built-in type, or NULL.
+fn type_numeric_precision(dt: DataType) -> Value {
+    match dt {
+        DataType::Int2 => Value::Int(16),
+        DataType::Int4 => Value::Int(32),
+        DataType::Int8 | DataType::Money => Value::Int(64),
+        DataType::Float4 => Value::Int(24),
+        DataType::Float8 => Value::Int(53),
+        // `numeric` without a declared precision is unconstrained -> NULL.
+        _ => Value::Null,
+    }
+}
+
+/// `information_schema.columns.numeric_scale` for a built-in type, or NULL.
+fn type_numeric_scale(dt: DataType) -> Value {
+    match dt {
+        DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Money => Value::Int(0),
+        _ => Value::Null,
+    }
+}
+
+/// `information_schema.columns.datetime_precision` for date/time types.
+fn type_datetime_precision(dt: DataType) -> Value {
+    match dt {
+        DataType::Date => Value::Int(0),
+        DataType::Time
+        | DataType::TimeTz
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Interval => Value::Int(6),
+        _ => Value::Null,
+    }
+}
+
+/// `(table_name, constraint_name, type)` for every constraint, where `type` is
+/// the SQL standard label (`PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `CHECK`).
+fn collect_constraints(db: &Database) -> Vec<(String, String, &'static str)> {
+    let mut out = Vec::new();
+    for table_name in db.table_names() {
+        let Some(table) = db.table(&table_name) else {
+            continue;
+        };
+        for index in table.indexes() {
+            if !index.unique {
+                continue;
+            }
+            let is_pk = index
+                .leading_column()
+                .is_some_and(|c| table.columns[c].primary_key);
+            out.push((
+                table_name.clone(),
+                index.name.clone(),
+                if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+            ));
+        }
+        for c in table.unique_constraints() {
+            out.push((
+                table_name.clone(),
+                c.name.clone(),
+                if c.primary_key { "PRIMARY KEY" } else { "UNIQUE" },
+            ));
+        }
+        for c in table.foreign_key_constraints() {
+            out.push((table_name.clone(), c.name.clone(), "FOREIGN KEY"));
+        }
+        for c in table.check_constraints() {
+            out.push((table_name.clone(), c.name.clone(), "CHECK"));
+        }
+    }
+    out
+}
+
+/// One row of `information_schema.key_column_usage`.
+struct KeyColumn {
+    constraint_name: String,
+    table_name: String,
+    column_name: String,
+    ordinal: i64,
+    /// For an FK column, its position in the referenced unique key.
+    unique_position: Option<i64>,
+}
+
+fn collect_key_columns(db: &Database) -> Vec<KeyColumn> {
+    let mut out = Vec::new();
+    for table_name in db.table_names() {
+        let Some(table) = db.table(&table_name) else {
+            continue;
+        };
+        let col_name = |i: usize| table.columns[i].name.clone();
+        for index in table.indexes() {
+            if !index.unique {
+                continue;
+            }
+            for (pos, &c) in index.columns.iter().enumerate() {
+                out.push(KeyColumn {
+                    constraint_name: index.name.clone(),
+                    table_name: table_name.clone(),
+                    column_name: col_name(c),
+                    ordinal: pos as i64 + 1,
+                    unique_position: None,
+                });
+            }
+        }
+        for uc in table.unique_constraints() {
+            for (pos, &c) in uc.columns.iter().enumerate() {
+                out.push(KeyColumn {
+                    constraint_name: uc.name.clone(),
+                    table_name: table_name.clone(),
+                    column_name: col_name(c),
+                    ordinal: pos as i64 + 1,
+                    unique_position: None,
+                });
+            }
+        }
+        for fk in table.foreign_key_constraints() {
+            out.push(KeyColumn {
+                constraint_name: fk.name.clone(),
+                table_name: table_name.clone(),
+                column_name: col_name(fk.column),
+                ordinal: 1,
+                unique_position: Some(1),
+            });
+        }
+    }
+    out
+}
+
+/// One row of `information_schema.constraint_column_usage`.
+struct ConstraintColumnUsage {
+    table_name: String,
+    column_name: String,
+    constraint_name: String,
+}
+
+fn collect_constraint_column_usage(db: &Database) -> Vec<ConstraintColumnUsage> {
+    let mut out = Vec::new();
+    for table_name in db.table_names() {
+        let Some(table) = db.table(&table_name) else {
+            continue;
+        };
+        let col_name = |i: usize| table.columns[i].name.clone();
+        for index in table.indexes() {
+            if !index.unique {
+                continue;
+            }
+            for &c in &index.columns {
+                out.push(ConstraintColumnUsage {
+                    table_name: table_name.clone(),
+                    column_name: col_name(c),
+                    constraint_name: index.name.clone(),
+                });
+            }
+        }
+        for uc in table.unique_constraints() {
+            for &c in &uc.columns {
+                out.push(ConstraintColumnUsage {
+                    table_name: table_name.clone(),
+                    column_name: col_name(c),
+                    constraint_name: uc.name.clone(),
+                });
+            }
+        }
+        // For a FK, the referenced (parent) column is what is "used".
+        for fk in table.foreign_key_constraints() {
+            out.push(ConstraintColumnUsage {
+                table_name: fk.ref_table.clone(),
+                column_name: fk.ref_column.clone(),
+                constraint_name: fk.name.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// One row of `information_schema.referential_constraints`.
+struct ReferentialConstraint {
+    constraint_name: String,
+    unique_constraint_name: String,
+}
+
+fn collect_referential_constraints(db: &Database) -> Vec<ReferentialConstraint> {
+    let mut out = Vec::new();
+    for table_name in db.table_names() {
+        let Some(table) = db.table(&table_name) else {
+            continue;
+        };
+        for fk in table.foreign_key_constraints() {
+            // Best-effort: name the parent's PK/unique constraint backing the
+            // referenced column.
+            let unique_constraint_name = db
+                .table(&fk.ref_table)
+                .and_then(|parent| {
+                    parent
+                        .indexes()
+                        .iter()
+                        .find(|i| {
+                            i.unique
+                                && i.columns
+                                    .iter()
+                                    .any(|&c| parent.columns[c].name == fk.ref_column)
+                        })
+                        .map(|i| i.name.clone())
+                        .or_else(|| {
+                            parent
+                                .unique_constraints()
+                                .iter()
+                                .find(|u| {
+                                    u.columns
+                                        .iter()
+                                        .any(|&c| parent.columns[c].name == fk.ref_column)
+                                })
+                                .map(|u| u.name.clone())
+                        })
+                })
+                .unwrap_or_else(|| format!("{}_pkey", fk.ref_table));
+            out.push(ReferentialConstraint {
+                constraint_name: fk.name.clone(),
+                unique_constraint_name,
+            });
+        }
+    }
+    out
 }
 
 /// Generate the rows of a supported `information_schema` view from the live
@@ -1735,24 +2840,234 @@ fn virtual_information_schema(
                 ("table_name", DataType::Text),
                 ("column_name", DataType::Text),
                 ("ordinal_position", DataType::Int4),
-                ("data_type", DataType::Text),
+                ("column_default", DataType::Text),
                 ("is_nullable", DataType::Text),
+                ("data_type", DataType::Text),
+                ("character_maximum_length", DataType::Int4),
+                ("numeric_precision", DataType::Int4),
+                ("numeric_scale", DataType::Int4),
+                ("datetime_precision", DataType::Int4),
+                ("udt_catalog", DataType::Text),
+                ("udt_schema", DataType::Text),
+                ("udt_name", DataType::Text),
+                ("is_identity", DataType::Text),
+                ("is_generated", DataType::Text),
             ];
             let mut rows = Vec::new();
             for t in db.table_names() {
                 if let Some(table) = db.table(&t) {
                     for (i, c) in table.columns.iter().enumerate() {
+                        let default = c
+                            .default
+                            .as_ref()
+                            .or(c.generated.as_ref())
+                            .map(|e| Value::Text(expr_to_sql(e)))
+                            .unwrap_or(Value::Null);
+                        let dt = c.data_type;
                         rows.push(vec![
                             txt("postgres"),
                             txt("public"),
                             Value::Text(t.clone()),
                             Value::Text(c.name.clone()),
                             Value::Int(i as i64 + 1),
-                            Value::Text(c.data_type.sql_name().to_string()),
+                            default,
                             txt(if c.not_null { "NO" } else { "YES" }),
+                            Value::Text(dt.sql_name().to_string()),
+                            Value::Null, // character_maximum_length (typmod not retained)
+                            type_numeric_precision(dt),
+                            type_numeric_scale(dt),
+                            type_datetime_precision(dt),
+                            txt("postgres"),
+                            txt("pg_catalog"),
+                            Value::Text(dt.pg_type_name().to_string()),
+                            txt(if c.identity { "YES" } else { "NO" }),
+                            txt(if c.generated.is_some() { "ALWAYS" } else { "NEVER" }),
                         ]);
                     }
                 }
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "schemata" => {
+            let cols = [
+                ("catalog_name", DataType::Text),
+                ("schema_name", DataType::Text),
+                ("schema_owner", DataType::Text),
+            ];
+            let rows = db
+                .schemas()
+                .into_iter()
+                .map(|s| vec![txt("postgres"), Value::Text(s), txt("postgres")])
+                .collect();
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "views" => {
+            let cols = [
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("view_definition", DataType::Text),
+                ("is_updatable", DataType::Text),
+            ];
+            let rows = db
+                .view_names()
+                .into_iter()
+                .map(|v| {
+                    let def = db
+                        .view(&v)
+                        .map(|view| select_to_sql(&view.select))
+                        .unwrap_or_default();
+                    vec![
+                        txt("postgres"),
+                        txt("public"),
+                        Value::Text(v),
+                        Value::Text(def),
+                        txt("NO"),
+                    ]
+                })
+                .collect();
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "sequences" => {
+            let cols = [
+                ("sequence_catalog", DataType::Text),
+                ("sequence_schema", DataType::Text),
+                ("sequence_name", DataType::Text),
+                ("data_type", DataType::Text),
+                ("start_value", DataType::Text),
+                ("minimum_value", DataType::Text),
+                ("maximum_value", DataType::Text),
+                ("increment", DataType::Text),
+                ("cycle_option", DataType::Text),
+            ];
+            let rows = db
+                .sequences()
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        txt("postgres"),
+                        txt("public"),
+                        Value::Text(s.name),
+                        txt("bigint"),
+                        Value::Text(s.start.to_string()),
+                        txt("1"),
+                        Value::Text(i64::MAX.to_string()),
+                        Value::Text(s.increment.to_string()),
+                        txt("NO"),
+                    ]
+                })
+                .collect();
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "table_constraints" => {
+            let cols = [
+                ("constraint_catalog", DataType::Text),
+                ("constraint_schema", DataType::Text),
+                ("constraint_name", DataType::Text),
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("constraint_type", DataType::Text),
+                ("is_deferrable", DataType::Text),
+                ("initially_deferred", DataType::Text),
+            ];
+            let mut rows = Vec::new();
+            for (name, cname, ctype) in collect_constraints(db) {
+                rows.push(vec![
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(cname),
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(name),
+                    Value::Text(ctype.to_string()),
+                    txt("NO"),
+                    txt("NO"),
+                ]);
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "key_column_usage" => {
+            let cols = [
+                ("constraint_catalog", DataType::Text),
+                ("constraint_schema", DataType::Text),
+                ("constraint_name", DataType::Text),
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("column_name", DataType::Text),
+                ("ordinal_position", DataType::Int4),
+                ("position_in_unique_constraint", DataType::Int4),
+            ];
+            let mut rows = Vec::new();
+            for kc in collect_key_columns(db) {
+                rows.push(vec![
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(kc.constraint_name),
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(kc.table_name),
+                    Value::Text(kc.column_name),
+                    Value::Int(kc.ordinal),
+                    kc.unique_position
+                        .map(Value::Int)
+                        .unwrap_or(Value::Null),
+                ]);
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "constraint_column_usage" => {
+            // Columns referenced by a constraint. For PK/UNIQUE these are the
+            // constrained columns; for FK they are the referenced columns.
+            let cols = [
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("column_name", DataType::Text),
+                ("constraint_catalog", DataType::Text),
+                ("constraint_schema", DataType::Text),
+                ("constraint_name", DataType::Text),
+            ];
+            let mut rows = Vec::new();
+            for u in collect_constraint_column_usage(db) {
+                rows.push(vec![
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(u.table_name),
+                    Value::Text(u.column_name),
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(u.constraint_name),
+                ]);
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "referential_constraints" => {
+            let cols = [
+                ("constraint_catalog", DataType::Text),
+                ("constraint_schema", DataType::Text),
+                ("constraint_name", DataType::Text),
+                ("unique_constraint_catalog", DataType::Text),
+                ("unique_constraint_schema", DataType::Text),
+                ("unique_constraint_name", DataType::Text),
+                ("match_option", DataType::Text),
+                ("update_rule", DataType::Text),
+                ("delete_rule", DataType::Text),
+            ];
+            let mut rows = Vec::new();
+            for r in collect_referential_constraints(db) {
+                rows.push(vec![
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(r.constraint_name),
+                    txt("postgres"),
+                    txt("public"),
+                    Value::Text(r.unique_constraint_name),
+                    txt("NONE"),
+                    txt("NO ACTION"),
+                    txt("NO ACTION"),
+                ]);
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
@@ -1788,6 +3103,15 @@ fn is_pg_catalog_table(name: &str) -> bool {
             | "pg_operator"
             | "pg_locks"
             | "pg_extension"
+            | "pg_policy"
+            | "pg_trigger"
+            | "pg_rewrite"
+            | "pg_inherits"
+            | "pg_statistic_ext"
+            | "pg_publication"
+            | "pg_publication_rel"
+            | "pg_foreign_table"
+            | "pg_partitioned_table"
     )
 }
 
@@ -1824,6 +3148,16 @@ fn user_attrdef_oid(table_index: usize, column_index: usize) -> i64 {
 
 fn user_sequence_oid(index: usize) -> i64 {
     USER_SEQUENCE_OID_BASE + index as i64
+}
+
+/// Resolve a role name to its OID via the role catalog (`pg_roles`/`pg_authid`),
+/// defaulting to 10 (the `postgres` superuser) when the role is unknown.
+fn role_oid(db: &Database, name: &str) -> i64 {
+    db.roles()
+        .iter()
+        .find(|r| r.name == name)
+        .map(|r| r.oid)
+        .unwrap_or(10)
 }
 
 fn relation_oid_by_name(db: &Database, name: &str) -> Option<i64> {
@@ -1880,6 +3214,31 @@ fn relpersistence(persistence: TablePersistence) -> &'static str {
 
 /// Generate the supported `pg_catalog` relations from the live schema, enough
 /// for `psql`'s `\dt` to list tables.
+/// Additional built-in PostgreSQL types that this engine accepts and stores as
+/// text: `(oid, typname, typcategory)`. Geometric types use category `G`,
+/// range types `R`. OIDs match upstream `pg_type.dat`.
+const EXTRA_PG_TYPES: &[(i64, &str, &str)] = &[
+    (600, "point", "G"),
+    (601, "lseg", "G"),
+    (602, "path", "G"),
+    (603, "box", "G"),
+    (604, "polygon", "G"),
+    (628, "line", "G"),
+    (718, "circle", "G"),
+    (3904, "int4range", "R"),
+    (3926, "int8range", "R"),
+    (3906, "numrange", "R"),
+    (3908, "tsrange", "R"),
+    (3910, "tstzrange", "R"),
+    (3912, "daterange", "R"),
+    (4451, "int4multirange", "R"),
+    (4536, "int8multirange", "R"),
+    (4532, "nummultirange", "R"),
+    (4533, "tsmultirange", "R"),
+    (4534, "tstzmultirange", "R"),
+    (4535, "datemultirange", "R"),
+];
+
 fn virtual_pg_catalog(
     db: &Database,
     name: &str,
@@ -1895,84 +3254,208 @@ fn virtual_pg_catalog(
                 ("relowner", DataType::Int8),
                 ("relam", DataType::Int8),
                 ("relpersistence", DataType::Text),
+                ("reltuples", DataType::Float4),
+                ("relpages", DataType::Int4),
+                ("relhasindex", DataType::Bool),
+                ("relchecks", DataType::Int2),
+                ("relhasrules", DataType::Bool),
+                ("relhastriggers", DataType::Bool),
+                ("relrowsecurity", DataType::Bool),
+                ("relforcerowsecurity", DataType::Bool),
+                ("relhasoids", DataType::Bool),
+                ("relispartition", DataType::Bool),
+                ("reltablespace", DataType::Int8),
+                ("reltoastrelid", DataType::Int8),
+                ("reloftype", DataType::Int8),
+                ("relreplident", DataType::Text),
+                ("reloptions", DataType::Text),
+                ("relpartbound", DataType::Text),
             ];
+            // Build a single row for a relation given the variable fields; the
+            // trailing defaults are shared by every relation kind.
+            #[allow(clippy::too_many_arguments)]
+            let row = |oid: i64,
+                       name: &str,
+                       kind: &str,
+                       am: i64,
+                       persistence: &str,
+                       relchecks: i64,
+                       relhasindex: bool,
+                       relhastriggers: bool,
+                       reltuples: f64,
+                       relpages: i64,
+                       relowner: i64,
+                       relrowsecurity: bool,
+                       relforcerowsecurity: bool|
+             -> Vec<Value> {
+                vec![
+                    Value::Int(oid),
+                    Value::Text(name.to_string()),
+                    Value::Int(PUBLIC_NAMESPACE_OID),
+                    Value::Text(kind.to_string()),
+                    Value::Int(relowner),
+                    Value::Int(am),
+                    Value::Text(persistence.to_string()),
+                    Value::Float(reltuples),
+                    Value::Int(relpages),
+                    Value::Bool(relhasindex),
+                    Value::Int(relchecks),
+                    Value::Bool(false), // relhasrules
+                    Value::Bool(relhastriggers),
+                    Value::Bool(relrowsecurity),
+                    Value::Bool(relforcerowsecurity),
+                    Value::Bool(false), // relhasoids
+                    Value::Bool(false), // relispartition
+                    Value::Int(0),      // reltablespace
+                    Value::Int(0),      // reltoastrelid
+                    Value::Int(0),      // reloftype
+                    Value::Text("d".to_string()), // relreplident (default)
+                    Value::Null,        // reloptions
+                    Value::Null,        // relpartbound
+                ]
+            };
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
-                let table_persistence = db
-                    .table(&table_name)
-                    .map(|table| relpersistence(table.persistence()))
+                let table = db.table(&table_name);
+                let persistence = table
+                    .map(|t| relpersistence(t.persistence()))
                     .unwrap_or("p");
-                rows.push(vec![
-                    Value::Int(user_table_oid(table_idx)),
-                    Value::Text(table_name.clone()),
-                    Value::Int(PUBLIC_NAMESPACE_OID),
-                    Value::Text("r".to_string()), // ordinary table
-                    Value::Int(10),               // owner oid (= postgres)
-                    Value::Int(0),                // access method
-                    Value::Text(table_persistence.into()),
-                ]);
-                if let Some(table) = db.table(&table_name) {
+                let has_index = table
+                    .map(|t| !t.indexes().is_empty() || !t.unique_constraints().is_empty())
+                    .unwrap_or(false);
+                let nchecks = table.map(|t| t.check_constraints().len() as i64).unwrap_or(0);
+                // Foreign keys are implemented via system triggers in real
+                // PostgreSQL (on both the referencing and referenced tables), so
+                // psql gates its FK / "Referenced by" footer queries on
+                // relhastriggers. Mirror that: a table "has triggers" if it
+                // declares an FK or is the target of one.
+                let referenced = db.table_names().iter().any(|other| {
+                    db.table(other).is_some_and(|t| {
+                        t.foreign_key_constraints()
+                            .iter()
+                            .any(|fk| fk.ref_table == table_name)
+                    })
+                });
+                let has_triggers = table
+                    .map(|t| !t.foreign_key_constraints().is_empty())
+                    .unwrap_or(false)
+                    || referenced;
+                let (reltuples, relpages) = table
+                    .map(|t| (t.reltuples() as f64, t.relpages() as i64))
+                    .unwrap_or((0.0, 0));
+                let owner_oid = table
+                    .map(|t| role_oid(db, t.owner()))
+                    .unwrap_or(10);
+                let row_security = table.map(|t| t.row_security()).unwrap_or(false);
+                let force_row_security = table.map(|t| t.force_row_security()).unwrap_or(false);
+                rows.push(row(
+                    user_table_oid(table_idx),
+                    &table_name,
+                    "r",
+                    0,
+                    persistence,
+                    nchecks,
+                    has_index,
+                    has_triggers,
+                    reltuples,
+                    relpages,
+                    owner_oid,
+                    row_security,
+                    force_row_security,
+                ));
+                if let Some(table) = table {
+                    let owner_oid = role_oid(db, table.owner());
                     for (index_idx, index) in table.indexes().iter().enumerate() {
-                        rows.push(vec![
-                            Value::Int(user_index_oid(table_idx, index_idx)),
-                            Value::Text(index.name.clone()),
-                            Value::Int(PUBLIC_NAMESPACE_OID),
-                            Value::Text("i".to_string()), // index relation
-                            Value::Int(10),
-                            Value::Int(403), // btree access method oid
-                            Value::Text(relpersistence(table.persistence()).into()),
-                        ]);
+                        rows.push(row(
+                            user_index_oid(table_idx, index_idx),
+                            &index.name,
+                            "i",
+                            403, // btree access method oid
+                            relpersistence(table.persistence()),
+                            0,
+                            false,
+                            false,
+                            0.0,
+                            0,
+                            owner_oid,
+                            false,
+                            false,
+                        ));
                     }
                     let unique_base = table.indexes().len();
                     for (constraint_idx, constraint) in
                         table.unique_constraints().iter().enumerate()
                     {
-                        rows.push(vec![
-                            Value::Int(user_index_oid(table_idx, unique_base + constraint_idx)),
-                            Value::Text(constraint.name.clone()),
-                            Value::Int(PUBLIC_NAMESPACE_OID),
-                            Value::Text("i".to_string()), // constraint-backed index relation
-                            Value::Int(10),
-                            Value::Int(403),
-                            Value::Text(relpersistence(table.persistence()).into()),
-                        ]);
+                        rows.push(row(
+                            user_index_oid(table_idx, unique_base + constraint_idx),
+                            &constraint.name,
+                            "i",
+                            403,
+                            relpersistence(table.persistence()),
+                            0,
+                            false,
+                            false,
+                            0.0,
+                            0,
+                            owner_oid,
+                            false,
+                            false,
+                        ));
                     }
                 }
             }
             let view_base = db.table_names().len();
             for (view_idx, view_name) in db.view_names().into_iter().enumerate() {
-                rows.push(vec![
-                    Value::Int(user_table_oid(view_base + view_idx)),
-                    Value::Text(view_name),
-                    Value::Int(PUBLIC_NAMESPACE_OID),
-                    Value::Text("v".to_string()), // view
-                    Value::Int(10),
-                    Value::Int(0),
-                    Value::Text("p".into()),
-                ]);
+                rows.push(row(
+                    user_table_oid(view_base + view_idx),
+                    &view_name,
+                    "v",
+                    0,
+                    "p",
+                    0,
+                    false,
+                    false,
+                    0.0,
+                    0,
+                    10,
+                    false,
+                    false,
+                ));
             }
             let materialized_base = view_base + db.view_names().len();
             for (view_idx, view_name) in db.materialized_view_names().into_iter().enumerate() {
-                rows.push(vec![
-                    Value::Int(user_table_oid(materialized_base + view_idx)),
-                    Value::Text(view_name),
-                    Value::Int(PUBLIC_NAMESPACE_OID),
-                    Value::Text("m".to_string()), // materialized view
-                    Value::Int(10),
-                    Value::Int(0),
-                    Value::Text("p".into()),
-                ]);
+                rows.push(row(
+                    user_table_oid(materialized_base + view_idx),
+                    &view_name,
+                    "m",
+                    0,
+                    "p",
+                    0,
+                    false,
+                    false,
+                    0.0,
+                    0,
+                    10,
+                    false,
+                    false,
+                ));
             }
             for (sequence_idx, sequence) in db.sequences().into_iter().enumerate() {
-                rows.push(vec![
-                    Value::Int(user_sequence_oid(sequence_idx)),
-                    Value::Text(sequence.name),
-                    Value::Int(PUBLIC_NAMESPACE_OID),
-                    Value::Text("S".to_string()), // sequence
-                    Value::Int(10),
-                    Value::Int(0),
-                    Value::Text("p".into()),
-                ]);
+                rows.push(row(
+                    user_sequence_oid(sequence_idx),
+                    &sequence.name,
+                    "S",
+                    0,
+                    "p",
+                    0,
+                    false,
+                    false,
+                    0.0,
+                    0,
+                    10,
+                    false,
+                    false,
+                ));
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
@@ -2055,9 +3538,33 @@ fn virtual_pg_catalog(
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
         "pg_am" => {
-            // Access methods: empty is fine (referenced only via LEFT JOIN).
-            let cols = [("oid", DataType::Int8), ("amname", DataType::Text)];
-            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+            // Index access methods, with their stable PostgreSQL OIDs. `amtype`
+            // is 'i' for index access methods.
+            let cols = [
+                ("oid", DataType::Int8),
+                ("amname", DataType::Text),
+                ("amhandler", DataType::Text),
+                ("amtype", DataType::Text),
+            ];
+            let rows: Vec<Vec<Value>> = [
+                (403i64, "btree"),
+                (405, "hash"),
+                (783, "gist"),
+                (2742, "gin"),
+                (4000, "spgist"),
+                (3580, "brin"),
+            ]
+            .iter()
+            .map(|&(oid, name)| {
+                vec![
+                    Value::Int(oid),
+                    Value::Text(name.into()),
+                    Value::Text(format!("{name}handler")),
+                    Value::Text("i".into()),
+                ]
+            })
+            .collect();
+            Ok(qualify_virtual(qualifier, &cols, rows))
         }
         "pg_type" => {
             let cols = [
@@ -2068,10 +3575,14 @@ fn virtual_pg_catalog(
                 ("typbyval", DataType::Bool),
                 ("typtype", DataType::Text),
                 ("typcategory", DataType::Text),
+                ("typcollation", DataType::Int8),
+                ("typelem", DataType::Int8),
+                ("typrelid", DataType::Int8),
             ];
-            let rows = DataType::ALL
+            let mut rows: Vec<Vec<Value>> = DataType::ALL
                 .iter()
                 .map(|dt| {
+                    let collation = if *dt == DataType::Text { 100 } else { 0 };
                     vec![
                         Value::Int(dt.oid() as i64),
                         Value::Text(dt.pg_type_name().into()),
@@ -2080,9 +3591,29 @@ fn virtual_pg_catalog(
                         Value::Bool(dt.type_size() > 0 && dt.type_size() <= 8),
                         Value::Text("b".into()),
                         Value::Text(type_category(*dt).into()),
+                        Value::Int(collation),
+                        Value::Int(0),
+                        Value::Int(0),
                     ]
                 })
                 .collect();
+            // Geometric and range/multirange types are text-backed in this
+            // engine but registered here (with their stable PostgreSQL OIDs and
+            // typcategory) so drivers and `\dT` can see them.
+            for &(oid, name, category) in EXTRA_PG_TYPES {
+                rows.push(vec![
+                    Value::Int(oid),
+                    Value::Text(name.into()),
+                    Value::Int(11),
+                    Value::Int(-1),
+                    Value::Bool(false),
+                    Value::Text("b".into()),
+                    Value::Text(category.into()),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Int(0),
+                ]);
+            }
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
         "pg_attribute" => {
@@ -2097,11 +3628,23 @@ fn virtual_pg_catalog(
                 ("attisdropped", DataType::Bool),
                 ("attidentity", DataType::Text),
                 ("attgenerated", DataType::Text),
+                ("atthasdef", DataType::Bool),
+                ("attcollation", DataType::Int8),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
                 if let Some(table) = db.table(&table_name) {
                     for (column_idx, column) in table.columns.iter().enumerate() {
+                        let has_def =
+                            column.default.is_some() || column.generated.is_some();
+                        // text/varchar/char collate to "default" (oid 100); other
+                        // types have no collation (0). This mirrors pg closely
+                        // enough that psql's collation subquery returns no rows.
+                        let collation = if column.data_type == DataType::Text {
+                            100
+                        } else {
+                            0
+                        };
                         rows.push(vec![
                             Value::Int(user_table_oid(table_idx)),
                             Value::Text(column.name.clone()),
@@ -2120,6 +3663,8 @@ fn virtual_pg_catalog(
                                 .into(),
                             ),
                             Value::Text(if column.generated.is_some() { "s" } else { "" }.into()),
+                            Value::Bool(has_def),
+                            Value::Int(collation),
                         ]);
                     }
                 }
@@ -2136,6 +3681,10 @@ fn virtual_pg_catalog(
                 ("indisprimary", DataType::Bool),
                 ("indisvalid", DataType::Bool),
                 ("indkey", DataType::Text),
+                ("indisclustered", DataType::Bool),
+                ("indisreplident", DataType::Bool),
+                ("indisexclusion", DataType::Bool),
+                ("indimmediate", DataType::Bool),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
@@ -2161,6 +3710,10 @@ fn virtual_pg_catalog(
                             Value::Bool(is_pk),
                             Value::Bool(true),
                             Value::Text(indkey),
+                            Value::Bool(false), // indisclustered
+                            Value::Bool(false), // indisreplident
+                            Value::Bool(false), // indisexclusion
+                            Value::Bool(true),  // indimmediate
                         ]);
                     }
                     let unique_base = table.indexes().len();
@@ -2182,6 +3735,10 @@ fn virtual_pg_catalog(
                             Value::Bool(constraint.primary_key),
                             Value::Bool(true),
                             Value::Text(indkey),
+                            Value::Bool(false), // indisclustered
+                            Value::Bool(false), // indisreplident
+                            Value::Bool(false), // indisexclusion
+                            Value::Bool(true),  // indimmediate
                         ]);
                     }
                 }
@@ -2198,6 +3755,10 @@ fn virtual_pg_catalog(
                 ("conindid", DataType::Int8),
                 ("conkey", DataType::Text),
                 ("convalidated", DataType::Bool),
+                ("condeferrable", DataType::Bool),
+                ("condeferred", DataType::Bool),
+                ("conparentid", DataType::Int8),
+                ("confrelid", DataType::Int8),
             ];
             let mut rows = Vec::new();
             for (table_idx, table_name) in db.table_names().into_iter().enumerate() {
@@ -2219,6 +3780,10 @@ fn virtual_pg_catalog(
                             Value::Int(user_index_oid(table_idx, index_idx)),
                             Value::Text((col + 1).to_string()),
                             Value::Bool(true),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Int(0),
+                            Value::Int(0),
                         ]);
                     }
                     let unique_base = table.indexes().len();
@@ -2241,6 +3806,10 @@ fn virtual_pg_catalog(
                             Value::Int(user_index_oid(table_idx, catalog_idx)),
                             Value::Text(conkey),
                             Value::Bool(true),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Int(0),
+                            Value::Int(0),
                         ]);
                     }
                     let check_base = table.indexes().len() + table.unique_constraints().len();
@@ -2254,10 +3823,15 @@ fn virtual_pg_catalog(
                             Value::Int(0),
                             Value::Text(String::new()),
                             Value::Bool(constraint.validated),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Int(0),
+                            Value::Int(0),
                         ]);
                     }
                     let fk_base = check_base + table.check_constraints().len();
                     for (fk_idx, constraint) in table.foreign_key_constraints().iter().enumerate() {
+                        let confrelid = relation_oid_by_name(db, &constraint.ref_table).unwrap_or(0);
                         rows.push(vec![
                             Value::Int(user_constraint_oid(table_idx, fk_base + fk_idx)),
                             Value::Text(constraint.name.clone()),
@@ -2267,6 +3841,10 @@ fn virtual_pg_catalog(
                             Value::Int(0),
                             Value::Text((constraint.column + 1).to_string()),
                             Value::Bool(constraint.validated),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Int(0),
+                            Value::Int(confrelid),
                         ]);
                     }
                 }
@@ -2556,59 +4134,47 @@ fn virtual_pg_catalog(
                 ("reset_val", DataType::Text),
                 ("pending_restart", DataType::Bool),
             ];
-            let mut rows = vec![
-                pg_setting_row(
-                    "server_version",
-                    db.system_setting("server_version")
-                        .map_or("16.0", String::as_str),
-                    "Preset Options",
-                    "Shows the server version.",
-                    "string",
-                ),
-                pg_setting_row(
-                    "server_encoding",
-                    db.system_setting("server_encoding")
-                        .map_or("UTF8", String::as_str),
-                    "Client Connection Defaults / Locale and Formatting",
-                    "Sets the server encoding.",
-                    "string",
-                ),
-                pg_setting_row(
-                    "client_encoding",
-                    db.system_setting("client_encoding")
-                        .map_or("UTF8", String::as_str),
-                    "Client Connection Defaults / Locale and Formatting",
-                    "Sets the client's character set encoding.",
-                    "string",
-                ),
-                pg_setting_row(
-                    "standard_conforming_strings",
-                    db.system_setting("standard_conforming_strings")
-                        .map_or("on", String::as_str),
-                    "Version and Platform Compatibility",
-                    "Causes '...' strings to treat backslashes literally.",
-                    "bool",
-                ),
-                pg_setting_row(
-                    "search_path",
-                    db.system_setting("search_path")
-                        .map_or_else(|| db.search_path(), Clone::clone)
-                        .as_str(),
-                    "Client Connection Defaults / Statement Behavior",
-                    "Sets the schema search order.",
-                    "string",
-                ),
-            ];
-            for (name, value) in db.system_settings() {
-                if rows.iter().any(|row| row[0] == Value::Text(name.clone())) {
+            // server_version is a preset (not in GUC_DEFAULTS); seed it first.
+            let server_version = db
+                .system_setting("server_version")
+                .cloned()
+                .or_else(|| {
+                    std::env::var("PGRS_SERVER_VERSION")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                })
+                .unwrap_or_else(|| "16.0".to_string());
+            let mut rows = vec![pg_setting_row(
+                "server_version",
+                &server_version,
+                "Preset Options",
+                "Shows the server version.",
+                "string",
+            )];
+            // Every effective GUC (built-in defaults overlaid with explicit
+            // settings), so custom `x.y` parameters and the timeout knobs appear.
+            for (name, value) in db.all_gucs() {
+                if name == "server_version" {
                     continue;
                 }
+                let known = crate::storage::guc_default(&name).is_some()
+                    || name.eq_ignore_ascii_case("search_path");
+                let category = if known {
+                    "Client Connection Defaults"
+                } else {
+                    "Customized Options"
+                };
+                let vartype = match value.as_str() {
+                    "on" | "off" | "true" | "false" => "bool",
+                    _ if value.parse::<i64>().is_ok() => "integer",
+                    _ => "string",
+                };
                 rows.push(pg_setting_row(
                     &name,
                     &value,
-                    "Customized Options",
-                    "Custom setting set with ALTER SYSTEM.",
-                    "string",
+                    category,
+                    &crate::storage::guc_description(&name),
+                    vartype,
                 ));
             }
             Ok(qualify_virtual(qualifier, &cols, rows))
@@ -2623,6 +4189,7 @@ fn virtual_pg_catalog(
                 ("prokind", DataType::Text),
                 ("proisstrict", DataType::Bool),
                 ("proretset", DataType::Bool),
+                ("prosecdef", DataType::Bool),
                 ("prorettype", DataType::Int8),
                 ("proargtypes", DataType::Text),
             ];
@@ -2687,7 +4254,15 @@ fn virtual_pg_catalog(
                     .collect::<Vec<_>>()
                     .join(" ");
                 let ret = f.return_type.unwrap_or(DataType::Text);
-                rows.push(pg_proc_row(oid, &f.name, "f", ret, &argtypes));
+                rows.push(pg_proc_row_full(
+                    oid,
+                    &f.name,
+                    "f",
+                    ret,
+                    &argtypes,
+                    false,
+                    f.security_definer,
+                ));
                 oid += 1;
             }
             for a in db.all_aggregates() {
@@ -2797,6 +4372,163 @@ fn virtual_pg_catalog(
                 .collect();
             Ok(qualify_virtual(qualifier, &cols, rows))
         }
+        "pg_policy" => {
+            // Row-level security policies stored on tables. They are stored and
+            // introspectable, but enforcement is moot single-user: the sole
+            // connected user is the owner/superuser, who BYPASSES RLS unless
+            // FORCE is set.
+            let cols = [
+                ("oid", DataType::Int8),
+                ("polname", DataType::Text),
+                ("polrelid", DataType::Int8),
+                ("polcmd", DataType::Text),
+                ("polpermissive", DataType::Bool),
+                ("polroles", DataType::Text),
+                ("polqual", DataType::Text),
+                ("polwithcheck", DataType::Text),
+            ];
+            let mut rows = Vec::new();
+            let mut policy_oid = 60000_i64;
+            for table_name in db.table_names() {
+                let Some(table) = db.table(&table_name) else {
+                    continue;
+                };
+                let relid = relation_oid_by_name(db, &table_name).unwrap_or(0);
+                for policy in table.policies() {
+                    // polcmd: '*' = ALL, 'r' SELECT, 'a' INSERT, 'w' UPDATE, 'd' DELETE.
+                    let polcmd = match policy.command.as_str() {
+                        "select" => "r",
+                        "insert" => "a",
+                        "update" => "w",
+                        "delete" => "d",
+                        _ => "*",
+                    };
+                    // polroles: '{0}' is PUBLIC; otherwise the role OID array.
+                    let polroles = if policy.roles.is_empty() {
+                        "{0}".to_string()
+                    } else {
+                        let oids: Vec<String> = policy
+                            .roles
+                            .iter()
+                            .map(|r| role_oid(db, r).to_string())
+                            .collect();
+                        format!("{{{}}}", oids.join(","))
+                    };
+                    rows.push(vec![
+                        Value::Int(policy_oid),
+                        Value::Text(policy.name.clone()),
+                        Value::Int(relid),
+                        Value::Text(polcmd.to_string()),
+                        Value::Bool(policy.permissive),
+                        Value::Text(polroles),
+                        policy
+                            .using
+                            .as_ref()
+                            .map(|e| Value::Text(expr_to_sql(e)))
+                            .unwrap_or(Value::Null),
+                        policy
+                            .with_check
+                            .as_ref()
+                            .map(|e| Value::Text(expr_to_sql(e)))
+                            .unwrap_or(Value::Null),
+                    ]);
+                    policy_oid += 1;
+                }
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "pg_trigger" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("tgname", DataType::Text),
+                ("tgrelid", DataType::Int8),
+                ("tgenabled", DataType::Text),
+                ("tgisinternal", DataType::Bool),
+                ("tgconstraint", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_rewrite" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("rulename", DataType::Text),
+                ("ev_class", DataType::Int8),
+                ("ev_type", DataType::Text),
+                ("is_instead", DataType::Bool),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_inherits" => {
+            let cols = [
+                ("inhrelid", DataType::Int8),
+                ("inhparent", DataType::Int8),
+                ("inhseqno", DataType::Int4),
+                ("inhdetachpending", DataType::Bool),
+            ];
+            // One row per child→parent link (covers both INHERITS and PARTITION
+            // OF). `inhseqno` numbers a child's parents from 1, in declared order.
+            let oid_of = |name: &str| -> i64 {
+                REGCLASS_OIDS.with(|cell| cell.borrow().get(name).copied().unwrap_or(0))
+            };
+            let mut rows = Vec::new();
+            for child_name in db.table_names() {
+                let Some(child) = db.table(&child_name) else {
+                    continue;
+                };
+                for (i, parent) in child.inherits().iter().enumerate() {
+                    rows.push(vec![
+                        Value::Int(oid_of(&child_name)),
+                        Value::Int(oid_of(parent)),
+                        Value::Int((i + 1) as i64),
+                        Value::Bool(false),
+                    ]);
+                }
+            }
+            Ok(qualify_virtual(qualifier, &cols, rows))
+        }
+        "pg_statistic_ext" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("stxname", DataType::Text),
+                ("stxrelid", DataType::Int8),
+                ("stxnamespace", DataType::Int8),
+                ("stxkind", DataType::Text),
+                ("stxstattarget", DataType::Int4),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_publication" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("pubname", DataType::Text),
+                ("puballtables", DataType::Bool),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_publication_rel" => {
+            let cols = [
+                ("oid", DataType::Int8),
+                ("prpubid", DataType::Int8),
+                ("prrelid", DataType::Int8),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_foreign_table" => {
+            let cols = [
+                ("ftrelid", DataType::Int8),
+                ("ftserver", DataType::Int8),
+                ("ftoptions", DataType::Text),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
+        "pg_partitioned_table" => {
+            let cols = [
+                ("partrelid", DataType::Int8),
+                ("partstrat", DataType::Text),
+                ("partnatts", DataType::Int2),
+            ];
+            Ok(qualify_virtual(qualifier, &cols, Vec::new()))
+        }
         other => Err(format!("pg_catalog.{other} is not supported")),
     }
 }
@@ -2813,6 +4545,18 @@ fn pg_proc_row_set(
     argtypes: &str,
     retset: bool,
 ) -> Vec<Value> {
+    pg_proc_row_full(oid, name, kind, ret, argtypes, retset, false)
+}
+
+fn pg_proc_row_full(
+    oid: i64,
+    name: &str,
+    kind: &str,
+    ret: DataType,
+    argtypes: &str,
+    retset: bool,
+    secdef: bool,
+) -> Vec<Value> {
     vec![
         Value::Int(oid),
         Value::Text(name.into()),
@@ -2822,6 +4566,7 @@ fn pg_proc_row_set(
         Value::Text(kind.into()),
         Value::Bool(false),
         Value::Bool(retset),
+        Value::Bool(secdef), // prosecdef
         Value::Int(ret.oid() as i64),
         Value::Text(argtypes.into()),
     ]
@@ -3015,11 +4760,59 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
         }
         return Err(format!("relation \"{}\" already exists", c.name));
     }
-    let columns: Vec<Column> = c
+
+    // Columns contributed by inheritance parents (or the partitioned parent)
+    // are prepended to the table's own, matched/merged by column name (a
+    // redeclared inherited column is dropped from the own list).
+    let mut inherited_columns: Vec<Column> = Vec::new();
+    // The list of parents to record this table as inheriting from.
+    let mut parents: Vec<String> = Vec::new();
+    if let Some(po) = &c.partition_of {
+        let parent = db
+            .table(&po.parent)
+            .ok_or_else(|| format!("relation \"{}\" does not exist", po.parent))?;
+        if parent.partition_scheme().is_none() {
+            return Err(format!("\"{}\" is not partitioned", po.parent));
+        }
+        inherited_columns = parent.columns.clone();
+        parents.push(po.parent.clone());
+    } else {
+        for parent_name in &c.inherits {
+            let parent = db
+                .table(parent_name)
+                .ok_or_else(|| format!("relation \"{parent_name}\" does not exist"))?;
+            for col in &parent.columns {
+                if !inherited_columns.iter().any(|c| c.name == col.name) {
+                    inherited_columns.push(col.clone());
+                }
+            }
+            parents.push(parent_name.clone());
+        }
+    }
+
+    let own_columns: Vec<Column> = c
         .columns
         .into_iter()
         .map(|cd| column_from_def(db, cd))
         .collect::<Result<_, _>>()?;
+    let mut columns = inherited_columns;
+    for col in own_columns {
+        if !columns.iter().any(|c| c.name == col.name) {
+            columns.push(col);
+        }
+    }
+
+    // Resolve a partition bound (for `PARTITION OF`) against the parent's key
+    // column type before the table is built.
+    let resolved_bound = if let Some(po) = &c.partition_of {
+        let parent = db.table(&po.parent).expect("parent existed above");
+        let scheme = parent.partition_scheme().expect("partitioned above").clone();
+        let key_type = parent.columns[scheme.column].data_type;
+        Some(resolve_partition_bound(&po.bound, key_type)?)
+    } else {
+        None
+    };
+
     // Auto-create a unique index for each PRIMARY KEY column so point lookups
     // on it are fast out of the box (mirrors PostgreSQL's implicit pkey index).
     let pk_indexes: Vec<(usize, String)> = columns
@@ -3029,6 +4822,21 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
         .map(|(i, col)| (i, format!("{}_{}_pkey", c.name, col.name)))
         .collect();
     let mut table = Table::new_with_persistence(c.name.clone(), columns, c.persistence);
+    if !parents.is_empty() {
+        table.set_inherits(parents);
+    }
+    if let Some(pb) = &c.partition_by {
+        let column = table
+            .column_index(&pb.column)
+            .ok_or_else(|| format!("column \"{}\" named in partition key does not exist", pb.column))?;
+        table.set_partition_scheme(crate::storage::PartitionScheme {
+            strategy: pb.strategy,
+            column,
+        });
+    }
+    if let Some(bound) = resolved_bound {
+        table.set_partition_bound(bound);
+    }
     for (col_idx, name) in pk_indexes {
         table.create_index(name, col_idx, true);
     }
@@ -3081,10 +4889,46 @@ fn exec_create_table(db: &mut Database, c: CreateTable) -> Result<ExecResult, St
                     validated,
                 });
             }
+            TableConstraint::Exclude { name, definition } => {
+                table.add_exclusion_constraint(ExclusionConstraint { name, definition });
+            }
         }
     }
     db.create_table(table)?;
+    // Register this table as a partition of its parent (for parent scans and so
+    // psql / pg_inherits can enumerate them).
+    if let Some(parent) = c.partition_of.as_ref().and_then(|po| db.table_mut(&po.parent)) {
+        parent.add_partition(c.name.clone());
+    }
     Ok(ExecResult::Command("CREATE TABLE".into()))
+}
+
+/// Resolve a parsed `PartitionBound` (literal expressions) to concrete values,
+/// coerced to the partition key's type.
+fn resolve_partition_bound(
+    bound: &crate::sql::ast::PartitionBound,
+    key_type: DataType,
+) -> Result<crate::storage::PartitionBoundSpec, String> {
+    use crate::sql::ast::PartitionBound;
+    use crate::storage::PartitionBoundSpec;
+    match bound {
+        PartitionBound::Range { from, to } => {
+            let from = coerce(eval_expr(from, &[], &[])?, key_type)?;
+            let to = coerce(eval_expr(to, &[], &[])?, key_type)?;
+            Ok(PartitionBoundSpec::Range { from, to })
+        }
+        PartitionBound::List(list) => {
+            let values = list
+                .iter()
+                .map(|e| coerce(eval_expr(e, &[], &[])?, key_type))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PartitionBoundSpec::List(values))
+        }
+        PartitionBound::Hash { modulus, remainder } => Ok(PartitionBoundSpec::Hash {
+            modulus: *modulus,
+            remainder: *remainder,
+        }),
+    }
 }
 
 fn constraint_column_indices(table: &Table, columns: &[String]) -> Result<Vec<usize>, String> {
@@ -3245,6 +5089,7 @@ fn exec_create_function(db: &mut Database, c: CreateFunction) -> Result<ExecResu
             return_type_name: c.return_type_name,
             body: c.body,
             language: c.language,
+            security_definer: c.security_definer,
         },
         c.or_replace,
     )?;
@@ -3504,6 +5349,10 @@ fn exec_create_index(db: &mut Database, c: CreateIndex) -> Result<ExecResult, St
     }
     let method = match c.method {
         crate::sql::ast::IndexMethod::Hash => crate::index::IndexMethod::Hash,
+        crate::sql::ast::IndexMethod::Gist => crate::index::IndexMethod::Gist,
+        crate::sql::ast::IndexMethod::SpGist => crate::index::IndexMethod::SpGist,
+        crate::sql::ast::IndexMethod::Brin => crate::index::IndexMethod::Brin,
+        crate::sql::ast::IndexMethod::Gin => crate::index::IndexMethod::Gin,
         crate::sql::ast::IndexMethod::Btree => crate::index::IndexMethod::Btree,
     };
     table.create_index_full(name, columns, expr, c.predicate, include, c.unique, method);
@@ -3812,12 +5661,25 @@ fn exec_alter_table(db: &mut Database, alter: AlterTable) -> Result<ExecResult, 
                 });
                 Ok(ExecResult::Command("ALTER TABLE".into()))
             }
+            TableConstraint::Exclude { name, definition } => {
+                let table = db
+                    .table_mut(&alter.table)
+                    .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+                if table.has_constraint_named(&name) {
+                    return Err(format!("constraint \"{name}\" already exists"));
+                }
+                table.add_exclusion_constraint(ExclusionConstraint { name, definition });
+                Ok(ExecResult::Command("ALTER TABLE".into()))
+            }
         },
         AlterAction::DropConstraint { name, if_exists } => {
             let table = db
                 .table_mut(&alter.table)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
             if table.drop_check_constraint(&name) {
+                return Ok(ExecResult::Command("ALTER TABLE".into()));
+            }
+            if table.drop_exclusion_constraint(&name) {
                 return Ok(ExecResult::Command("ALTER TABLE".into()));
             }
             if table.drop_foreign_key_constraint(&name) {
@@ -3854,6 +5716,87 @@ fn exec_alter_table(db: &mut Database, alter: AlterTable) -> Result<ExecResult, 
                 )),
             }
         }
+        AlterAction::OwnerTo { owner } => {
+            // The named role must exist (PostgreSQL errors otherwise).
+            if !db.roles().iter().any(|r| r.name == owner) {
+                return Err(format!("role \"{owner}\" does not exist"));
+            }
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            table.set_owner(owner);
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+        AlterAction::RowSecurity { action } => {
+            let table = db
+                .table_mut(&alter.table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", alter.table))?;
+            match action {
+                RowSecurityAction::Enable => table.set_row_security(true),
+                RowSecurityAction::Disable => table.set_row_security(false),
+                RowSecurityAction::Force => table.set_force_row_security(true),
+                RowSecurityAction::NoForce => table.set_force_row_security(false),
+            }
+            Ok(ExecResult::Command("ALTER TABLE".into()))
+        }
+    }
+}
+
+fn exec_create_policy(db: &mut Database, c: CreatePolicy) -> Result<ExecResult, String> {
+    // Validate any named roles exist (PUBLIC = empty list is always valid).
+    for role in &c.roles {
+        if role != "current_user" && !db.roles().iter().any(|r| &r.name == role) {
+            return Err(format!("role \"{role}\" does not exist"));
+        }
+    }
+    let table = db
+        .table_mut(&c.table)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", c.table))?;
+    table.add_policy(Policy {
+        name: c.name,
+        permissive: c.permissive,
+        command: c.command,
+        roles: c.roles,
+        using: c.using,
+        with_check: c.with_check,
+    })?;
+    Ok(ExecResult::Command("CREATE POLICY".into()))
+}
+
+fn exec_alter_policy(db: &mut Database, a: AlterPolicy) -> Result<ExecResult, String> {
+    if let Some(roles) = &a.roles {
+        for role in roles {
+            if role != "current_user" && !db.roles().iter().any(|r| &r.name == role) {
+                return Err(format!("role \"{role}\" does not exist"));
+            }
+        }
+    }
+    let table = db
+        .table_mut(&a.table)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", a.table))?;
+    let policy = table
+        .policy_mut(&a.name)
+        .ok_or_else(|| format!("policy \"{}\" for table \"{}\" does not exist", a.name, a.table))?;
+    if let Some(roles) = a.roles {
+        policy.roles = roles;
+    }
+    if a.using.is_some() {
+        policy.using = a.using;
+    }
+    if a.with_check.is_some() {
+        policy.with_check = a.with_check;
+    }
+    Ok(ExecResult::Command("ALTER POLICY".into()))
+}
+
+fn exec_drop_policy(db: &mut Database, d: DropPolicy) -> Result<ExecResult, String> {
+    match db.table_mut(&d.table) {
+        Some(table) => {
+            table.drop_policy(&d.name, d.if_exists)?;
+            Ok(ExecResult::Command("DROP POLICY".into()))
+        }
+        None if d.if_exists => Ok(ExecResult::Command("DROP POLICY".into())),
+        None => Err(format!("relation \"{}\" does not exist", d.table)),
     }
 }
 
@@ -4089,6 +6032,11 @@ fn exec_insert(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
     let table = db
         .table(&ins.table)
         .ok_or_else(|| format!("relation \"{}\" does not exist", ins.table))?;
+    // A partitioned parent owns no rows itself: route each inserted row to the
+    // matching partition.
+    if table.partition_scheme().is_some() {
+        return exec_insert_partitioned(db, ins);
+    }
     let columns = table.columns.clone();
     if let Some(on_conflict) = &ins.on_conflict {
         for name in on_conflict_target(on_conflict) {
@@ -4461,6 +6409,169 @@ fn on_conflict_eval_names(columns: &[Column]) -> Vec<String> {
             .map(|column| format!("excluded.{}", column.name)),
     );
     names
+}
+
+/// Insert into a partitioned parent by routing each row to the partition whose
+/// bound it matches. Rows are fully materialised (DEFAULT / serial / generated
+/// columns applied) against the parent's schema, then routed and dispatched to
+/// the matching partition via the ordinary insert path (so its constraints and
+/// triggers run). A row matching no partition is an error.
+fn exec_insert_partitioned(db: &mut Database, ins: Insert) -> Result<ExecResult, String> {
+    let table = db.table(&ins.table).expect("partitioned parent existed");
+    let columns = table.columns.clone();
+    let scheme = table.partition_scheme().expect("partitioned above").clone();
+
+    // Map each input position to a target column index (parent's column order).
+    let target_indices: Vec<usize> = if ins.default_values {
+        Vec::new()
+    } else {
+        match &ins.columns {
+            Some(names) => {
+                let mut idx = Vec::with_capacity(names.len());
+                for n in names {
+                    let i = columns.iter().position(|c| &c.name == n).ok_or_else(|| {
+                        format!(
+                            "column \"{n}\" of relation \"{}\" does not exist",
+                            ins.table
+                        )
+                    })?;
+                    idx.push(i);
+                }
+                idx
+            }
+            None => (0..columns.len()).collect(),
+        }
+    };
+
+    // Materialise the input rows (from VALUES or SELECT) as evaluated values.
+    let value_rows: Vec<Vec<Value>> = if let Some(select) = ins.select {
+        match exec_select(db, *select)? {
+            ExecResult::Rows { rows, .. } => rows,
+            ExecResult::Empty | ExecResult::Command(_) => {
+                return Err("INSERT query did not produce rows".into());
+            }
+        }
+    } else if ins.default_values {
+        vec![Vec::new()]
+    } else {
+        let mut out = Vec::with_capacity(ins.rows.len());
+        for tuple in &ins.rows {
+            let mut vals = Vec::with_capacity(tuple.len());
+            for expr in tuple {
+                vals.push(eval_expr(expr, &[], &[])?);
+            }
+            out.push(vals);
+        }
+        out
+    };
+
+    let mut routed = 0usize;
+    for values in value_rows {
+        if values.len() != target_indices.len() {
+            return Err(format!(
+                "INSERT has {} expressions but {} target columns",
+                values.len(),
+                target_indices.len()
+            ));
+        }
+        let mut row = vec![Value::Null; columns.len()];
+        for (val, &col_idx) in values.into_iter().zip(&target_indices) {
+            row[col_idx] = coerce(val, columns[col_idx].data_type)?;
+        }
+        finish_insert_row(
+            db,
+            &ins.table,
+            &columns,
+            &target_indices,
+            ins.overriding_system_value,
+            &mut row,
+        )?;
+
+        // Route on the (now fully materialised) partition key value.
+        let key = &row[scheme.column];
+        let partition = route_partition(db, &ins.table, key)?;
+
+        // Dispatch a fully-specified INSERT into the chosen partition so its own
+        // insert pipeline (constraints, triggers, indexes) runs.
+        let literal_row: Vec<Expr> = row.into_iter().map(value_to_literal).collect();
+        let child_insert = Insert {
+            table: partition,
+            columns: Some(columns.iter().map(|c| c.name.clone()).collect()),
+            default_values: false,
+            overriding_system_value: true,
+            rows: vec![literal_row],
+            select: None,
+            on_conflict: None,
+            returning: Vec::new(),
+        };
+        exec_insert(db, child_insert)?;
+        routed += 1;
+    }
+
+    Ok(ExecResult::Command(format!("INSERT 0 {routed}")))
+}
+
+/// Find the partition of `parent` whose bound matches partition-key value `key`.
+fn route_partition(db: &Database, parent: &str, key: &Value) -> Result<String, String> {
+    use crate::storage::PartitionBoundSpec;
+    let parent_table = db.table(parent).expect("parent existed");
+    for name in parent_table.partitions() {
+        let Some(child) = db.table(name) else { continue };
+        let Some(bound) = child.partition_bound() else {
+            continue;
+        };
+        let matched = match bound {
+            PartitionBoundSpec::Range { from, to } => {
+                // lo <= v < hi (NULL never routes to a range partition).
+                !key.is_null()
+                    && compare_values(key, from)
+                        .map(|o| o != Ordering::Less)
+                        .unwrap_or(false)
+                    && compare_values(key, to)
+                        .map(|o| o == Ordering::Less)
+                        .unwrap_or(false)
+            }
+            PartitionBoundSpec::List(values) => values
+                .iter()
+                .any(|v| compare_values(key, v) == Some(Ordering::Equal)),
+            PartitionBoundSpec::Hash { modulus, remainder } => {
+                *modulus > 0 && partition_hash(key).rem_euclid(*modulus) == *remainder
+            }
+        };
+        if matched {
+            return Ok(name.clone());
+        }
+    }
+    Err(format!(
+        "no partition of relation \"{parent}\" found for row"
+    ))
+}
+
+/// A simple, deterministic hash of a partition-key value for HASH partitioning.
+/// (Not PostgreSQL's hash — just stable and well-distributed within this engine.)
+fn partition_hash(value: &Value) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match value {
+        Value::Null => 0u8.hash(&mut hasher),
+        Value::Bool(b) => {
+            1u8.hash(&mut hasher);
+            b.hash(&mut hasher);
+        }
+        Value::Int(i) => {
+            2u8.hash(&mut hasher);
+            i.hash(&mut hasher);
+        }
+        Value::Float(f) => {
+            3u8.hash(&mut hasher);
+            f.to_bits().hash(&mut hasher);
+        }
+        Value::Text(s) => {
+            4u8.hash(&mut hasher);
+            s.hash(&mut hasher);
+        }
+    }
+    (hasher.finish() & i64::MAX as u64) as i64
 }
 
 fn finish_insert_row(
@@ -5378,6 +7489,195 @@ fn array_element(raw: &str, was_quoted: bool) -> Option<String> {
     }
 }
 
+/// A parsed range value `lo .. hi` with inclusive/exclusive bounds. `None`
+/// bounds mean unbounded (infinite). An empty range is represented separately.
+#[derive(Debug, Clone)]
+struct Range {
+    empty: bool,
+    lower: Option<String>,
+    upper: Option<String>,
+    lower_inc: bool,
+    upper_inc: bool,
+}
+
+/// Whether a value looks like a text range literal (`[..)`, `(..]`, `empty`).
+fn is_range_text(v: &Value) -> bool {
+    match v.to_text() {
+        Some(t) => {
+            let t = t.trim();
+            t.eq_ignore_ascii_case("empty")
+                || ((t.starts_with('[') || t.starts_with('('))
+                    && (t.ends_with(']') || t.ends_with(')'))
+                    && t.contains(','))
+        }
+        None => false,
+    }
+}
+
+/// Parse a range literal like `[1,5)`, `(,10]`, or `empty`.
+fn parse_range_text(text: &str) -> Option<Range> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("empty") {
+        return Some(Range {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+        });
+    }
+    let bytes = t.as_bytes();
+    let lower_inc = match bytes.first()? {
+        b'[' => true,
+        b'(' => false,
+        _ => return None,
+    };
+    let upper_inc = match bytes.last()? {
+        b']' => true,
+        b')' => false,
+        _ => return None,
+    };
+    let inner = &t[1..t.len() - 1];
+    let (lo, hi) = inner.split_once(',')?;
+    let parse_bound = |s: &str| {
+        let s = s.trim().trim_matches('"');
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    };
+    Some(Range {
+        empty: false,
+        lower: parse_bound(lo),
+        upper: parse_bound(hi),
+        lower_inc,
+        upper_inc,
+    })
+}
+
+/// Compare two range bound values, parsing as numbers when possible so
+/// `int4range`/`numrange` order numerically; otherwise compare as text.
+fn cmp_bound(a: &str, b: &str) -> Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
+impl Range {
+    /// Does this range contain the scalar point value?
+    fn contains_point(&self, p: &str) -> bool {
+        if self.empty {
+            return false;
+        }
+        if let Some(lo) = &self.lower {
+            let ord = cmp_bound(p, lo);
+            if ord == Ordering::Less || (ord == Ordering::Equal && !self.lower_inc) {
+                return false;
+            }
+        }
+        if let Some(hi) = &self.upper {
+            let ord = cmp_bound(p, hi);
+            if ord == Ordering::Greater || (ord == Ordering::Equal && !self.upper_inc) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Effective lower edge for overlap math: (value, inclusive). `None` => -inf.
+    fn lower_edge(&self) -> Option<(&str, bool)> {
+        self.lower.as_deref().map(|v| (v, self.lower_inc))
+    }
+    fn upper_edge(&self) -> Option<(&str, bool)> {
+        self.upper.as_deref().map(|v| (v, self.upper_inc))
+    }
+
+    /// Does this range contain the other range entirely?
+    fn contains_range(&self, other: &Range) -> bool {
+        if other.empty {
+            return true;
+        }
+        if self.empty {
+            return false;
+        }
+        // self.lower <= other.lower
+        let lo_ok = match (self.lower_edge(), other.lower_edge()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some((a, ai)), Some((b, _))) => {
+                let ord = cmp_bound(a, b);
+                ord == Ordering::Less || (ord == Ordering::Equal && (ai || self.lower_inc))
+            }
+        };
+        // self.upper >= other.upper
+        let hi_ok = match (self.upper_edge(), other.upper_edge()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some((a, ai)), Some((b, _))) => {
+                let ord = cmp_bound(a, b);
+                ord == Ordering::Greater || (ord == Ordering::Equal && (ai || self.upper_inc))
+            }
+        };
+        lo_ok && hi_ok
+    }
+
+    /// Do the two ranges overlap (share at least one point)?
+    fn overlaps(&self, other: &Range) -> bool {
+        if self.empty || other.empty {
+            return false;
+        }
+        // self.lower <= other.upper  AND  other.lower <= self.upper
+        let le = |lower: Option<(&str, bool)>, upper: Option<(&str, bool)>| -> bool {
+            match (lower, upper) {
+                (None, _) | (_, None) => true, // unbounded side
+                (Some((l, li)), Some((u, ui))) => {
+                    let ord = cmp_bound(l, u);
+                    ord == Ordering::Less || (ord == Ordering::Equal && li && ui)
+                }
+            }
+        };
+        le(self.lower_edge(), other.upper_edge()) && le(other.lower_edge(), self.upper_edge())
+    }
+}
+
+/// Build a canonical `[lo,hi)` range text from constructor arguments
+/// `(lo, hi [, bounds])`. NULL bounds become unbounded edges.
+fn range_constructor(vals: &[Value]) -> Value {
+    let lo = vals.first();
+    let hi = vals.get(1);
+    let bounds = vals
+        .get(2)
+        .and_then(|v| v.to_text())
+        .unwrap_or_else(|| "[)".to_string());
+    let lower_inc = bounds.starts_with('[');
+    let upper_inc = bounds.ends_with(']');
+    let lo_txt = lo.and_then(|v| v.to_text()).unwrap_or_default();
+    let hi_txt = hi.and_then(|v| v.to_text()).unwrap_or_default();
+    let lb = if lower_inc { '[' } else { '(' };
+    let ub = if upper_inc { ']' } else { ')' };
+    Value::Text(format!("{lb}{lo_txt},{hi_txt}{ub}"))
+}
+
+/// `lower(range)` / `upper(range)`: return the bound value (NULL if unbounded).
+fn range_bound(v: &Value, want_lower: bool) -> Value {
+    let Some(text) = v.to_text() else {
+        return Value::Null;
+    };
+    let Some(range) = parse_range_text(&text) else {
+        return Value::Null;
+    };
+    let bound = if want_lower { range.lower } else { range.upper };
+    match bound {
+        Some(s) => match s.parse::<i64>() {
+            Ok(i) => Value::Int(i),
+            Err(_) => Value::Text(s),
+        },
+        None => Value::Null,
+    }
+}
+
 fn array_text_from_elements(values: &[Option<String>]) -> String {
     let parts: Vec<String> = values
         .iter()
@@ -5425,11 +7725,17 @@ fn exec_select_with_ctes(
     if sel.from.is_none() && is_single_generate_series_projection(&sel.projection) {
         return select_generate_series(&sel);
     }
+    if sel.from.is_none() && is_single_unnest_projection(&sel.projection) {
+        return select_unnest(&sel);
+    }
     if sel.from.is_none() && is_single_sequence_projection(&sel.projection) {
         return select_sequence_function(db, &sel);
     }
     if sel.from.is_none() && is_advisory_lock_projection(&sel.projection) {
         return select_advisory_lock_functions(db, &sel);
+    }
+    if sel.from.is_none() && is_replication_slot_projection(&sel.projection) {
+        return select_replication_slot_functions(db, &sel);
     }
 
     // Resolve the source: the (possibly joined) FROM rows with qualified
@@ -5815,6 +8121,38 @@ fn is_single_generate_series_projection(items: &[SelectItem]) -> bool {
     )
 }
 
+fn is_single_unnest_projection(items: &[SelectItem]) -> bool {
+    matches!(
+        items,
+        [SelectItem::Expr {
+            expr: Expr::Function { name, .. },
+            ..
+        }] if name.eq_ignore_ascii_case("unnest")
+    )
+}
+
+fn select_unnest(sel: &Select) -> Result<ExecResult, String> {
+    let SelectItem::Expr {
+        expr: Expr::Function { args, .. },
+        alias,
+    } = &sel.projection[0]
+    else {
+        unreachable!()
+    };
+    let elems = eval_unnest(args)?;
+    let field_name = alias.clone().unwrap_or_else(|| "unnest".to_string());
+    let rows: Vec<Vec<Value>> = elems.into_iter().map(|v| vec![v]).collect();
+    let tag = format!("SELECT {}", rows.len());
+    Ok(ExecResult::Rows {
+        fields: vec![FieldDescription {
+            name: field_name,
+            data_type: DataType::Text,
+        }],
+        rows,
+        tag,
+    })
+}
+
 fn is_single_sequence_projection(items: &[SelectItem]) -> bool {
     matches!(
         items,
@@ -5908,6 +8246,65 @@ fn select_advisory_lock_functions(db: &mut Database, sel: &Select) -> Result<Exe
     })
 }
 
+fn is_replication_slot_projection(items: &[SelectItem]) -> bool {
+    items.len() == 1
+        && matches!(
+            &items[0],
+            SelectItem::Expr {
+                expr: Expr::Function { name, star: false, .. },
+                ..
+            } if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "pg_create_physical_replication_slot"
+                    | "pg_create_logical_replication_slot"
+                    | "pg_drop_replication_slot"
+            )
+        )
+}
+
+/// Handle `SELECT pg_create_physical_replication_slot('s')` and friends. The
+/// named slots are stored in the catalog so they appear consistent across the
+/// session; the functions return a single row (the slot name) as PostgreSQL
+/// does.
+fn select_replication_slot_functions(
+    db: &mut Database,
+    sel: &Select,
+) -> Result<ExecResult, String> {
+    let SelectItem::Expr { expr, alias } = &sel.projection[0] else {
+        unreachable!()
+    };
+    let Expr::Function { name, args, .. } = expr else {
+        unreachable!()
+    };
+    let lname = name.to_ascii_lowercase();
+    let slot = match args.first() {
+        Some(arg) => eval_expr(arg, &[], &[])?
+            .to_text()
+            .ok_or_else(|| format!("{lname}() slot name must not be null"))?,
+        None => return Err(format!("{lname}() expects a slot name argument")),
+    };
+    let value = match lname.as_str() {
+        "pg_create_physical_replication_slot" | "pg_create_logical_replication_slot" => {
+            // Idempotent-ish: ignore "already exists" so repeated calls succeed.
+            let _ = db.create_catalog_object("REPLICATION SLOT", slot.clone(), String::new());
+            Value::Text(slot)
+        }
+        "pg_drop_replication_slot" => {
+            db.drop_catalog_object("REPLICATION SLOT", &slot, true)?;
+            Value::Null
+        }
+        _ => unreachable!(),
+    };
+    Ok(ExecResult::Rows {
+        fields: vec![FieldDescription {
+            name: alias.clone().unwrap_or(lname),
+            data_type: DataType::Text,
+        }],
+        rows: vec![vec![value]],
+        tag: "SELECT 1".into(),
+    })
+}
+
 fn advisory_lock_key(args: &[Expr]) -> Result<(i64, i64), String> {
     match args {
         [key] => Ok((0, eval_int_arg(key)?)),
@@ -5994,6 +8391,29 @@ fn select_generate_series(sel: &Select) -> Result<ExecResult, String> {
         rows,
         tag,
     })
+}
+
+/// Expand the argument array(s) into one value per element. With multiple
+/// array arguments the columns are zipped (shorter arrays padded with NULL),
+/// but the common single-array case yields one column of values.
+fn eval_unnest(args: &[Expr]) -> Result<Vec<Value>, String> {
+    if args.len() != 1 {
+        return Err("unnest() expects a single array argument".into());
+    }
+    let v = eval_expr(&args[0], &[], &[])?;
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let text = v.to_text().unwrap_or_default();
+    let values =
+        parse_array_text(&text).ok_or_else(|| "unnest() requires an array".to_string())?;
+    Ok(values
+        .into_iter()
+        .map(|e| match e {
+            Some(s) => Value::Text(s),
+            None => Value::Null,
+        })
+        .collect())
 }
 
 fn eval_generate_series(args: &[Expr]) -> Result<Vec<i64>, String> {
@@ -6726,6 +9146,7 @@ fn build_merge_source(
                 alias: alias.clone(),
                 subquery: None,
                 lateral: false,
+                only: false,
             };
             let (names, _, rows) = resolve_source_table(db, &tref, &CteMap::new())?;
             Ok((names, rows))
@@ -7075,24 +9496,54 @@ fn exec_merge(db: &mut Database, mut merge: Merge) -> Result<ExecResult, String>
 }
 
 fn exec_set(db: &mut Database, name: String, value: String) -> Result<ExecResult, String> {
-    if name.eq_ignore_ascii_case("search_path") {
-        db.set_search_path(&value);
-    }
+    // SET LOCAL vs SET SESSION: in a true per-session model LOCAL would be scoped
+    // to the current transaction and rolled back on COMMIT. This engine stores
+    // GUCs on the shared Database (see module docs / the report), so LOCAL is
+    // treated like SESSION here — the value persists. `set_system_setting`
+    // routes `search_path` into its dedicated machinery.
+    db.set_system_setting(name, value);
     Ok(ExecResult::Command("SET".into()))
 }
 
 fn exec_show(db: &Database, name: String) -> Result<ExecResult, String> {
-    let value = match name.to_ascii_lowercase().as_str() {
-        // Honor PGRS_SERVER_VERSION so compatibility mode is visible to SQL too.
-        "server_version" => std::env::var("PGRS_SERVER_VERSION")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "16.0 (postgres-rs)".to_string()),
-        "server_encoding" | "client_encoding" => "UTF8".to_string(),
-        "transaction_isolation" => "read committed".to_string(),
-        "search_path" => db.search_path(),
-        "current_schema" => db.current_schema(),
-        _ => String::new(),
+    // `SHOW ALL` returns one row per configuration parameter.
+    if name.eq_ignore_ascii_case("all") {
+        let rows = db
+            .all_gucs()
+            .into_iter()
+            .map(|(n, v)| {
+                let desc = crate::storage::guc_description(&n);
+                vec![Value::Text(n), Value::Text(v), Value::Text(desc)]
+            })
+            .collect();
+        return Ok(ExecResult::Rows {
+            fields: vec![
+                FieldDescription {
+                    name: "name".into(),
+                    data_type: DataType::Text,
+                },
+                FieldDescription {
+                    name: "setting".into(),
+                    data_type: DataType::Text,
+                },
+                FieldDescription {
+                    name: "description".into(),
+                    data_type: DataType::Text,
+                },
+            ],
+            rows,
+            tag: "SHOW".to_string(),
+        });
+    }
+
+    // `SHOW current_schema` is a special introspection alias, not a GUC.
+    let value = if name.eq_ignore_ascii_case("current_schema") {
+        db.current_schema()
+    } else {
+        // Effective value (explicit setting, live search_path, or built-in
+        // default). Unknown parameters error like PostgreSQL.
+        db.guc(&name)
+            .ok_or_else(|| format!("unrecognized configuration parameter \"{name}\""))?
     };
     Ok(ExecResult::Rows {
         fields: vec![FieldDescription {
@@ -7392,6 +9843,10 @@ fn array_operator(op: BinaryOp, left: Value, right: Value) -> Result<Value, Stri
     let Some(right_text) = right.to_text() else {
         return Ok(Value::Null);
     };
+    // Range operators: `range @> element/range`, `range <@ range`, `range && range`.
+    if let Some(result) = range_operator(op, &left_text, &right_text) {
+        return Ok(Value::Bool(result));
+    }
     let left_values = parse_array_text(&left_text)
         .ok_or_else(|| "array operator requires array values".to_string())?;
     let right_values = parse_array_text(&right_text)
@@ -7415,6 +9870,37 @@ fn array_operator(op: BinaryOp, left: Value, right: Value) -> Result<Value, Stri
         _ => unreachable!(),
     };
     Ok(Value::Bool(result))
+}
+
+/// Evaluate `@>`, `<@`, `&&` when the operands are range values. Returns
+/// `None` if neither operand parses as a range (so array semantics apply).
+fn range_operator(op: BinaryOp, left: &str, right: &str) -> Option<bool> {
+    let left_range = parse_range_text(left);
+    let right_range = parse_range_text(right);
+    match op {
+        BinaryOp::ArrayContains => {
+            let lr = left_range?;
+            match right_range {
+                // range @> range
+                Some(rr) => Some(lr.contains_range(&rr)),
+                // range @> element (scalar point)
+                None => Some(lr.contains_point(right.trim().trim_matches('"'))),
+            }
+        }
+        BinaryOp::ArrayContainedBy => {
+            let rr = right_range?;
+            match left_range {
+                Some(lr) => Some(rr.contains_range(&lr)),
+                None => Some(rr.contains_point(left.trim().trim_matches('"'))),
+            }
+        }
+        BinaryOp::ArrayOverlap => {
+            let lr = left_range?;
+            let rr = right_range?;
+            Some(lr.overlaps(&rr))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8516,6 +11002,14 @@ fn eval_scalar_function(
         vals.push(eval_expr(a, col_names, row)?);
     }
     match lname.as_str() {
+        // `upper`/`lower` are overloaded: on a range value they return the
+        // upper/lower bound; otherwise the string-case function.
+        "upper" if matches!(arg(&vals, 0), Ok(v) if is_range_text(v)) => {
+            Ok(range_bound(arg(&vals, 0)?, false))
+        }
+        "lower" if matches!(arg(&vals, 0), Ok(v) if is_range_text(v)) => {
+            Ok(range_bound(arg(&vals, 0)?, true))
+        }
         "upper" => str_fn(&vals, |s| s.to_uppercase()),
         "lower" => str_fn(&vals, |s| s.to_lowercase()),
         "length" | "char_length" | "character_length" => {
@@ -8725,6 +11219,78 @@ fn eval_scalar_function(
             values.append(&mut right_values);
             Ok(Value::Text(array_text_from_elements(&values)))
         }
+        "__subscript" => {
+            // Array element access `arr[idx]` (1-based). Out-of-range or NULL
+            // yields NULL, matching PostgreSQL.
+            let array = arg(&vals, 0)?;
+            let idx = arg(&vals, 1)?;
+            if array.is_null() || idx.is_null() {
+                return Ok(Value::Null);
+            }
+            let i = match idx {
+                Value::Int(i) => *i,
+                other => other.to_text().and_then(|t| t.parse::<i64>().ok()).ok_or_else(
+                    || "array subscript must be an integer".to_string(),
+                )?,
+            };
+            let text = array.to_text().unwrap_or_default();
+            let values = parse_array_text(&text)
+                .ok_or_else(|| "array subscript requires an array".to_string())?;
+            if i < 1 || i as usize > values.len() {
+                return Ok(Value::Null);
+            }
+            Ok(match &values[(i - 1) as usize] {
+                Some(s) => Value::Text(s.clone()),
+                None => Value::Null,
+            })
+        }
+        "array_to_string" => {
+            let array = arg(&vals, 0)?;
+            let sep = arg(&vals, 1)?;
+            if array.is_null() || sep.is_null() {
+                return Ok(Value::Null);
+            }
+            let null_str = vals.get(2).and_then(|v| v.to_text());
+            let text = array.to_text().unwrap_or_default();
+            let values = parse_array_text(&text)
+                .ok_or_else(|| "array_to_string() requires an array".to_string())?;
+            let sep = sep.to_text().unwrap_or_default();
+            let parts: Vec<String> = values
+                .iter()
+                .filter_map(|v| match v {
+                    Some(s) => Some(s.clone()),
+                    None => null_str.clone(),
+                })
+                .collect();
+            Ok(Value::Text(parts.join(&sep)))
+        }
+        // Range constructors: `int4range(lo, hi [, bounds])` etc. Ranges are
+        // text-backed in the canonical `[lo,hi)` form (PostgreSQL default).
+        "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => {
+            Ok(range_constructor(&vals))
+        }
+        // Multirange constructors: accept and store as text `{range, ...}`.
+        "int4multirange" | "int8multirange" | "nummultirange" | "tsmultirange"
+        | "tstzmultirange" | "datemultirange" => {
+            let parts: Vec<String> = vals
+                .iter()
+                .filter_map(|v| v.to_text())
+                .collect();
+            Ok(Value::Text(format!("{{{}}}", parts.join(", "))))
+        }
+        // Geometric constructor `point(x, y)` -> text `(x,y)`.
+        "point" => {
+            let x = arg(&vals, 0)?;
+            let y = arg(&vals, 1)?;
+            if x.is_null() || y.is_null() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Text(format!(
+                "({},{})",
+                x.to_text().unwrap_or_default(),
+                y.to_text().unwrap_or_default()
+            )))
+        }
         "json_typeof" | "jsonb_typeof" => json_typeof_text(arg(&vals, 0)?),
         "json_array_length" | "jsonb_array_length" => json_array_length_text(arg(&vals, 0)?),
         "json_extract_path_text" | "jsonb_extract_path_text" => {
@@ -8796,6 +11362,35 @@ fn eval_scalar_function(
             Ok(Value::Text("postgres".to_string()))
         }
         "current_schema" => Ok(Value::Text("public".to_string())),
+        "current_setting" => {
+            // current_setting(name [, missing_ok]) — read a configuration parameter.
+            let name = arg(&vals, 0)?.to_text().unwrap_or_default();
+            let missing_ok = vals.get(1).map(|v| v.is_true()).unwrap_or(false);
+            let key = name.to_ascii_lowercase();
+            let found = GUC_SNAPSHOT.with(|cell| cell.borrow().get(&key).cloned());
+            match found.or_else(|| crate::storage::guc_default(&key).map(str::to_string)) {
+                Some(v) => Ok(Value::Text(v)),
+                None if missing_ok => Ok(Value::Null),
+                None => Err(format!("unrecognized configuration parameter \"{name}\"")),
+            }
+        }
+        "set_config" => {
+            // set_config(name, value, is_local) — set a parameter and return it.
+            let name = arg(&vals, 0)?.to_text().unwrap_or_default();
+            let value = arg(&vals, 1)?.to_text().unwrap_or_default();
+            // Stage the write so the surrounding `execute` can apply it to the
+            // database (and update the live snapshot for any later reads in the
+            // same statement). `is_local` is accepted but, like SET LOCAL, is not
+            // transaction-scoped in this engine.
+            let key = name.to_ascii_lowercase();
+            GUC_SNAPSHOT.with(|cell| {
+                cell.borrow_mut().insert(key.clone(), value.clone());
+            });
+            GUC_PENDING_WRITES.with(|cell| {
+                cell.borrow_mut().push((name.clone(), value.clone()));
+            });
+            Ok(Value::Text(value))
+        }
         "date_part" | "extract" => {
             let field = arg(&vals, 0)?
                 .to_text()
@@ -9180,15 +11775,131 @@ fn eval_scalar_function(
                 .collect();
             Ok(Value::Text(out))
         }
+        // `x::regclass` — OID <-> relation-name conversion. psql uses both
+        // directions: `'name'::regclass` (name -> oid for WHERE clauses) and
+        // `oid::regclass` (oid -> name for display).
+        "__cast_regclass" => {
+            let v = arg(&vals, 0).cloned().unwrap_or(Value::Null);
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(oid) => Ok(REGCLASS_OIDS
+                    .with(|cell| {
+                        cell.borrow()
+                            .iter()
+                            .find(|(_, o)| **o == oid)
+                            .map(|(name, _)| name.clone())
+                    })
+                    .map(Value::Text)
+                    .unwrap_or(Value::Int(oid))),
+                other => {
+                    // A relation name (possibly schema-qualified or quoted).
+                    let raw = other.to_text().unwrap_or_default();
+                    let name = raw
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&raw)
+                        .trim_matches('"')
+                        .to_string();
+                    Ok(REGCLASS_OIDS
+                        .with(|cell| cell.borrow().get(&name).copied())
+                        .map(Value::Int)
+                        .unwrap_or(Value::Text(raw)))
+                }
+            }
+        }
+        // `x::regtype` — OID <-> type-name conversion.
+        "__cast_regtype" => {
+            let v = arg(&vals, 0).cloned().unwrap_or(Value::Null);
+            match v {
+                Value::Null => Ok(Value::Null),
+                Value::Int(oid) => Ok(Value::Text(
+                    DataType::ALL
+                        .iter()
+                        .find(|dt| dt.oid() as i64 == oid)
+                        .map(|dt| dt.sql_name().to_string())
+                        .unwrap_or_else(|| oid.to_string()),
+                )),
+                other => {
+                    let raw = other.to_text().unwrap_or_default();
+                    Ok(DataType::from_sql_name(&raw)
+                        .map(|dt| Value::Int(dt.oid() as i64))
+                        .unwrap_or(Value::Text(raw)))
+                }
+            }
+        }
+        // Other `reg*` casts: not meaningfully resolvable here; echo the input
+        // (psql wraps these in `::text` for display only).
+        "__cast_regnamespace"
+        | "__cast_regproc"
+        | "__cast_regrole"
+        | "__cast_regprocedure"
+        | "__cast_regoper"
+        | "__cast_regoperator"
+        | "__cast_regconfig"
+        | "__cast_regdictionary" => Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null)),
         // Catalog helpers used by psql meta-commands.
         "pg_get_userbyid" => Ok(Value::Text("postgres".to_string())),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(Value::Bool(true))
         }
-        "pg_get_expr" | "pg_get_constraintdef" | "pg_get_indexdef" | "format_type" => {
-            Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null))
+        // `format_type(typoid, typmod)` -> SQL type name. psql/ORM column lists
+        // wrap `a.atttypid` in this; resolve the OID back to its type name.
+        "format_type" => {
+            let v = arg(&vals, 0).cloned().unwrap_or(Value::Null);
+            if v.is_null() {
+                return Ok(Value::Null);
+            }
+            match &v {
+                Value::Int(oid) => Ok(Value::Text(
+                    DataType::ALL
+                        .iter()
+                        .find(|dt| dt.oid() as i64 == *oid)
+                        .map(|dt| dt.sql_name().to_string())
+                        .unwrap_or_else(|| "???".to_string()),
+                )),
+                // Already a textual type name: pass through.
+                _ => Ok(v),
+            }
+        }
+        // `pg_get_expr(adbin, ...)` echoes its first argument, which by
+        // construction already holds the rendered SQL (pg_attrdef.adbin).
+        "pg_get_expr" => Ok(arg(&vals, 0).cloned().unwrap_or(Value::Null)),
+        // `pg_get_indexdef(oid, ...)` / `pg_get_constraintdef(oid, ...)` resolve
+        // the catalog OID to the definition rendered for the current statement.
+        "pg_get_indexdef" | "pg_get_constraintdef" => {
+            let v = arg(&vals, 0).cloned().unwrap_or(Value::Null);
+            match &v {
+                Value::Int(oid) => Ok(CATALOG_DEFS
+                    .with(|cell| cell.borrow().get(oid).cloned())
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null)),
+                // Already textual (e.g. tests passing the def directly): echo.
+                Value::Null => Ok(Value::Null),
+                _ => Ok(v),
+            }
         }
         "pg_encoding_to_char" => Ok(Value::Text("UTF8".to_string())),
+        // Logical replication is not implemented: nothing is publishable.
+        "pg_relation_is_publishable" => Ok(Value::Bool(false)),
+        // Partitioning is not implemented; a relation is its own ancestor/root.
+        // (Also exposed as a set-returning function for FROM-clause use.)
+        "pg_partition_ancestors" | "pg_partition_root" => {
+            let v = arg(&vals, 0).cloned().unwrap_or(Value::Null);
+            match v {
+                Value::Int(_) | Value::Null => Ok(v),
+                other => Ok(REGCLASS_OIDS
+                    .with(|cell| {
+                        cell.borrow()
+                            .get(other.to_text().unwrap_or_default().trim_matches('"'))
+                            .copied()
+                    })
+                    .map(Value::Int)
+                    .unwrap_or(other)),
+            }
+        }
+        // No extended statistics objects exist; psql only calls this on rows
+        // from an (always empty) pg_statistic_ext, so a stub suffices.
+        "pg_get_statisticsobjdef_columns" => Ok(Value::Null),
         // Aggregates reaching here means used outside an aggregate context.
         "count" | "sum" | "avg" | "min" | "max" => {
             Err(format!("aggregate function {lname}() is not allowed here"))
@@ -9632,6 +12343,7 @@ fn is_aggregate_name(name: &str) -> bool {
             | "min"
             | "max"
             | "string_agg"
+            | "array_agg"
             | "stddev"
             | "stddev_samp"
             | "stddev_pop"
@@ -9897,6 +12609,22 @@ fn eval_aggregate(
                 .map(|v| v.to_text().unwrap_or_default())
                 .collect();
             Ok(Value::Text(parts.join(&sep)))
+        }
+        "array_agg" => {
+            // Collect all (including NULL) input values into a text-backed array.
+            // `vals` above dropped NULLs, so re-collect from the filtered rows.
+            let mut elems: Vec<Option<String>> = Vec::new();
+            for row in &filtered_rows {
+                let v = eval_expr(arg, col_names, row)?;
+                elems.push(v.to_text());
+            }
+            if distinct {
+                let mut seen = std::collections::HashSet::new();
+                elems.retain(|v| {
+                    seen.insert(v.clone().unwrap_or_else(|| "\0NULL".to_string()))
+                });
+            }
+            Ok(Value::Text(array_text_from_elements(&elems)))
         }
         // Statistical aggregates over the numeric (non-null) values.
         "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {

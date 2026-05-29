@@ -37,6 +37,9 @@ pub enum Statement {
     DropRule(DropRule),
     DropAggregate(DropAggregate),
     AlterTable(AlterTable),
+    CreatePolicy(CreatePolicy),
+    AlterPolicy(AlterPolicy),
+    DropPolicy(DropPolicy),
     AlterRole(AlterRole),
     AlterSequence(AlterSequence),
     CreateIndex(CreateIndex),
@@ -75,9 +78,14 @@ pub enum Statement {
     },
     LockTable(LockTable),
     RefreshMaterializedView(RefreshMaterializedView),
-    /// Transaction control. Currently executed as a no-op acknowledgement
-    /// (everything is auto-committed) but parsed so clients don't error.
-    Begin,
+    /// Transaction control. `BEGIN`/`START TRANSACTION`, optionally carrying an
+    /// isolation level and/or read-only mode (`BEGIN [TRANSACTION] [ISOLATION
+    /// LEVEL <lvl>] [READ ONLY|READ WRITE]`). The session layer (server.rs)
+    /// honors these; executed directly it is a no-op acknowledgement.
+    Begin {
+        isolation: Option<IsolationLevel>,
+        read_only: Option<bool>,
+    },
     Commit,
     Rollback,
     Savepoint {
@@ -89,12 +97,20 @@ pub enum Statement {
     RollbackToSavepoint {
         name: String,
     },
-    /// `SET name = value` — accepted and ignored.
+    /// `SET [SESSION|LOCAL] name {=|TO} value` — stores a runtime configuration
+    /// parameter (GUC). `local` reflects `SET LOCAL` (transaction-scoped in real
+    /// PostgreSQL; see the executor for the simplification taken here).
     Set {
         name: String,
         value: String,
+        local: bool,
     },
-    /// `SHOW name` — returns a single-row, single-column result.
+    /// `RESET name` / `RESET ALL` / `SET name TO DEFAULT` — restore a GUC (or all
+    /// GUCs when `name` is `None`) to its built-in default.
+    ResetConfig {
+        name: Option<String>,
+    },
+    /// `SHOW name` / `SHOW ALL` — returns configuration parameter rows.
     Show {
         name: String,
     },
@@ -107,6 +123,16 @@ pub enum Statement {
     DropCatalogObject(DropCatalogObject),
     /// `SET CONSTRAINTS ... { DEFERRED | IMMEDIATE }` — accepted no-op.
     SetConstraints,
+    /// `SET TRANSACTION ...` / `SET SESSION CHARACTERISTICS AS TRANSACTION ...`:
+    /// set the isolation level and/or read-only mode of the current transaction
+    /// (or the session default when `session` is true).
+    SetTransaction {
+        isolation: Option<IsolationLevel>,
+        read_only: Option<bool>,
+        /// `true` for `SET SESSION CHARACTERISTICS AS TRANSACTION ...`, which
+        /// changes the default for subsequent transactions.
+        session: bool,
+    },
     /// `PREPARE TRANSACTION 'gid'` — two-phase commit prepare.
     PrepareTransaction {
         gid: String,
@@ -121,6 +147,40 @@ pub enum Statement {
     },
     /// An empty statement (e.g. a lone `;`).
     Empty,
+}
+
+/// Transaction isolation level. `READ UNCOMMITTED` is accepted but treated as
+/// `READ COMMITTED` (as PostgreSQL does — it has no dirty reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// The canonical lowercase name PostgreSQL reports for
+    /// `transaction_isolation` (READ UNCOMMITTED collapses to read committed).
+    pub fn guc_value(self) -> &'static str {
+        match self {
+            IsolationLevel::ReadUncommitted | IsolationLevel::ReadCommitted => "read committed",
+            IsolationLevel::RepeatableRead => "repeatable read",
+            IsolationLevel::Serializable => "serializable",
+        }
+    }
+
+    /// Parse from a GUC string value (case-insensitive). Returns `None` for an
+    /// unrecognized level.
+    pub fn from_guc_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read uncommitted" => Some(IsolationLevel::ReadUncommitted),
+            "read committed" => Some(IsolationLevel::ReadCommitted),
+            "repeatable read" => Some(IsolationLevel::RepeatableRead),
+            "serializable" => Some(IsolationLevel::Serializable),
+            _ => None,
+        }
+    }
 }
 
 /// The kind of an extended catalog object that is accepted and stored by name
@@ -556,6 +616,10 @@ pub struct CreateFunction {
     pub body: String,
     /// The language given by `LANGUAGE <lang>` (lowercased); defaults to `sql`.
     pub language: String,
+    /// `SECURITY DEFINER` was specified (`prosecdef`). `SECURITY INVOKER` (the
+    /// default) leaves this false. Behaviorally moot single-user, but recorded
+    /// and exposed via `pg_proc.prosecdef`.
+    pub security_definer: bool,
 }
 
 /// `DROP FUNCTION [IF EXISTS] name [(argtypes)]`.
@@ -699,6 +763,49 @@ pub struct CreateTable {
     pub constraints: Vec<TableConstraint>,
     pub if_not_exists: bool,
     pub persistence: TablePersistence,
+    /// `INHERITS (parent1, parent2, ...)`: parent tables whose columns are
+    /// prepended to this table's own, and whose `SELECT` scans include this
+    /// table's rows.
+    pub inherits: Vec<String>,
+    /// `PARTITION BY {RANGE|LIST|HASH} (col)`: marks this as a partitioned
+    /// parent that routes inserted rows to its partitions.
+    pub partition_by: Option<PartitionBy>,
+    /// `PARTITION OF parent FOR VALUES ...`: declares this table a partition of
+    /// `parent`, inheriting its columns and bound.
+    pub partition_of: Option<PartitionOf>,
+}
+
+/// The partitioning strategy of a partitioned parent table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionBy {
+    pub strategy: PartitionStrategy,
+    /// The partition key column name.
+    pub column: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionStrategy {
+    Range,
+    List,
+    Hash,
+}
+
+/// `PARTITION OF parent FOR VALUES ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionOf {
+    pub parent: String,
+    pub bound: PartitionBound,
+}
+
+/// The bound of a partition, mirroring `FOR VALUES`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionBound {
+    /// `FROM (lo) TO (hi)`: range `lo <= v < hi`.
+    Range { from: Expr, to: Expr },
+    /// `IN (v, ...)`: membership.
+    List(Vec<Expr>),
+    /// `WITH (MODULUS m, REMAINDER r)`: `hash(v) % m == r`.
+    Hash { modulus: i64, remainder: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,6 +851,57 @@ pub enum AlterAction {
     RenameTable {
         to: String,
     },
+    /// `OWNER TO role`.
+    OwnerTo {
+        owner: String,
+    },
+    /// `{ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL SECURITY`.
+    RowSecurity {
+        action: RowSecurityAction,
+    },
+}
+
+/// The row-level-security toggle in `ALTER TABLE ... ROW LEVEL SECURITY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSecurityAction {
+    Enable,
+    Disable,
+    Force,
+    NoForce,
+}
+
+/// `CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE] [FOR cmd]
+/// [TO role[,...]] [USING (expr)] [WITH CHECK (expr)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePolicy {
+    pub name: String,
+    pub table: String,
+    /// `true` = PERMISSIVE (default), `false` = RESTRICTIVE.
+    pub permissive: bool,
+    /// The command: `"all"` (default), `"select"`, `"insert"`, `"update"`, `"delete"`.
+    pub command: String,
+    /// Roles in `TO`; empty means `PUBLIC`.
+    pub roles: Vec<String>,
+    pub using: Option<Expr>,
+    pub with_check: Option<Expr>,
+}
+
+/// `ALTER POLICY name ON table [TO role[,...]] [USING (expr)] [WITH CHECK (expr)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterPolicy {
+    pub name: String,
+    pub table: String,
+    pub roles: Option<Vec<String>>,
+    pub using: Option<Expr>,
+    pub with_check: Option<Expr>,
+}
+
+/// `DROP POLICY [IF EXISTS] name ON table`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropPolicy {
+    pub name: String,
+    pub table: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -765,6 +923,11 @@ pub enum TableConstraint {
         ref_column: String,
         validated: bool,
     },
+    /// `EXCLUDE [USING method] (element WITH operator, ...)`. Accepted and
+    /// stored as a named constraint; never enforced. The `definition` is the
+    /// verbatim text following the constraint name (from `EXCLUDE` onward),
+    /// kept so the constraint round-trips through the WAL.
+    Exclude { name: String, definition: String },
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING method]
@@ -801,6 +964,10 @@ pub enum IndexKeyExpr {
 pub enum IndexMethod {
     Btree,
     Hash,
+    Gist,
+    SpGist,
+    Brin,
+    Gin,
 }
 
 /// `DROP INDEX [IF EXISTS] name`.
@@ -828,16 +995,25 @@ pub struct Insert {
     pub returning: Vec<SelectItem>,
 }
 
-/// `COPY table [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`.
+/// `COPY table [(cols)] FROM <src> | TO <dst> [WITH (...)]`, and
+/// `COPY (SELECT ...) TO <dst> [WITH (...)]`.
 ///
-/// Only the STDIN/STDOUT streaming forms are modelled (the ones that use the
-/// COPY sub-protocol); file-based COPY is not supported.
+/// The endpoint is given by [`Copy::target`]: `STDIN`/`STDOUT` use the COPY
+/// sub-protocol (driven by the server with the connection socket), while a
+/// single-quoted file path runs entirely server-side via `std::fs`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Copy {
+    /// Target table for a `COPY table ...`. For `COPY (query) TO ...` this is
+    /// the empty string and [`Copy::query`] holds the source query instead.
     pub table: String,
+    /// `COPY (SELECT ...) TO <dst>`: the source query. Mutually exclusive with a
+    /// named `table`; only valid with [`CopyDirection::To`].
+    pub query: Option<Box<Select>>,
     /// Explicit column list, or `None` for all columns in table order.
     pub columns: Option<Vec<String>>,
     pub direction: CopyDirection,
+    /// Where the data comes from / goes to (STDIN/STDOUT or a file path).
+    pub target: CopyTarget,
     pub format: CopyFormat,
     /// Field delimiter; defaults to tab (text) or comma (CSV) when `None`.
     pub delimiter: Option<char>,
@@ -849,16 +1025,30 @@ pub struct Copy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyDirection {
-    /// `COPY ... FROM STDIN` — client streams rows to the server.
+    /// `COPY ... FROM ...` — data flows into the table.
     From,
-    /// `COPY ... TO STDOUT` — server streams rows to the client.
+    /// `COPY ... TO ...` — data flows out of the table/query.
     To,
+}
+
+/// The endpoint of a COPY: the client stream (STDIN/STDOUT) or a server file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyTarget {
+    /// `FROM STDIN` — client streams rows to the server (COPY sub-protocol).
+    Stdin,
+    /// `TO STDOUT` — server streams rows to the client (COPY sub-protocol).
+    Stdout,
+    /// `FROM '<path>'` / `TO '<path>'` — a server-side file, read/written with
+    /// `std::fs`. No COPY sub-protocol messages are exchanged.
+    File(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
     Text,
     Csv,
+    /// PostgreSQL COPY binary format (`WITH (FORMAT binary)`).
+    Binary,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -967,6 +1157,9 @@ pub struct TableRef {
     /// `true` when prefixed with `LATERAL`: the subquery or set-returning
     /// function may reference columns from preceding FROM items.
     pub lateral: bool,
+    /// `true` when prefixed with `ONLY`: restrict the scan to this table's own
+    /// rows, excluding inheritance children / partitions.
+    pub only: bool,
 }
 
 impl TableRef {

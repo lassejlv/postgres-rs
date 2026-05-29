@@ -187,6 +187,9 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
             format!("DROP MATERIALIZED VIEW {exists}{}", ident(&d.name))
         }
         Statement::AlterTable(a) => alter_table_sql(a),
+        Statement::CreatePolicy(c) => create_policy_sql(c),
+        Statement::AlterPolicy(a) => alter_policy_sql(a),
+        Statement::DropPolicy(d) => drop_policy_sql(d),
         Statement::AlterRole(a) => {
             let options = role_options_sql(&a.options);
             if options.is_empty() {
@@ -276,15 +279,109 @@ pub fn statement_to_sql(stmt: &Statement) -> String {
             format!("REFRESH MATERIALIZED VIEW {}", ident(&r.name))
         }
         Statement::Select(s) => select_to_sql(s),
-        Statement::Begin => "BEGIN".into(),
+        Statement::Begin {
+            isolation,
+            read_only,
+        } => {
+            let mut out = String::from("BEGIN");
+            if let Some(level) = isolation {
+                out.push_str(&format!(" ISOLATION LEVEL {}", isolation_sql(*level)));
+            }
+            if let Some(ro) = read_only {
+                out.push_str(if *ro { " READ ONLY" } else { " READ WRITE" });
+            }
+            out
+        }
         Statement::Commit => "COMMIT".into(),
         Statement::Rollback => "ROLLBACK".into(),
         Statement::Savepoint { name } => format!("SAVEPOINT {}", ident(name)),
         Statement::ReleaseSavepoint { name } => format!("RELEASE SAVEPOINT {}", ident(name)),
         Statement::RollbackToSavepoint { name } => format!("ROLLBACK TO SAVEPOINT {}", ident(name)),
-        Statement::Set { name, .. } => format!("SET {name}"),
+        Statement::Set { name, value, .. } => format!("SET {name} = {}", quote_string(value)),
+        Statement::ResetConfig { name } => match name {
+            Some(name) => format!("RESET {name}"),
+            None => "RESET ALL".into(),
+        },
         Statement::Show { name } => format!("SHOW {name}"),
+        Statement::CreateCatalogObject(c) => create_catalog_object_sql(c),
+        Statement::DropCatalogObject(d) => drop_catalog_object_sql(d),
+        Statement::SetConstraints => "SET CONSTRAINTS ALL IMMEDIATE".into(),
+        Statement::SetTransaction {
+            isolation,
+            read_only,
+            session,
+        } => {
+            let mut out = if *session {
+                String::from("SET SESSION CHARACTERISTICS AS TRANSACTION")
+            } else {
+                String::from("SET TRANSACTION")
+            };
+            if let Some(level) = isolation {
+                out.push_str(&format!(" ISOLATION LEVEL {}", isolation_sql(*level)));
+            }
+            if let Some(ro) = read_only {
+                out.push_str(if *ro { " READ ONLY" } else { " READ WRITE" });
+            }
+            out
+        }
+        Statement::PrepareTransaction { gid } => {
+            format!("PREPARE TRANSACTION {}", quote_string(gid))
+        }
+        Statement::CommitPrepared { gid } => format!("COMMIT PREPARED {}", quote_string(gid)),
+        Statement::RollbackPrepared { gid } => {
+            format!("ROLLBACK PREPARED {}", quote_string(gid))
+        }
         Statement::Empty => String::new(),
+    }
+}
+
+fn isolation_sql(level: IsolationLevel) -> &'static str {
+    match level {
+        IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+        IsolationLevel::ReadCommitted => "READ COMMITTED",
+        IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        IsolationLevel::Serializable => "SERIALIZABLE",
+    }
+}
+
+fn create_catalog_object_sql(c: &CatalogObject) -> String {
+    let def = if c.definition.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", c.definition)
+    };
+    // The operator-name (e.g. `===`) is a symbol, not an identifier, so emit it
+    // verbatim; other object names are identifiers.
+    let name = if c.kind == CatalogObjectKind::Operator {
+        c.name.clone()
+    } else {
+        ident(&c.name)
+    };
+    match c.kind {
+        CatalogObjectKind::UserMapping => {
+            format!("CREATE USER MAPPING FOR {name}{def}")
+        }
+        kind => format!("CREATE {} {name}{def}", kind.keyword()),
+    }
+}
+
+fn drop_catalog_object_sql(d: &DropCatalogObject) -> String {
+    let exists = if d.if_exists { "IF EXISTS " } else { "" };
+    let def = if d.definition.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", d.definition)
+    };
+    let name = if d.kind == CatalogObjectKind::Operator {
+        d.name.clone()
+    } else {
+        ident(&d.name)
+    };
+    match d.kind {
+        CatalogObjectKind::UserMapping => {
+            format!("DROP USER MAPPING {exists}FOR {name}{def}")
+        }
+        kind => format!("DROP {} {exists}{name}{def}", kind.keyword()),
     }
 }
 
@@ -294,20 +391,33 @@ fn truncate_sql(t: &Truncate) -> String {
 }
 
 fn copy_sql(c: &Copy) -> String {
-    let cols = match &c.columns {
-        Some(names) => {
-            let list: Vec<String> = names.iter().map(|n| ident(n)).collect();
-            format!(" ({})", list.join(", "))
-        }
-        None => String::new(),
+    // The data source: a named table (+ optional column list) or a query.
+    let source = if let Some(query) = &c.query {
+        format!("({})", select_to_sql(query))
+    } else {
+        let cols = match &c.columns {
+            Some(names) => {
+                let list: Vec<String> = names.iter().map(|n| ident(n)).collect();
+                format!(" ({})", list.join(", "))
+            }
+            None => String::new(),
+        };
+        format!("{}{}", ident(&c.table), cols)
     };
-    let (dir, endpoint) = match c.direction {
-        CopyDirection::From => ("FROM", "STDIN"),
-        CopyDirection::To => ("TO", "STDOUT"),
+    let dir = match c.direction {
+        CopyDirection::From => "FROM",
+        CopyDirection::To => "TO",
+    };
+    let endpoint = match &c.target {
+        CopyTarget::Stdin => "STDIN".to_string(),
+        CopyTarget::Stdout => "STDOUT".to_string(),
+        CopyTarget::File(path) => format!("'{}'", path.replace('\'', "''")),
     };
     let mut opts = Vec::new();
-    if c.format == CopyFormat::Csv {
-        opts.push("FORMAT csv".to_string());
+    match c.format {
+        CopyFormat::Csv => opts.push("FORMAT csv".to_string()),
+        CopyFormat::Binary => opts.push("FORMAT binary".to_string()),
+        CopyFormat::Text => {}
     }
     if let Some(d) = c.delimiter {
         opts.push(format!("DELIMITER '{d}'"));
@@ -323,7 +433,7 @@ fn copy_sql(c: &Copy) -> String {
     } else {
         format!(" WITH ({})", opts.join(", "))
     };
-    format!("COPY {}{} {} {}{}", ident(&c.table), cols, dir, endpoint, with)
+    format!("COPY {} {} {}{}", source, dir, endpoint, with)
 }
 
 fn alter_database_sql(a: &AlterDatabase) -> String {
@@ -579,6 +689,9 @@ fn create_function_sql(c: &CreateFunction) -> String {
         dollar_quote(&c.body),
         c.language
     ));
+    if c.security_definer {
+        s.push_str(" SECURITY DEFINER");
+    }
     s
 }
 
@@ -655,13 +768,57 @@ fn create_table_sql(c: &CreateTable) -> String {
         TablePersistence::Unlogged => "UNLOGGED ",
         TablePersistence::Temporary => "TEMPORARY ",
     };
+    // A partition (`PARTITION OF ...`) has no column list of its own.
+    if let Some(po) = &c.partition_of {
+        return format!(
+            "CREATE {persistence}TABLE {exists}{} PARTITION OF {} {}",
+            ident(&c.name),
+            ident(&po.parent),
+            partition_bound_sql(&po.bound),
+        );
+    }
     let mut cols: Vec<String> = c.columns.iter().map(column_def_to_sql).collect();
     cols.extend(c.constraints.iter().map(table_constraint_sql));
-    format!(
+    let mut out = format!(
         "CREATE {persistence}TABLE {exists}{} ({})",
         ident(&c.name),
         cols.join(", ")
-    )
+    );
+    if !c.inherits.is_empty() {
+        let parents = c
+            .inherits
+            .iter()
+            .map(|p| ident(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(" INHERITS ({parents})"));
+    }
+    if let Some(pb) = &c.partition_by {
+        let strategy = match pb.strategy {
+            PartitionStrategy::Range => "RANGE",
+            PartitionStrategy::List => "LIST",
+            PartitionStrategy::Hash => "HASH",
+        };
+        out.push_str(&format!(" PARTITION BY {strategy} ({})", ident(&pb.column)));
+    }
+    out
+}
+
+fn partition_bound_sql(bound: &PartitionBound) -> String {
+    match bound {
+        PartitionBound::Range { from, to } => format!(
+            "FOR VALUES FROM ({}) TO ({})",
+            expr_to_sql(from),
+            expr_to_sql(to)
+        ),
+        PartitionBound::List(values) => {
+            let items = values.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ");
+            format!("FOR VALUES IN ({items})")
+        }
+        PartitionBound::Hash { modulus, remainder } => {
+            format!("FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})")
+        }
+    }
 }
 
 /// Serialize a single column definition (shared by CREATE TABLE / ALTER ADD).
@@ -754,6 +911,9 @@ fn table_constraint_sql(constraint: &TableConstraint) -> String {
                 ident(ref_column)
             )
         }
+        TableConstraint::Exclude { name, definition } => {
+            format!("CONSTRAINT {} {definition}", ident(name))
+        }
     }
 }
 
@@ -823,6 +983,9 @@ fn alter_table_sql(a: &AlterTable) -> String {
                     ident(ref_column)
                 )
             }
+            TableConstraint::Exclude { name, definition } => {
+                format!("ALTER TABLE {t} ADD CONSTRAINT {} {definition}", ident(name))
+            }
         },
         AlterAction::DropConstraint { name, if_exists } => {
             let exists = if *if_exists { "IF EXISTS " } else { "" };
@@ -836,7 +999,64 @@ fn alter_table_sql(a: &AlterTable) -> String {
             )
         }
         AlterAction::RenameTable { to } => format!("ALTER TABLE {t} RENAME TO {}", ident(to)),
+        AlterAction::OwnerTo { owner } => {
+            format!("ALTER TABLE {t} OWNER TO {}", ident(owner))
+        }
+        AlterAction::RowSecurity { action } => {
+            let verb = match action {
+                RowSecurityAction::Enable => "ENABLE",
+                RowSecurityAction::Disable => "DISABLE",
+                RowSecurityAction::Force => "FORCE",
+                RowSecurityAction::NoForce => "NO FORCE",
+            };
+            format!("ALTER TABLE {t} {verb} ROW LEVEL SECURITY")
+        }
     }
+}
+
+fn create_policy_sql(c: &CreatePolicy) -> String {
+    let mut s = format!("CREATE POLICY {} ON {}", ident(&c.name), ident(&c.table));
+    if !c.permissive {
+        s.push_str(" AS RESTRICTIVE");
+    }
+    if c.command != "all" {
+        s.push_str(&format!(" FOR {}", c.command.to_uppercase()));
+    }
+    if !c.roles.is_empty() {
+        let roles: Vec<String> = c.roles.iter().map(|r| ident(r)).collect();
+        s.push_str(&format!(" TO {}", roles.join(", ")));
+    }
+    if let Some(using) = &c.using {
+        s.push_str(&format!(" USING ({})", expr_to_sql(using)));
+    }
+    if let Some(check) = &c.with_check {
+        s.push_str(&format!(" WITH CHECK ({})", expr_to_sql(check)));
+    }
+    s
+}
+
+fn alter_policy_sql(a: &AlterPolicy) -> String {
+    let mut s = format!("ALTER POLICY {} ON {}", ident(&a.name), ident(&a.table));
+    if let Some(roles) = &a.roles {
+        let roles: Vec<String> = roles.iter().map(|r| ident(r)).collect();
+        s.push_str(&format!(" TO {}", roles.join(", ")));
+    }
+    if let Some(using) = &a.using {
+        s.push_str(&format!(" USING ({})", expr_to_sql(using)));
+    }
+    if let Some(check) = &a.with_check {
+        s.push_str(&format!(" WITH CHECK ({})", expr_to_sql(check)));
+    }
+    s
+}
+
+fn drop_policy_sql(d: &DropPolicy) -> String {
+    let exists = if d.if_exists { "IF EXISTS " } else { "" };
+    format!(
+        "DROP POLICY {exists}{} ON {}",
+        ident(&d.name),
+        ident(&d.table)
+    )
 }
 
 fn create_index_sql(c: &CreateIndex) -> String {
@@ -854,6 +1074,10 @@ fn create_index_sql(c: &CreateIndex) -> String {
     };
     let using = match c.method {
         IndexMethod::Hash => " USING hash",
+        IndexMethod::Gist => " USING gist",
+        IndexMethod::SpGist => " USING spgist",
+        IndexMethod::Brin => " USING brin",
+        IndexMethod::Gin => " USING gin",
         IndexMethod::Btree => "",
     };
     let keys: Vec<String> = c
@@ -1411,6 +1635,10 @@ pub fn expr_to_sql(e: &Expr) -> String {
             filter,
             over,
         } => {
+            // Internal subscript marker serialises back to `expr[idx]`.
+            if name == "__subscript" && args.len() == 2 {
+                return format!("{}[{}]", expr_to_sql(&args[0]), expr_to_sql(&args[1]));
+            }
             let mut call = if *star {
                 format!("{name}(*)")
             } else {

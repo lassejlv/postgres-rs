@@ -26,8 +26,13 @@ impl Wal {
         fs::create_dir_all(dir)?;
         let path = Path::new(dir).join("wal.sql");
 
-        let existing = match fs::read_to_string(&path) {
-            Ok(s) => s,
+        // Read the raw bytes and decode lossily rather than `read_to_string`,
+        // which would reject the whole log on a single invalid byte. A crash can
+        // leave a torn (partially written, possibly non-UTF8) tail; lossy
+        // decoding preserves the well-formed prefix so replay can recover the
+        // committed statements and drop only the torn fragment.
+        let existing = match fs::read(&path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };

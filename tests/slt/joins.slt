@@ -1,0 +1,41 @@
+# Joins between two tables.
+
+statement ok
+CREATE TABLE authors (id integer PRIMARY KEY, name text)
+
+statement ok
+CREATE TABLE books (id integer PRIMARY KEY, author_id integer, title text)
+
+statement ok
+INSERT INTO authors VALUES (1, 'Asimov'), (2, 'Le Guin'), (3, 'Nobody')
+
+statement ok
+INSERT INTO books VALUES (10, 1, 'Foundation'), (11, 1, 'I, Robot'), (12, 2, 'Earthsea')
+
+query TT
+SELECT a.name, b.title FROM books b JOIN authors a ON b.author_id = a.id ORDER BY b.id
+----
+Asimov
+Foundation
+Asimov
+I, Robot
+Le Guin
+Earthsea
+
+# LEFT JOIN keeps the author with no books, with NULL title.
+query TT
+SELECT a.name, b.title FROM authors a LEFT JOIN books b ON b.author_id = a.id ORDER BY a.id, b.id
+----
+Asimov
+Foundation
+Asimov
+I, Robot
+Le Guin
+Earthsea
+Nobody
+NULL
+
+query I
+SELECT count(*) FROM authors a JOIN books b ON b.author_id = a.id
+----
+3

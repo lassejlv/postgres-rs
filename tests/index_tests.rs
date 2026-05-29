@@ -575,6 +575,308 @@ fn advanced_indexes_survive_wal_replay() {
 }
 
 #[test]
+fn gist_index_equality_and_range_match_scan() {
+    // GiST is btree-backed here: equality + range must match the scan path.
+    let (mut u, mut i) = paired(
+        500,
+        Some("CREATE INDEX idx_price_g ON products USING gist (price)"),
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 300 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price > 950 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price BETWEEN 100 AND 200 ORDER BY id",
+    );
+    // Mutations keep it consistent.
+    run(&mut u, "UPDATE products SET price = price + 1000 WHERE id <= 30");
+    run(&mut i, "UPDATE products SET price = price + 1000 WHERE id <= 30");
+    run(&mut u, "DELETE FROM products WHERE price < 60");
+    run(&mut i, "DELETE FROM products WHERE price < 60");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price >= 1000 ORDER BY id",
+    );
+}
+
+#[test]
+fn spgist_index_equality_and_range_match_scan() {
+    // SP-GiST is btree-backed here too.
+    let (mut u, mut i) = paired(
+        400,
+        Some("CREATE INDEX idx_price_sp ON products USING spgist (price)"),
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 99 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price < 50 ORDER BY id",
+    );
+    run(&mut u, "UPDATE products SET price = 5 WHERE id = 7");
+    run(&mut i, "UPDATE products SET price = 5 WHERE id = 7");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 5 ORDER BY id",
+    );
+}
+
+#[test]
+fn brin_index_range_and_equality_match_scan() {
+    // BRIN summarises block ranges of `price`; range/eq must match the scan
+    // exactly (the executor re-checks each surviving range).
+    let (mut u, mut i) = paired(
+        500,
+        Some("CREATE INDEX idx_price_b ON products USING brin (price)"),
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price < 50 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price > 950 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price BETWEEN 100 AND 200 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 300 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price = 999999",
+    );
+    // Mutations must resummarise affected ranges.
+    run(
+        &mut u,
+        "UPDATE products SET price = price + 1000 WHERE id <= 60",
+    );
+    run(
+        &mut i,
+        "UPDATE products SET price = price + 1000 WHERE id <= 60",
+    );
+    run(&mut u, "DELETE FROM products WHERE price < 80");
+    run(&mut i, "DELETE FROM products WHERE price < 80");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price >= 1000 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM products WHERE price BETWEEN 80 AND 500 ORDER BY id",
+    );
+}
+
+#[test]
+fn brin_index_with_nulls_matches_scan() {
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(db, "CREATE TABLE t (id integer, v integer)");
+        run(
+            db,
+            "INSERT INTO t (id, v) VALUES (1,10),(2,NULL),(3,30),(4,NULL),(5,5),(6,500),(7,NULL),(8,42)",
+        );
+    }
+    run(&mut i, "CREATE INDEX idx_vb ON t USING brin (v)");
+    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v > 0 ORDER BY id");
+    assert_same(&mut u, &mut i, "SELECT id FROM t WHERE v = 42 ORDER BY id");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM t WHERE v BETWEEN 5 AND 50 ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM t WHERE v IS NULL ORDER BY id",
+    );
+}
+
+/// Build paired databases with a `tags text[]`-style column (stored as array
+/// text). Only the second gets the GIN index.
+fn paired_tags(index_sql: Option<&str>) -> (Database, Database) {
+    let mut u = Database::new();
+    let mut i = Database::new();
+    for db in [&mut u, &mut i] {
+        run(db, "CREATE TABLE docs (id integer PRIMARY KEY, tags text[])");
+        run(
+            db,
+            "INSERT INTO docs VALUES \
+             (1, '{a,b,c}'), (2, '{b}'), (3, '{c,d}'), (4, '{a,d,e}'), \
+             (5, '{}'), (6, '{b,c}'), (7, '{a}'), (8, '{d,e,f}')",
+        );
+    }
+    if let Some(sql) = index_sql {
+        run(&mut i, sql);
+    }
+    (u, i)
+}
+
+#[test]
+fn gin_index_containment_matches_scan() {
+    let (mut u, mut i) = paired_tags(Some("CREATE INDEX idx_tags ON docs USING gin (tags)"));
+    // Single-element containment.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['a'] ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['d'] ORDER BY id",
+    );
+    // Multi-element containment (intersection of posting lists).
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['a','b'] ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['d','e'] ORDER BY id",
+    );
+    // An element nobody has.
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['z'] ORDER BY id",
+    );
+}
+
+#[test]
+fn gin_index_consistent_after_mutations() {
+    let (mut u, mut i) = paired_tags(Some("CREATE INDEX idx_tags ON docs USING gin (tags)"));
+    run(&mut u, "UPDATE docs SET tags = '{a,z}' WHERE id = 2");
+    run(&mut i, "UPDATE docs SET tags = '{a,z}' WHERE id = 2");
+    run(&mut u, "DELETE FROM docs WHERE id = 4");
+    run(&mut i, "DELETE FROM docs WHERE id = 4");
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['a'] ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['z'] ORDER BY id",
+    );
+    assert_same(
+        &mut u,
+        &mut i,
+        "SELECT id FROM docs WHERE tags @> ARRAY['d'] ORDER BY id",
+    );
+}
+
+#[test]
+fn new_access_methods_round_trip_and_replay() {
+    // Round-trip each method through serialize.
+    for sql in [
+        "CREATE INDEX g_idx ON t USING gist (a)",
+        "CREATE INDEX sp_idx ON t USING spgist (a)",
+        "CREATE INDEX b_idx ON t USING brin (a)",
+        "CREATE INDEX gin_idx ON t USING gin (a)",
+    ] {
+        let stmt = Parser::parse_sql(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let out = statement_to_sql(&stmt);
+        let reparsed = Parser::parse_sql(&out).unwrap().into_iter().next().unwrap();
+        assert_eq!(stmt, reparsed, "did not round-trip: {sql} -> {out}");
+    }
+
+    // WAL replay must rebuild each method correctly.
+    let mut original = Database::new();
+    let mut log = String::new();
+    let mut apply = |db: &mut Database, sql: &str| {
+        for stmt in Parser::parse_sql(sql).expect("parse") {
+            let serialized = statement_to_sql(&stmt);
+            let res = executor::execute(db, stmt).expect("execute");
+            if !serialized.is_empty() && !matches!(res, ExecResult::Rows { .. }) {
+                log.push_str(&serialized);
+                log.push_str(";\n");
+            }
+        }
+    };
+    apply(
+        &mut original,
+        "CREATE TABLE t (id integer PRIMARY KEY, p integer, tags text[])",
+    );
+    apply(&mut original, "CREATE INDEX idx_g ON t USING gist (p)");
+    apply(&mut original, "CREATE INDEX idx_b ON t USING brin (p)");
+    apply(&mut original, "CREATE INDEX idx_gin ON t USING gin (tags)");
+    apply(
+        &mut original,
+        "INSERT INTO t VALUES (1,10,'{a,b}'),(2,20,'{b,c}'),(3,30,'{a}'),(4,20,'{c}')",
+    );
+    apply(&mut original, "DELETE FROM t WHERE id = 4");
+
+    let mut recovered = Database::new();
+    for stmt in Parser::parse_sql(&log).expect("reparse WAL") {
+        executor::execute(&mut recovered, stmt).expect("replay");
+    }
+    for q in [
+        "SELECT id FROM t WHERE p > 15 ORDER BY id",
+        "SELECT id FROM t WHERE p = 10 ORDER BY id",
+        "SELECT id FROM t WHERE tags @> ARRAY['a'] ORDER BY id",
+        "SELECT id FROM t WHERE tags @> ARRAY['b','c'] ORDER BY id",
+    ] {
+        assert_eq!(
+            rows(run(&mut original, q)),
+            rows(run(&mut recovered, q)),
+            "replay diverged for: {q}"
+        );
+    }
+}
+
+#[test]
+fn pg_am_lists_new_access_methods() {
+    let mut db = Database::new();
+    let res = run(
+        &mut db,
+        "SELECT amname FROM pg_am WHERE amname IN ('btree','hash','gist','spgist','brin','gin') ORDER BY amname",
+    );
+    let got: Vec<String> = rows(res)
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(t) => t.clone(),
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec!["brin", "btree", "gin", "gist", "hash", "spgist"]
+    );
+}
+
+#[test]
 fn null_values_excluded_from_index_scans() {
     // A nullable indexed column: NULLs must never be returned by range scans
     // (comparisons with NULL are never true), matching the scan path.

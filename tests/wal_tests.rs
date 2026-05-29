@@ -363,6 +363,17 @@ fn new_forms_serialize_and_reparse() {
         "SELECT INTERVAL '1 year 2 months'",
         // jsonpath.
         "SELECT jsonb_path_query(doc, '$.a.b') FROM j",
+        // Ownership + row-level security DDL.
+        "ALTER TABLE t OWNER TO alice",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE t FORCE ROW LEVEL SECURITY",
+        "ALTER TABLE t NO FORCE ROW LEVEL SECURITY",
+        // Policies.
+        "CREATE POLICY p ON t AS RESTRICTIVE FOR SELECT TO alice USING ((tenant = 'x'))",
+        "ALTER POLICY p ON t USING ((tenant = 'y'))",
+        "DROP POLICY IF EXISTS p ON t",
+        // SECURITY DEFINER function.
+        "CREATE FUNCTION sd() RETURNS integer AS $$ SELECT 1 $$ LANGUAGE sql SECURITY DEFINER",
     ];
     for sql in cases {
         let stmt = Parser::parse_sql(sql).expect("parse").remove(0);
@@ -388,4 +399,50 @@ fn writable_cte_side_effects_replay() {
         "WITH ins AS (INSERT INTO t (id) VALUES (7) RETURNING id) SELECT id FROM ins",
     );
     assert_eq!(select_all(&mut original, "SELECT id FROM t"), vec![vec![Value::Int(7)]]);
+}
+
+/// Extended catalog DDL (FDW, server, publication, exclusion constraint, foreign
+/// table) serializes, replays, and reproduces the same catalog state.
+#[test]
+fn extended_catalog_ddl_replays() {
+    let mut original = Database::new();
+    let mut log = String::new();
+    apply(&mut original, &mut log, "CREATE FOREIGN DATA WRAPPER w OPTIONS (a 'b')");
+    apply(
+        &mut original,
+        &mut log,
+        "CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (host 'localhost')",
+    );
+    apply(&mut original, &mut log, "CREATE PUBLICATION p FOR ALL TABLES");
+    apply(
+        &mut original,
+        &mut log,
+        "CREATE FOREIGN TABLE ft (id integer, name text) SERVER s OPTIONS (tab 'x')",
+    );
+    apply(&mut original, &mut log, "INSERT INTO ft (id, name) VALUES (1, 'a')");
+    apply(
+        &mut original,
+        &mut log,
+        "CREATE TABLE rooms (id integer, during int4range, \
+         EXCLUDE USING gist (during WITH &&))",
+    );
+
+    // Rebuild a fresh database purely from the log.
+    let mut recovered = Database::new();
+    for stmt in Parser::parse_sql(&log).expect("reparse WAL") {
+        executor::execute(&mut recovered, stmt).expect("replay");
+    }
+
+    // The foreign table (stored as a regular table) and its row survived.
+    assert_eq!(
+        select_all(&mut recovered, "SELECT id, name FROM ft"),
+        vec![vec![Value::Int(1), Value::Text("a".into())]]
+    );
+    // The catalog objects survived replay.
+    assert_eq!(recovered.catalog_objects("FOREIGN DATA WRAPPER").len(), 1);
+    assert_eq!(recovered.catalog_objects("SERVER").len(), 1);
+    assert_eq!(recovered.catalog_objects("PUBLICATION").len(), 1);
+    // The exclusion-constrained table replayed too.
+    assert!(select_all(&mut recovered, "SELECT id FROM rooms").is_empty());
+    let _ = &original;
 }
